@@ -6,8 +6,8 @@
 #include <cstdint>
 
 #include "strata/models/qwen38/kernels/qsa_prompt_attn.hpp"
-#include "strata/kernels/rope_scaling.hpp"
-#include "strata/prefill/kernels.hpp"
+#include "strata/common/kernels/rope_scaling.hpp"
+#include "strata/models/qwen38/prefill/kernels.hpp"
 
 namespace strata::metal_engine { void missing(const char* name); }
 
