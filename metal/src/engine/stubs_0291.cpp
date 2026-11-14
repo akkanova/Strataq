@@ -5,7 +5,7 @@
 
 #include <cstdint>
 
-#include "strata/kernels/qsa_prompt_attn.hpp"
+#include "strata/models/qwen38/kernels/qsa_prompt_attn.hpp"
 #include "strata/kernels/rope_scaling.hpp"
 #include "strata/prefill/kernels.hpp"
 
