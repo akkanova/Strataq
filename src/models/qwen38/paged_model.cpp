@@ -462,6 +462,7 @@ int run_paged_engine(int argc, char** argv) {
         return 1;
     }
     m.use_expert_source(ram);
+    set_tail_skip_default(m, std::max(o.expert_cache, 0), kProgram.c_str());
     m.set_prompt_pinned_share();
     m.arm_prompt_cpu_share();
     ConversationDrafter drafter;

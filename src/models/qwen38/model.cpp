@@ -5552,6 +5552,63 @@ bool decode_defaults_arch_ok() {
 #endif
 }
 
+void set_tail_skip_default(const Model& m, int64_t gpu_experts, const char* who) {
+    const Options& o = m.o;
+    const int64_t n_experts = m.is_paged() ? m.g.n_layers * m.g.n_expert : (int64_t) m.host_res.size();
+    const bool all_experts_resident = n_experts > 0 && gpu_experts >= n_experts;
+    // STRATA_ROUTE_TAIL_SKIP: ON BY DEFAULT on CUDA builds (owner decision, 0.1.42) and on HIP gfx1200/gfx1201
+    // (0.1.43): a missed expert that every token of a verify window routes at rank 7 or lower is neither copied nor
+    // computed (answers differ slightly from 0.1.41, KL ~0.003-0.006; docs/DETAILS.md).  =0 restores 0.1.41's bytes.
+    // Nothing to do, so no default and no line, when every expert is in VRAM; off with --batch slots (a window then
+    // mixes requests, and one request's skip would depend on another's tokens) and, as in the dispatch, with a peer
+    // or helper GPU.  A layer split is fine: each stage skips by itself.  The paged engine's windows mix its
+    // conversations too, but there the owner chose to keep the skip: a high rank in any row keeps the expert for
+    // every row, which keeps each answer nearer the full model.
+    const char* tse = std::getenv("STRATA_ROUTE_TAIL_SKIP");
+    // #1884: with nearly every expert in the GPU cache (V100 32 GB, Coder IQ1_M: 94.8% of the experts, 99.9% decode
+    // hits) the few misses are cheap and the skip costs more draft acceptance (70.1% -> 68.2%) than it saves:
+    // -1..2% decode.  No default then.
+    // (STRATA_TAIL_SKIP_MAX_CACHED=<percent>, default 90, moves the line; 101 = never).  0.1.43: 60 on a HIP layer
+    // split, where 2x R9700 (5 pairs, skip on vs off): Q2_0 story -6.2% at 70% cached, -1.8% at 60%; IQ3_S +6..15%
+    // at 44-52%, about 0 at 60%.
+#if defined(STRATA_USE_HIP)
+    const double max_cached_default = !m.split_devs.empty() ? 0.60 : 0.90;
+#else
+    const double max_cached_default = 0.90;
+#endif
+    const char* mcs = std::getenv("STRATA_TAIL_SKIP_MAX_CACHED");
+    const double max_cached = mcs != nullptr && mcs[0] != 0 ? std::atof(mcs) / 100.0 : max_cached_default;
+    const bool nearly_all_cached = n_experts > 0 && !all_experts_resident &&
+                                   (double) gpu_experts >= max_cached * (double) n_experts;
+    // NVFP4 experts (any layer): no default (sergqwer/strata-nvfp4 c83625c3).  On the fork's qwen-nvfp4-gptq pack the
+    // skip moved the answers by teacher-forced KL 0.035 against it off - as much as the GPTQ quantization's own error
+    // against an all-Q8_0 reference (0.038) - for +11.5% decode (RTX 5090).  STRATA_ROUTE_TAIL_SKIP=7 opts in.
+    bool nvfp4_experts = false;
+    if (m.native_pack)
+        for (const auto& f : strata::kernels::cpu::expert_layout().fmt)
+            nvfp4_experts = nvfp4_experts || f.gu_type == strata::kernels::cpu::kNvfp4Type ||
+                            f.d_type == strata::kernels::cpu::kNvfp4Type;
+    const bool start_allows = tse == nullptr && o.batch == 0 && o.peer_device < 0 && decode_defaults_arch_ok();
+    const bool tail_default_path = start_allows && !all_experts_resident && !nearly_all_cached;
+    if (tail_default_path && nvfp4_experts)
+        std::fprintf(stderr, "%s: STRATA_ROUTE_TAIL_SKIP is off by default with NVFP4 experts (it moved an NVFP4 "
+                             "pack's answers by about as much as its quantization does); "
+                             "STRATA_ROUTE_TAIL_SKIP=7 turns it on\n", who);
+    if (start_allows && nearly_all_cached)
+        std::fprintf(stderr, "%s: STRATA_ROUTE_TAIL_SKIP is off by default: %.1f%% of the experts are in the GPU "
+                             "cache, so few are missed and skipping them costs more draft acceptance than it saves; "
+                             "STRATA_ROUTE_TAIL_SKIP=7 turns it on\n", who,
+                     100.0 * (double) gpu_experts / (double) n_experts);
+    if (tail_default_path && !nvfp4_experts)
+        strata::core::set_tail_skip_rank(7);
+    if (strata::core::tail_skip_rank() > 0 && !all_experts_resident)
+        std::fprintf(stderr, "%s: STRATA_ROUTE_TAIL_SKIP=%d is ON%s: a missed expert that every token of a verify "
+                             "window routes at rank %d or lower is skipped (+10..20%% decode on 12-16 GB cards "
+                             "that miss experts, answers differ slightly from 0.1.41); "
+                             "STRATA_ROUTE_TAIL_SKIP=0 turns it off\n", who, strata::core::tail_skip_rank(),
+                     tse == nullptr ? " (default)" : "", strata::core::tail_skip_rank());
+}
+
 double get_last_h2d_gbps() { return g_last_h2d_gbps; }
 
 #if !defined(_WIN32)

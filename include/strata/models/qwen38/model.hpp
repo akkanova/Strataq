@@ -377,6 +377,10 @@ void mem_mark(const char* where);
 bool pcie_auto_split_ok();
 /// Tells whether the HIP defaults of the decode speed push apply to the current card (gfx12; always on CUDA).
 bool decode_defaults_arch_ok();
+/// Enables rank-7 skipping of low-ranked missed experts when the environment leaves STRATA_ROUTE_TAIL_SKIP unset
+/// and the serving configuration allows it. Logs the choice with the prefix `who`. `gpu_experts` counts resident
+/// experts across all stages, or their total planned capacity for the paged engine's caches, which fill on demand.
+void set_tail_skip_default(const Model& m, int64_t gpu_experts, const char* who);
 /// Gets the host-to-device bandwidth the last PCIe probe measured, GB/s (<= 0: none ran).
 double get_last_h2d_gbps();
 #if !defined(_WIN32)
