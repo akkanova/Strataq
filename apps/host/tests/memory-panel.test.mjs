@@ -624,6 +624,23 @@ test('a drafter the engine did not load is shown, with its words, but cannot be 
   assert.match(element.innerHTML, /<option value="on" disabled>No MTP drafter loaded<\/option>/);
 });
 
+test('an unavailable drafter without discovery details says none is loaded', () => {
+  const {element} = mount({...live, settings: {...live.settings, drafter: 0, has_drafter: 0}}, () => {});
+  assert.match(element.innerHTML, /<option value="on" disabled>No model drafter loaded<\/option>/);
+  assert.match(element.innerHTML, /<option value="off" selected>/);
+});
+
+test('a selected unavailable drafter still allows switching to suffix drafting', async () => {
+  const view = {...live, settings: {...live.settings, drafter: 1, has_drafter: 0, suffix_draft: 0}};
+  const {calls, onChange} = recorder(), {element, fire} = mount(view, onChange);
+  assert.match(element.innerHTML, /<option value="on" selected disabled>/);
+  assert.doesNotMatch(element.innerHTML, /<select[^>]* disabled/);
+  fire('change', {target: control('[data-setting]', {dataset: {setting: 'drafter'}, value: 'suffix'})});
+  apply(fire);
+  await settle();
+  assert.deepEqual(calls, [[{drafter: false, suffix_draft: 3, lookup_chain: 0}, 'session']]);
+});
+
 test('allocation tooltips sort every category by label', () => {
   const html = draw({available: true, settings: {}, memories: [{id: 'gpu0', total: GIB,
     uses: {other: GIB}, blocks: [

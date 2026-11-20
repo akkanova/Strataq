@@ -417,7 +417,8 @@ function drawDrafterControl(settings, details = {}, disabled = "") {
       " Suffix drafting uses greedy sampling only. Mode changes take effect on the next request.");
   const model = `<option value="on"${settings.drafter ? " selected" : ""}` +
     `${settings.has_drafter === 0 ? " disabled" : ""}>` +
-    `${esc(details.drafter_label || "Use model drafter (VRAM cost not reported)")}</option>`;
+    `${esc(details.drafter_label || (settings.has_drafter === 0 ? "No model drafter loaded" :
+      "Use model drafter (VRAM cost not reported)"))}</option>`;
   const lookup = settings.suffix_draft == null ? "" :
     `<option value="suffix"${suffix ? " selected" : ""}>` +
     `${esc(details.suffix_label || "Use suffix drafter (0 GiB)")}</option>`;

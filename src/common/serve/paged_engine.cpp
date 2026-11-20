@@ -2344,14 +2344,14 @@ strata::serve::MemoryReport PagedEngine::describe_memory() const {
     report.settings.emplace_back("save_on_shutdown", settings_.save_on_shutdown ? 1 : 0);
     report.settings.emplace_back("suffix_draft", settings_.suffix_draft);
     report.settings.emplace_back("lookup_chain", settings_.lookup_chain);
-    // A model that reloads its dense drafter weights knows their size while they are unloaded (DeepSeek); otherwise
-    // the size is what the drafter holds on the cards now, nothing while it is off (Qwen's MTP)
+    // Qwen retains conversation snapshots with MTP off; those alone cannot tell us the cost of enabling it.
     uint64_t dense = 0, held = 0;
     for (const PagedCard& card : cards_) {
         dense += model_.get_drafter_weight_bytes(card);
         held += report.at(card.id).get_use("drafter");
     }
-    const uint64_t drafter_bytes = facts_.drafter_expert_bytes + std::max(dense, held);
+    const uint64_t drafter_bytes = facts_.drafter_expert_bytes +
+                                  (settings_.drafter ? std::max(dense, held) : dense);
     char cost[32];
     std::snprintf(cost, sizeof cost, "%.1f GiB", (double) drafter_bytes / 1073741824.0);
     const std::string drafter = facts_.drafter_label + " drafter";

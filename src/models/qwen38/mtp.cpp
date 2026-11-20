@@ -367,8 +367,10 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
             ~Closer() { if (f != nullptr) std::fclose(f); }
         } closer{f};
         if (strata::core::allocate_device((void**) &experts_, bytes,
-            {"drafter", "Drafter", "Expert weights"}) != cudaSuccess) { err = "mtp: the 512 experts do not fit in VRAM";
-                return false; }
+            {"drafter", "Drafter", "Expert weights"}) != cudaSuccess) {
+            err = "mtp: the 512 experts do not fit in VRAM";
+            return false;
+        }
 #if !defined(_WIN32)
         strata::platform::advise_willneed(fileno(f), 0, bytes);
 #endif
@@ -421,8 +423,10 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     if (kv_hybrid_was) qsa_set_kv_int8(true);   // the drafter under --kv k8v4: plain INT8
     uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
     if (strata::core::allocate_device(&state_arena_, sb,
-        {"drafter", "Drafter", "Attention state"}) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return
-            false; }
+        {"drafter", "Drafter", "Attention state"}) != cudaSuccess) {
+        err = "mtp: the K/V state does not fit";
+        return false;
+    }
     if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
         if (st_.kv_mode == 0) { err = "mtp: state init failed"; return false; }
         std::fprintf(stderr, "strata mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM\n");
@@ -432,8 +436,10 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         ring = -1;   // fully resident
         sb = qsa_state_bytes(g, max_cells, false, ring);
         if (strata::core::allocate_device(&state_arena_, sb,
-            {"drafter", "Drafter", "Attention state"}) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return
-                false; }
+            {"drafter", "Drafter", "Attention state"}) != cudaSuccess) {
+            err = "mtp: the K/V state does not fit";
+            return false;
+        }
         if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) { err = "mtp: state init failed"; return false; }
     }
     qsa_set_kv_int8(kv_int8_was);

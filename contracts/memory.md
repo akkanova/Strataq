@@ -140,10 +140,13 @@ existing host-state file layout is unchanged.
 The report may include `MEMORY_DETAIL <key> <percent-encoded-value>` lines.
 Python exposes these as the `details` dictionary. The paged engines supply
 `drafter_label`, `drafter_details`, `suffix_label` and `kv_quantization` for
-settings help. Drafter cost includes reloadable dense weights and prediction
-experts; per-conversation state is accounted separately. A drafter whose size
-is known only while it is loaded (Qwen's MTP) has no size while it is off, and
-the label says so. Without a drafter, `drafter_label` says none is loaded and
+settings help. While enabled, drafter cost includes allocations in the GPUs'
+`drafter` category (weights, working buffers and snapshots) and any separately
+managed prediction experts. It excludes host copies and conversation pages in
+the shared pool. While off, it reports known reloadable weights and prediction
+experts; if these sizes are unknown (Qwen's MTP), the label says the size is
+known once it is on. Retained snapshots alone do not establish that size.
+Without a drafter, `drafter_label` says none is loaded and
 the panel shows it as an option that cannot be chosen. Older engines omit
 these fields, so readers must allow missing discovery and cost information.
 
