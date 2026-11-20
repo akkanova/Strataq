@@ -89,6 +89,13 @@ struct Memory {
             }
         uses.emplace_back(use, bytes);
     }
+    /// Gets the bytes held here for use `use`; 0 when it holds none.
+    uint64_t get_use(const std::string& use) const {
+        for (const auto& [u, b] : uses)
+            if (u == use)
+                return b;
+        return 0;
+    }
     /// Includes labelled blocks and derives the category totals from them.
     void add_blocks(const std::vector<core::MemoryBlock>& entries) {
         for (const core::MemoryBlock& b : entries) {

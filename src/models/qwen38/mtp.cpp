@@ -253,7 +253,7 @@ bool MtpDrafter::make_q4_dense(const std::vector<uint8_t>& blob, std::string& er
         q4_off_.push_back({t->name, off});
     }
     if (strata::core::allocate_device((void**) &dense4_, (size_t) total,
-        {"other", "Device allocations", "Drafter"}) != cudaSuccess) { err = "mtp: the Q4_0 projections do not fit";
+        {"drafter", "Device allocations", "Drafter"}) != cudaSuccess) { err = "mtp: the Q4_0 projections do not fit";
             return false; }
     cudaMemcpy(dense4_, host.data(), (size_t) total, cudaMemcpyHostToDevice);
     vram_ += total;
@@ -342,7 +342,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         std::vector<uint8_t> blob;
         if (!read_file(rt_dir + "/dense.bin", blob)) { err = "mtp: cannot read dense.bin"; return false; }
         const cudaError_t alloc = strata::core::allocate_device((void**) &dense_, blob.size(),
-            {"other", "Drafter", "Dense weights"});
+            {"drafter", "Drafter", "Dense weights"});
         if (alloc != cudaSuccess) {
             size_t free_bytes = 0, total_bytes = 0;
             const cudaError_t info = cudaMemGetInfo(&free_bytes, &total_bytes);
@@ -367,7 +367,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
             ~Closer() { if (f != nullptr) std::fclose(f); }
         } closer{f};
         if (strata::core::allocate_device((void**) &experts_, bytes,
-            {"other", "Drafter", "Expert weights"}) != cudaSuccess) { err = "mtp: the 512 experts do not fit in VRAM";
+            {"drafter", "Drafter", "Expert weights"}) != cudaSuccess) { err = "mtp: the 512 experts do not fit in VRAM";
                 return false; }
 #if !defined(_WIN32)
         strata::platform::advise_willneed(fileno(f), 0, bytes);
@@ -421,7 +421,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     if (kv_hybrid_was) qsa_set_kv_int8(true);   // the drafter under --kv k8v4: plain INT8
     uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
     if (strata::core::allocate_device(&state_arena_, sb,
-        {"other", "Drafter", "Attention state"}) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return
+        {"drafter", "Drafter", "Attention state"}) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return
             false; }
     if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
         if (st_.kv_mode == 0) { err = "mtp: state init failed"; return false; }
@@ -432,7 +432,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         ring = -1;   // fully resident
         sb = qsa_state_bytes(g, max_cells, false, ring);
         if (strata::core::allocate_device(&state_arena_, sb,
-            {"other", "Drafter", "Attention state"}) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return
+            {"drafter", "Drafter", "Attention state"}) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return
                 false; }
         if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) { err = "mtp: state init failed"; return false; }
     }
@@ -442,7 +442,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     if (kv_in_pages_) {   // the K/V is in a conversation's pages (use_kv_units): a table of its units, empty for now
         kv_blocks_ = max_cells / s.idx_block + 2;   // as ConversationPages sizes its tables
         if (strata::core::allocate_device((void**) &kv_units_, (size_t) kv_blocks_ * sizeof(int64_t),
-            {"other", "Device allocations", "Drafter"}) != cudaSuccess) {
+            {"drafter", "Device allocations", "Drafter"}) != cudaSuccess) {
             err = "mtp: the K/V's unit table does not fit";
             return false;
         }
@@ -508,7 +508,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     Bump count;
     carve(count);
     if (strata::core::allocate_device(&arena_, count.used,
-        {"other", "Drafter", "Working buffers"}) != cudaSuccess) { err = "mtp: buffers do not fit"; return false; }
+        {"drafter", "Drafter", "Working buffers"}) != cudaSuccess) { err = "mtp: buffers do not fit"; return false; }
     cudaMemset(arena_, 0, count.used);
     Bump real;
     real.base = (uint8_t*) arena_;
@@ -642,7 +642,7 @@ bool MtpDrafter::experts_lend(std::string& err) {
         // taken once and kept: the room opens and closes around every long prompt, and a second read of experts.bin
         // (675 MiB) per prompt is what this avoids
         if (strata::core::allocate_host(&experts_host_, (size_t) bytes, cudaHostAllocDefault,
-            {"other", "Drafter", "Expert weights (host copy)"}) != cudaSuccess) {
+            {"drafter", "Drafter", "Expert weights (host copy)"}) != cudaSuccess) {
             (void) cudaGetLastError();
             err = "mtp: the 512 experts have no room in pinned host memory (they stay the decode's)";
             return false;
@@ -714,10 +714,10 @@ bool MtpDrafter::setup_coupled(std::string& err) {
     }
     const size_t ring = (size_t) (kCoupledHistCap + max_t_) * sizeof(int32_t);
     if (strata::core::allocate_device((void**) &cparams_, sizeof(strata::kernels::SamplerParams),
-        {"other", "Device allocations", "Drafter"}) != cudaSuccess ||
+        {"drafter", "Device allocations", "Drafter"}) != cudaSuccess ||
         strata::core::allocate_device((void**) &cring_, ring,
-            {"other", "Device allocations", "Drafter"}) != cudaSuccess || strata::core::allocate_device(&cscratch_,
-                scratch, {"other", "Device allocations", "Drafter"}) != cudaSuccess ||
+            {"drafter", "Device allocations", "Drafter"}) != cudaSuccess || strata::core::allocate_device(&cscratch_,
+                scratch, {"drafter", "Device allocations", "Drafter"}) != cudaSuccess ||
         !mapped(sizeof(strata::kernels::SamplerParams), (void**) &h_cparams_, (void**) &m_cparams_) ||
         !mapped((size_t) kCoupledHistCap * sizeof(int32_t), (void**) &h_chist_, (void**) &m_chist_)) {
         err = "mtp: the coupled draft sampler's buffers do not fit";
@@ -737,7 +737,7 @@ bool MtpDrafter::setup_coupled(std::string& err) {
         for (size_t i = 0; i < sub.size(); ++i)
             if (sub[i] >= 0 && sub[i] < n_vocab_ && inv[(size_t) sub[i]] < 0) inv[(size_t) sub[i]] = (int32_t) i;
         if (strata::core::allocate_device((void**) &dinv_, inv.size() * sizeof(int32_t),
-            {"other", "Device allocations", "Drafter"}) != cudaSuccess) {
+            {"drafter", "Device allocations", "Drafter"}) != cudaSuccess) {
             err = "mtp: the coupled draft sampler's token map does not fit";
             return false;
         }
@@ -827,7 +827,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
     if (head == nullptr || !head->loaded()) { err = "mtp: the draft layer needs the native head (--native)"; return false; }
     if (head_logits_ == nullptr &&
         strata::core::allocate_device((void**) &head_logits_, (size_t) max_t_ * (size_t) n_vocab_ * sizeof(float),
-            {"other", "Drafter", "Output scores"}) != cudaSuccess) {
+            {"drafter", "Drafter", "Output scores"}) != cudaSuccess) {
         err = "mtp: the draft logits do not fit";
         return false;
     }
@@ -850,9 +850,9 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             n_dvocab_ = (int64_t) (raw.size() / 4);
             const int64_t row_bytes = (int64_t) head->row_bytes();   // a vocabulary row of the native head
             if (strata::core::allocate_device((void**) &dvocab_, raw.size(),
-                {"other", "Device allocations", "Drafter"}) != cudaSuccess ||
+                {"drafter", "Device allocations", "Drafter"}) != cudaSuccess ||
                 strata::core::allocate_device((void**) &dhead_, (size_t) (n_dvocab_ * row_bytes),
-                    {"other", "Drafter", "Output head"}) != cudaSuccess) {
+                    {"drafter", "Drafter", "Output head"}) != cudaSuccess) {
                 err = "mtp: the draft head does not fit";
                 draft_head_hint(n_dvocab_, row_bytes);
                 return false;
@@ -870,9 +870,9 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 {
                     const OnDevice on_head(head_dev);
                     ok_x = strata::core::allocate_device((void**) &tmp, (size_t) (n_dvocab_ * row_bytes),
-                        {"other", "Device allocations", "Drafter"}) == cudaSuccess &&
+                        {"drafter", "Device allocations", "Drafter"}) == cudaSuccess &&
                            strata::core::allocate_device((void**) &dv, raw.size(),
-                               {"other", "Device allocations", "Drafter"}) == cudaSuccess &&
+                               {"drafter", "Device allocations", "Drafter"}) == cudaSuccess &&
                            cudaMemcpy(dv, raw.data(), raw.size(), cudaMemcpyHostToDevice) == cudaSuccess;
                     if (ok_x) {
                         strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dv, n_dvocab_,
@@ -943,7 +943,7 @@ struct MtpProf {
     void init() {
         if (!on || d != nullptr) return;
         if (strata::core::allocate_device((void**) &d, (size_t) kMpSlots * kMpGraphs * 8,
-            {"other", "Device allocations", "Drafter"}) != cudaSuccess) { on = false; d = nullptr; (void)
+            {"drafter", "Device allocations", "Drafter"}) != cudaSuccess) { on = false; d = nullptr; (void)
                 cudaGetLastError(); return; }
         cudaMemset(d, 0, (size_t) kMpSlots * kMpGraphs * 8);
         h.assign((size_t) kMpSlots * kMpGraphs, 0);
@@ -1584,7 +1584,7 @@ bool MtpDrafter::prepare_prefill(std::string& err) {
         pf_dev_ = nullptr;
         pf_cap_ = 0;
         if (strata::core::allocate_device((void**) &pf_dev_, (size_t) (max_t_ * per_row) * sizeof(int32_t),
-            {"other", "Drafter", "Prompt records"}) != cudaSuccess) {
+            {"drafter", "Drafter", "Prompt records"}) != cudaSuccess) {
             err = "mtp prefill: the input records do not fit";
             return false;
         }
@@ -1629,7 +1629,7 @@ bool MtpDrafter::reserve_prefill(int64_t n, std::string& err) {
     pf_dev_ = nullptr;
     pf_cap_ = 0;
     if (strata::core::allocate_device((void**) &pf_dev_, (size_t) (n * per_row) * sizeof(int32_t),
-        {"other", "Drafter", "Prompt records"}) != cudaSuccess) {
+        {"drafter", "Drafter", "Prompt records"}) != cudaSuccess) {
         err = "mtp prefill: the input records do not fit";
         return false;
     }
@@ -1667,7 +1667,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
             pf_dev_ = nullptr;
             pf_cap_ = 0;
             if (strata::core::allocate_device((void**) &pf_dev_, (size_t) (n * per_row) * sizeof(int32_t),
-                {"other", "Drafter", "Prompt records"}) != cudaSuccess) {
+                {"drafter", "Drafter", "Prompt records"}) != cudaSuccess) {
                 err = "mtp prefill: the input records do not fit";
                 return false;
             }

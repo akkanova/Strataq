@@ -2023,7 +2023,7 @@ struct Model::Impl {
         cudaSetDevice(d.id);
         const size_t b = align256(n * sizeof(T));
         if (strata::core::allocate_device(&v, b,
-                {acct == &d.weights && !d.loading_drafter ? "weights" : "other", "Device allocations",
+                {d.loading_drafter ? "drafter" : acct == &d.weights ? "weights" : "other", "Device allocations",
                  d.loading_drafter ? "Drafter" : label}) != cudaSuccess) {
             err = "cudaMalloc " + std::to_string(b >> 20) + " MiB on CUDA" + std::to_string(d.id) + " failed";
             return false;

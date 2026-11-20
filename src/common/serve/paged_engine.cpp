@@ -2344,12 +2344,20 @@ strata::serve::MemoryReport PagedEngine::describe_memory() const {
     report.settings.emplace_back("save_on_shutdown", settings_.save_on_shutdown ? 1 : 0);
     report.settings.emplace_back("suffix_draft", settings_.suffix_draft);
     report.settings.emplace_back("lookup_chain", settings_.lookup_chain);
-    uint64_t drafter_bytes = facts_.drafter_expert_bytes;
-    for (const PagedCard& card : cards_)
-        drafter_bytes += model_.get_drafter_weight_bytes(card);
+    // A model that reloads its dense drafter weights knows their size while they are unloaded (DeepSeek); otherwise
+    // the size is what the drafter holds on the cards now, nothing while it is off (Qwen's MTP)
+    uint64_t dense = 0, held = 0;
+    for (const PagedCard& card : cards_) {
+        dense += model_.get_drafter_weight_bytes(card);
+        held += report.at(card.id).get_use("drafter");
+    }
+    const uint64_t drafter_bytes = facts_.drafter_expert_bytes + std::max(dense, held);
     char cost[32];
     std::snprintf(cost, sizeof cost, "%.1f GiB", (double) drafter_bytes / 1073741824.0);
-    report.details = {{"drafter_label", "Use " + facts_.drafter_label + " drafter (" + cost + ")"},
+    const std::string drafter = facts_.drafter_label + " drafter";
+    report.details = {{"drafter_label", !facts_.has_drafter ? "No " + drafter + " loaded" :
+                                        drafter_bytes == 0 ? "Use " + drafter + " (size known once it is on)" :
+                                        "Use " + drafter + " (" + cost + ")"},
                       {"drafter_details", facts_.has_drafter ? "Discovered drafter: " + facts_.drafter_label :
                        "No model drafter was loaded on startup; restart with " + facts_.drafter_start},
                       {"suffix_label", "Use suffix drafter (0 GiB)"},

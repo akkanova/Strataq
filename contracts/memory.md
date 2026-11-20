@@ -10,7 +10,7 @@ so category names do not determine the divider position.
 It is followed by any number of lines of this form:
 
 ```text
-MEMORY_BLOCK gpu0 1048576 other Device%20allocations Drafter
+MEMORY_BLOCK gpu0 1048576 drafter Device%20allocations Drafter
 ```
 
 The fields are memory ID, bytes, category, pool name and block label.
@@ -141,7 +141,10 @@ The report may include `MEMORY_DETAIL <key> <percent-encoded-value>` lines.
 Python exposes these as the `details` dictionary. The paged engines supply
 `drafter_label`, `drafter_details`, `suffix_label` and `kv_quantization` for
 settings help. Drafter cost includes reloadable dense weights and prediction
-experts; per-conversation state is accounted separately. Older engines omit
+experts; per-conversation state is accounted separately. A drafter whose size
+is known only while it is loaded (Qwen's MTP) has no size while it is off, and
+the label says so. Without a drafter, `drafter_label` says none is loaded and
+the panel shows it as an option that cannot be chosen. Older engines omit
 these fields, so readers must allow missing discovery and cost information.
 
 Paged engines report `has_drafter`, `suffix_draft` and `lookup_chain` alongside

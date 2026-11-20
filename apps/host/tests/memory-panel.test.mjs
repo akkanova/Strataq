@@ -617,6 +617,13 @@ test('suffix mode uses engine labels and is submitted as one mutually exclusive 
   assert.deepEqual(calls, [[{drafter: false, suffix_draft: 3, lookup_chain: 0}, 'session']]);
 });
 
+test('a drafter the engine did not load is shown, with its words, but cannot be chosen', () => {
+  const view = {...live, settings: {...live.settings, drafter: 0, has_drafter: 0},
+    details: {drafter_label: 'No MTP drafter loaded'}};
+  const {element} = mount(view, () => {});
+  assert.match(element.innerHTML, /<option value="on" disabled>No MTP drafter loaded<\/option>/);
+});
+
 test('allocation tooltips sort every category by label', () => {
   const html = draw({available: true, settings: {}, memories: [{id: 'gpu0', total: GIB,
     uses: {other: GIB}, blocks: [
