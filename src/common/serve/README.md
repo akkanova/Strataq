@@ -15,6 +15,8 @@ engine).
 - `request.hpp`: a request line (`RUN`, `RUNI`, plus legacy handler forms) split into its parts, its token ids, and the
   sampling keys every engine reads; the logprobs keys and their `LP` lines (`format_logprob_line`, and `RowLogprobs`,
   which the paged engine's models fill as they pick tokens).
+- `option_names.hpp`: the older command-line names of a setting (`--reserve-mib`, `--eos`, `--slots`, ...) that each
+  parser built from `src/` reads as the primary name (`get_primary_option`). Header only.
 - `gpu_fatal.hpp`: how an engine ends after a fatal GPU error (#4350): `ERR fatal GPU error: <reason>` and exit code
   3, by which the server fails the request with a 503 and starts the engine again. Header only; the old engines and
   the paged engine call it where a step or a prompt read fails.

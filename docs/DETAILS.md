@@ -530,6 +530,27 @@ applies at the next start. Network, key, MCP and program keys are not editable t
 | `codex_thread_titles`, `codex_compaction_cache` | off | See [Codex CLI](#the-responses-api-and-codex-cli). |
 | `mcp_servers`, `mcp` | none | See [Tools from MCP servers](#tools-from-mcp-servers). |
 
+### Engine options with an older name
+
+Engines built from `src/` accept both names below wherever they support the setting. Use the first name;
+the older name is deprecated. Aliases do not add settings to engines that lack them. Installed older engines
+and the separate SYCL engine may accept only their original names. Launchers keep those spellings for compatibility.
+
+| Option | Older name, still taken |
+| --- | --- |
+| `--vram-reserve-mib N` | `--reserve-mib` (the DeepSeek engines) |
+| `--eos-ids LIST` | `--eos` (the DeepSeek engines) |
+| `--batch N` | `--slots` |
+| `--max-new N` | `--n` (strata-dsv41, strata-q36) |
+| `--max-context N` | `--ctx` (strata-q36) |
+| `--prefill N` | `--chunk` (strata-q36) |
+
+Some options look alike but are different settings. Qwen's `--gpu` hides the other cards from the engine; DeepSeek's
+`--gpus` picks cards among all of them. Qwen's `--pool-workers` counts the threads beside the engine's own; DeepSeek's
+`--cpu-threads` counts that one too. Qwen3.8's `--prefill` takes `auto` and `auto:N`; Qwen3.6 takes `auto` or a number.
+EOS lists use comma-separated token IDs. DeepSeek's `--prefill-chunk 0` means
+windows of 16 tokens. strata-dsv41 takes its conversations at once as `--parallel`.
+
 ### Streaming and tool calls
 
 - With `"stream": true` everything arrives as it is made: thinking, answer and tool calls (the tool's name first, then its

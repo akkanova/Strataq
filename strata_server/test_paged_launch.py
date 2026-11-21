@@ -46,6 +46,14 @@ class PagedLaunchTests(unittest.TestCase):
             self.assertEqual(args[args.index('--batch') + 1], '4')
             self.assertEqual(args[args.index('--dspark') + 1], 'none')
 
+    def test_both_names_use_spellings_supported_by_older_engines(self):
+        args = ['--vram-reserve-mib', '700', '--reserve-mib', '600', '--eos-ids', '1', '--eos', '2', '--slots', '3']
+        for exe in ('strata-q38', 'strata-ds41'):
+            reserve, eos = (('--reserve-mib', '--eos') if exe == 'strata-ds41' else
+                            ('--vram-reserve-mib', '--eos-ids'))
+            self.assertEqual(engine_client.engine_args({'exe': exe, 'args': args}),
+                             [reserve, '700', reserve, '600', eos, '1', eos, '2', '--batch', '3'])
+
     def test_lookup_options_reach_both_engines(self):
         args = ['--suffix-draft', '3', '--lookup-chain', '2', '--lookup-chain-min', '6', '--mtp-max-t', '4']
         for exe in ('strata-q38', 'strata-ds41'):
@@ -82,9 +90,7 @@ class PagedLaunchTests(unittest.TestCase):
         self.assertEqual(engine_client.engine_args(cfg)[-2:], ['--dspark', 'none'])
 
     def test_gpu_names_and_explicit_pool_budget(self):
-        self.assertEqual(engine_client.engine_args({'exe': 'strata-ds41', 'args': ['--gpu', '1,0',
-                                                                             '--vram-reserve-mib', '700']}),
-                         ['--gpus', '1,0', '--reserve-mib', '700'])
+        self.assertEqual(engine_client.engine_args({'exe': 'strata-ds41', 'args': ['--gpu', '1,0']}), ['--gpus', '1,0'])
         cfg = {'exe': 'strata-q38', 'args': ['--gpus', '1', '--resident-budget-gib', '2.5']}
         self.assertEqual(engine_client.engine_args(cfg), ['--gpu', '1', '--ram-mib', '2560'])
         cfg['args'] += ['--ram-mib', '1024']

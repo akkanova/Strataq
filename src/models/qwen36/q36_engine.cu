@@ -22,6 +22,7 @@
 #include "strata/common/artifact/gguf_reader.hpp"
 #include "strata/models/common/family_layout.hpp"
 #include "strata/common/serve/loop.hpp"
+#include "strata/common/serve/option_names.hpp"
 #include "strata/common/serve/request.hpp"
 #include "strata/common/state/state_layout.hpp"
 #include "strata/common/state/token_listing.hpp"
@@ -3663,7 +3664,7 @@ int strata::qwen35::run(int argc, char** argv) {
     int expert_slots = 0, batch = 0, draft_vocab = -1;
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false;
     for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
+        const std::string a = strata::serve::get_primary_option(argv[i]);
         auto next = [&]() -> std::string {
             if (i + 1 >= argc) { std::fprintf(stderr, "strata-q36: %s needs a value\n", a.c_str()); std::exit(2); }
             return argv[++i];
@@ -3676,10 +3677,9 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--gpu") (void) next();   // applied by strata before the switch (CUDA/HIP_VISIBLE_DEVICES)
         else if (a == "--greedy") {}            // --tokens decodes greedily here anyway
         else if (a == "--serve") serve_mode = true;
-        else if (a == "--max-context" || a == "--ctx") ctx = std::atoi(next().c_str());
-        else if (a == "--chunk" || a == "--prefill") { const std::string v = next(); chunk = v == "auto" ? 0 : std::atoi(v.c_str()); }
+        else if (a == "--max-context") ctx = std::atoi(next().c_str());
+        else if (a == "--prefill") { const std::string v = next(); chunk = v == "auto" ? 0 : std::atoi(v.c_str()); }
         else if (a == "--tokens") tokens = next();
-        else if (a == "--n") n_gen = std::atoi(next().c_str());
         else if (a == "--force") force = next();
         else if (a == "--emb") emb_file = next();   // --tokens with pictures: a strata-vision file (the ids carry <|image_pad|> runs)
         else if (a == "--dump-full-logits") dump_full = next();
@@ -3696,7 +3696,7 @@ int strata::qwen35::run(int argc, char** argv) {
         }
         else if (a == "--draft-vocab") draft_vocab = std::atoi(next().c_str());   // the MTP drafts pick among the first N token ids
         else if (a == "--vision") vision = true;                                  // pictures (GENI): the encoder is strata-vision's
-        else if (a == "--batch" || a == "--slots") batch = std::atoi(next().c_str());   // sessions decoding together
+        else if (a == "--batch") batch = std::atoi(next().c_str());                     // sessions decoding together
         else if (a == "--batch-mtp") batch_mtp = true;                                  // ... each verifying an MTP proposal
         else if (a == "--expert-vram") expert_vram = std::atof(next().c_str());   // GiB for the routed experts
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
@@ -3711,8 +3711,8 @@ int strata::qwen35::run(int argc, char** argv) {
             if (val) ++i;
         } else {
             std::fprintf(stderr,
-                         "usage: strata-q36 --model GGUF [--max-context 32768] [--chunk 512] [--no-graph]\n"
-                         "       (--serve | --tokens IDS [--n 64] [--force IDS] [--dump-full-logits F] | --bench-pp N "
+                         "usage: strata-q36 --model GGUF [--max-context 32768] [--prefill 512] [--no-graph]\n"
+                         "       (--serve | --tokens IDS [--max-new 64] [--force IDS] [--dump-full-logits F] | --bench-pp N "
                          "--bench-tg N)\n");
             return 2;
         }
@@ -3722,7 +3722,7 @@ int strata::qwen35::run(int argc, char** argv) {
     strata::platform::set_env("STRATA_Q8_PACKED", "1", false);   // the packed Q8_0 decode copy unless STRATA_Q8_PACKED is set otherwise
     strata::platform::set_env("STRATA_MMQ_KQ", "1", false);      // the K-quant MMQ prompt kernels (every expert of this family is a K-quant)
     if (mtp_d < 0 || mtp_d > 7) { std::fprintf(stderr, "strata-q36: --mtp takes 0 .. 7 drafts\n"); return 2; }
-    if (chunk < 0 || chunk > 4096 || ctx < 256) { std::fprintf(stderr, "strata-q36: bad --chunk / --max-context\n"); return 2; }
+    if (chunk < 0 || chunk > 4096 || ctx < 256) { std::fprintf(stderr, "strata-q36: bad --prefill / --max-context\n"); return 2; }
     Model m;
     std::string err;
     try {

@@ -12,6 +12,7 @@
 #include "strata/common/experts/ram_experts.hpp"
 #include "strata/common/experts/card_rules.hpp"
 #include "strata/common/experts/split_rules.hpp"
+#include "strata/common/serve/option_names.hpp"
 #include "strata/common/serve/paged_engine.hpp"
 #include "strata/common/serve/paged_model.hpp"
 #include "strata/common/state/restore_points.hpp"
@@ -1290,11 +1291,11 @@ bool PagedDeepSeek::go_to(int64_t pos, std::string& err) {
     return false;
 }
 
-/// Reads the model's own options, strata-ds41's (`x`) and --eos from `argv` (the paged engine's are gone) into `o`, `x`
-/// and `eos`.  -1: go on, else the exit status.
+/// Reads the model's own options, strata-ds41's (`x`) and --eos-ids from `argv` (the paged engine's are gone) into `o`,
+/// `x` and `eos`.  -1: go on, else the exit status.
 int read_model_options(int argc, char** argv, Options& o, ProgramOptions& x, std::string& eos) {
     for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
+        const std::string a = strata::serve::get_primary_option(argv[i]);
         const auto val = [&](const char* what) -> std::string {
             if (i + 1 >= argc) {
                 std::fprintf(stderr, "%s: %s needs a value\n", kProgram.c_str(), what);
@@ -1304,8 +1305,8 @@ int read_model_options(int argc, char** argv, Options& o, ProgramOptions& x, std
         };
         if (read_option(a, val, o, x.drafting))
             continue;
-        if (a == "--eos")
-            eos = val("--eos");
+        if (a == "--eos-ids")
+            eos = val("--eos-ids");
         else if (a == "--batch")
             x.batch = std::max(0, std::atoi(val("--batch").c_str()));
         else if (a == "--expert-cache") {
