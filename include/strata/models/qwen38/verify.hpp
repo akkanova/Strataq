@@ -491,6 +491,12 @@ public:
 private:
     /// Checks whether each conversation owns exactly one row, so no rejected state needs replaying.
     bool can_self_commit(const int* rows, int count) const;
+    /// Writes each slot group's accepted prefix (`keep[slot]` rows, or all its rows if `keep` is null) and the rows'
+    /// positions `pos` into the slot's commit record in `records`; fails if a prefix is empty or overruns its group.
+    bool write_slot_prefixes(const int* rows, int S, const int* keep, const int64_t* pos, int32_t* records,
+                             std::string& err) const;
+    /// Moves each slot's last two PLE hash tokens past its accepted rows' `tokens` (the host's side of a commit).
+    void advance_ple_prev(const int* rows, int S, const int* keep, const int32_t* tokens);
     bool batch_self_commit_default_ = false; ///< The caller's policy when no environment override is set.
     bool batch_self_commit_ = false; ///< The policy resolved before any graphs are captured.
     bool resident_shared_inline_ = false; ///< Avoids competing weight reads when a resident batch plans on device.

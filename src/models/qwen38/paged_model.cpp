@@ -1240,9 +1240,8 @@ bool PagedQwen::keep_group(int group, const std::vector<strata::spec::StepRow>& 
                           const std::vector<int>& kept, bool drafting, std::string& err) {
     Group& g = *groups_[(size_t) group];
     std::vector<int> keep((size_t) sessions_, 0);
-    for (size_t r = 0, c = 0; r < rows.size(); ++r)
-        if (r == 0 || rows[r].session != rows[r - 1].session)
-            keep[(size_t) rows[r].session] = kept[c++];
+    size_t c = 0;
+    strata::spec::for_each_window(rows, [&](size_t first, size_t) { keep[(size_t) rows[first].session] = kept[c++]; });
     for (auto& card : cards_) {
         if (!card.ver->restore_slot_commit_inputs(g.sessions.data(), (int) rows.size(),
                 group * strata::kernels::kVerifyMaxT, g.tokens.data(), g.positions.data(), err) ||
@@ -1255,9 +1254,8 @@ bool PagedQwen::keep_group(int group, const std::vector<strata::spec::StepRow>& 
 bool PagedQwen::keep_rows(const std::vector<strata::spec::StepRow>& rows, const std::vector<int>& kept, bool drafting,
                           std::string& err) {
     std::vector<int> keep((size_t) sessions_, 0);
-    for (size_t r = 0, c = 0; r < rows.size(); ++r)
-        if (r == 0 || rows[r].session != rows[r - 1].session)
-            keep[(size_t) rows[r].session] = kept[c++];
+    size_t c = 0;
+    strata::spec::for_each_window(rows, [&](size_t first, size_t) { keep[(size_t) rows[first].session] = kept[c++]; });
     const bool all = rows.size() == kept.size();   // one row each, kept
     // Serial turns must preserve the owned rows of conversations that are waiting for their next turn.
     if (drafting && !drafter_->note_window(rows, kept, picks_.data(), err,

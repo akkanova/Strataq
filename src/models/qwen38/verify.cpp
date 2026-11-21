@@ -22,6 +22,7 @@
 #include "strata/base/gpu/dma_batch.hpp"
 #include "strata/common/kernels/spec_prob.hpp"
 #include "strata/common/kernels/spec_proposal.hpp"
+#include "strata/common/spec/step.hpp"
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -334,6 +335,14 @@ bool one_row_per_slot(const int* rows, int S) {
         for (int j = i + 1; j < S; ++j)
             if (rows[i] == rows[j]) return false;
     return S >= 1;
+}
+
+/// Calls `fn(first, end)` for each slot group among rows [begin, end): a run of rows of one slot `rows[t]`
+/// (strata::spec::for_each_window, which also says how `fn` can stop the walk).
+template <class Fn>
+bool for_each_slot_group(const int* rows, int begin, int end, Fn&& fn) {
+    return strata::spec::for_each_window(end - begin, [&](int t) { return rows[begin + t]; },
+                                         [&](int first, int last) { return fn(begin + first, begin + last); });
 }
 
 // The shared expert runs on its own stream, forked off and joined back per layer (`sh_fork` in record_window).  The
@@ -1736,16 +1745,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!side_proj) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
                 stamp(l, 2, grp);
                 if (batch_rec_ && !fuse_ab) {   // contiguous rows may be proposals for the same slot
-                    for (int t = tb; t < te;) {
-                        const int first = t;
-                        while (t < te && brow_[t] == brow_[first]) ++t;
+                    for_each_slot_group(brow_, tb, te, [&](int first, int t) {
                         SessionState& sx = slot_ss(first);
                         const float* cx = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats +
                                           (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
                         gdn_conv_l2_multi(cx, qkv + (size_t) first * C, (const float*) wc->data,
                                           hb + (size_t) first * C, (int) C, (int) (2 * HK), EPS, t - first, cs, 0,
                                           keep_rows);
-                    }
+                    });
                 } else
                 // a one-token window keeps its token: it advances the conv history and the state itself (commit)
                 if (fuse_ab)   // 143-amdk: the conv and the a/b projections in one launch
@@ -1785,23 +1792,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }();
                 if (batch_rec_ && gdn_groups_on && te - tb <= 8) {
                     strata::kernels::GdnGroups gg;
-                    for (int t = tb; t < te;) {
-                        const int first = t;
-                        while (t < te && brow_[t] == brow_[first]) ++t;
+                    for_each_slot_group(brow_, tb, te, [&](int first, int t) {
                         SessionState& sx = slot_ss(first);
                         gg.state[gg.n] = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats;
                         gg.first[gg.n] = first;
                         gg.ntok[gg.n] = t - first;
                         gg.keep[gg.n] = keep_rows ? one_ : nullptr;   // STRATA_BATCH_SELF_COMMIT: the window keeps its one-row groups itself
                         ++gg.n;
-                    }
+                    });
                     strata::kernels::gdn_step_norm_groups(gg, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS,
                                                           y_, (int) HK, (int) HV, keep_rows, cs);
                 } else
                 if (batch_rec_) {   // each slot's recurrence over its own proposed-token group
-                    for (int t = tb; t < te;) {
-                        const int first = t;
-                        while (t < te && brow_[t] == brow_[first]) ++t;
+                    for_each_slot_group(brow_, tb, te, [&](int first, int t) {
                         SessionState& sx = slot_ss(first);
                         float* stx = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats;
                         gdn_step_norm_multi(stx, hb + (size_t) first * C, (int) C, gate + (size_t) first * HV,
@@ -1809,7 +1812,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                             (const float*) wnm->data, EPS, y_ + (size_t) first * ZV,
                                             (int) HK, (int) HV, t - first, keep_rows ? one_ : nullptr, cs, 0,
                                             g_qfuse() ? xq_ + (size_t) first * (ZV / 32) * 36 : nullptr);
-                    }
+                    });
                 } else
                 gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
                                     (int) HV, te, self_commit ? one_ : nullptr, cs, tb, g_qfuse() ? (void*) xq_ : nullptr);
@@ -4057,20 +4060,14 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
             if (t == 0 || rows[t] != rows[t - 1])
                 copy_i32_from_mapped(commitb_ + (size_t) rows[t] * CB, m_commitb_ + (size_t) rows[t] * CB, CB, cs_);
         std::vector<bool> qsa_batched(slots_.size(), false);
-        for (int t = 0; t < S;) {
-            const int first = t;
-            while (t < S && rows[t] == rows[first])
-                ++t;
+        ok = for_each_slot_group(rows, 0, S, [&](int first, int t) {
             const int slot = rows[first];
             const MropeTableScope image_table(slot_image_tables_.empty() ? mrope_table() : slot_image_tables_[slot]);
             qsa_batched[(size_t) slot] = try_record_qsa_commit_layers(
                 *slots_[(size_t) slot], first, t - first, commitb_ + (size_t) slot * CB + 2,
                 tail_snap_b_ + (size_t) slot * nQ * TS, err);
-            if (!err.empty()) {
-                ok = false;
-                break;
-            }
-        }
+            return err.empty();
+        });
         int64_t qsa_index = 0, gdn_index = 0;
         for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
         for (int64_t l = lb_; l < le_ && ok; ++l) {
@@ -4084,9 +4081,7 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                 bool one_row = S <= 8;
                 for (int t = 1; one_row && t < S; ++t) one_row = rows[t] != rows[t - 1];
                 strata::kernels::GdnGroups gg;
-                for (int t = 0; t < S;) {
-                    const int first = t;
-                    while (t < S && rows[t] == rows[first]) ++t;
+                for_each_slot_group(rows, 0, S, [&](int first, int t) {
                     SessionState& sx = *slots_[(size_t) rows[first]];
                     const int32_t* keep = commitb_ + (size_t) rows[first] * CB;
                     float* state = sx.gdn_state + (size_t) (gdn_index - sx.gdn_ord0) * gdn_floats;
@@ -4099,7 +4094,7 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                         gg.first[gg.n] = first;
                         gg.ntok[gg.n] = 1;
                         ++gg.n;
-                        continue;
+                        return;
                     }
                     gdn_step_norm_multi(state, h_L_ + (size_t) gdn_index * MT * C + (size_t) first * C, (int) C,
                                         gate_L_ + (size_t) gdn_index * MT * HV + (size_t) first * HV,
@@ -4108,7 +4103,7 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                                         y_dummy_ + (size_t) first * ZV, (int) g.ssm_k_heads,
                                         (int) HV, t - first, keep, cs_,
                                         t - first > 1 ? t - first : 0);   // a 1-row group keeps the 0.1.39 kernel
-                }
+                });
                 if (gg.n > 0)
                     gdn_step_norm_groups(gg, h_L_ + (size_t) gdn_index * MT * C, (int) C,
                                          gate_L_ + (size_t) gdn_index * MT * HV, beta_L_ + (size_t) gdn_index * MT * HV,
@@ -4118,11 +4113,9 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
             } else {
                 const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
                 if (!wikn) { ok = false; break; }
-                for (int t = 0; t < S;) {
-                    const int first = t;
-                    while (t < S && rows[t] == rows[first]) ++t;
+                for_each_slot_group(rows, 0, S, [&](int first, int t) {
                     if (qsa_batched[(size_t) rows[first]])
-                        continue;
+                        return;
                     const MropeTableScope image_table(slot_image_tables_.empty()
                         ? mrope_table() : slot_image_tables_[(size_t) rows[first]]);
                     const QsaState& st = slots_[(size_t) rows[first]]->qsa_states[qsa_index];
@@ -4134,17 +4127,15 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                                                   commitb_ + (size_t) rows[first] * CB + 2 + (u - first),
                                                   0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                                   rope_scaling(), cs_);
-                }
+                });
                 ++qsa_index;
             }
         }
         if (ok && ss_->ple.ready() && ple_stage())
-            for (int t = 0; t < S;) {
-                const int first = t;
-                while (t < S && rows[t] == rows[first]) ++t;
+            for_each_slot_group(rows, 0, S, [&](int first, int) {
                 copy_indexed(slots_[(size_t) rows[first]]->ple_hist, hist_snap_ + (size_t) first * HS,
                              HS, commitb_ + (size_t) rows[first] * CB + 1, HS, cs_);
-            }
+            });
     } catch (const std::exception& e) {
         err = std::string("verify batch commit: ") + e.what();
         ok = false;
@@ -4281,9 +4272,7 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
                 if (!is_qsa_layer(g, l)) {
                     const WeightRef* wnm = need(v, "ssm_norm.weight", err);
                     if (!wnm) { ok = false; break; }
-                    for (int t = 0; t < S;) {
-                        const int first = t;
-                        while (t < S && rows[t] == rows[first]) ++t;
+                    for_each_slot_group(rows, 0, S, [&](int first, int t) {
                         SessionState& sx = *slots_[(size_t) rows[first]];
                         const int32_t* keep = commitd_ + (size_t) rows[first] * CB;
                         float* state = sx.gdn_state + (size_t) (gdn_index - sx.gdn_ord0) * gdn_floats;
@@ -4296,14 +4285,12 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
                                             (const float*) wnm->data, EPS, y_dummy_ + (size_t) first * ZV,
                                             (int) g.ssm_k_heads, (int) HV, t - first, keep, cs_,
                                             t - first > 1 ? t - first : 0);
-                    }
+                    });
                     ++gdn_index;
                 } else {
                     const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
                     if (!wikn) { ok = false; break; }
-                    for (int t = 0; t < S;) {
-                        const int first = t;
-                        while (t < S && rows[t] == rows[first]) ++t;
+                    for_each_slot_group(rows, 0, S, [&](int first, int t) {
                         const QsaState& st = slots_[(size_t) rows[first]]->qsa_states[qsa_index];
                         copy_from_mapped(st.idx_tail, tail_snap_b_ + ((size_t) rows[first] * nQ + qsa_index) * TS, TS, cs_);
                         const QsaIndexerBuffers ib = qsa_indexer_buffers(st);
@@ -4312,17 +4299,15 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
                                                       commitd_ + (size_t) rows[first] * CB + 2 + (u - first), 0,
                                                       (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                                       rope_scaling(), cs_);
-                    }
+                    });
                     ++qsa_index;
                 }
             }
             if (ok && ple)
-                for (int t = 0; t < S;) {
-                    const int first = t;
-                    while (t < S && rows[t] == rows[first]) ++t;
+                for_each_slot_group(rows, 0, S, [&](int first, int) {
                     copy_indexed(slots_[(size_t) rows[first]]->ple_hist, dc_hist_ + (size_t) (hbase + first) * HS, HS,
                                  commitd_ + (size_t) rows[first] * CB + 1, HS, cs_);
-                }
+                });
         } catch (const std::exception& e) {
             err = std::string("verify deferred commit: ") + e.what();
             ok = false;
@@ -4363,33 +4348,16 @@ bool Verifier::batch_commit_rows(const int* rows, int S, int hbase, const int* k
     const OnDevice on_device(device_);
     const auto it = dcommit_bm_.find(bkey(rows, S, hbase));
     if (it == dcommit_bm_.end() || it->second == nullptr) { err = "verify: a deferred commit without its window"; return false; }
-    const int64_t CB = 2 + max_t_;
     // Each slot's accepted prefix.  The graph reads it from mapped memory when it runs; this slot's entry is written
     // again only at its next verdict, which comes after its next window has passed this stage - behind this commit.
-    for (int t = 0; t < S;) {
-        const int first = t;
-        while (t < S && rows[t] == rows[first]) ++t;
-        const int n = keep[rows[first]];
-        if (n < 1 || n > t - first) { err = "verify: accepted prefix is outside its slot group"; return false; }
-        int32_t* c = h_commitd_ + (size_t) rows[first] * CB;
-        c[0] = n;
-        c[1] = n - 1;
-        for (int64_t j = 0; j < max_t_; ++j) c[2 + j] = j < n ? (int32_t) pos[first + j] : -1;
-    }
+    if (!write_slot_prefixes(rows, S, keep, pos, h_commitd_, err))
+        return false;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     const cudaError_t le = cudaGraphLaunch(it->second, cs_);
     if (le != cudaSuccess) { err = std::string("verify: deferred commit launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
-    if (ple_stage())   // the host's side of the commit (the hash's last two tokens), the accepted rows only
-        for (int t = 0; t < S;) {
-            const int first = t;
-            while (t < S && rows[t] == rows[first]) ++t;
-            SessionState& sx = *slots_[(size_t) rows[first]];
-            for (int u = first; u < first + keep[rows[first]]; ++u) {
-                sx.ple_prev[0] = sx.ple_prev[1];
-                sx.ple_prev[1] = tokens[u];
-            }
-        }
+    if (ple_stage())
+        advance_ple_prev(rows, S, keep, tokens);
     return true;
 }
 
@@ -4676,16 +4644,7 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     }
     // Each slot owns a contiguous group. The default commit keeps all its rows; speculative
     // decoding may change the prefix length after comparing the draft with these picks.
-    const int64_t CB = 2 + max_t_;
-    for (int t = 0; t < S;) {
-        const int first = t;
-        while (t < S && rows[t] == rows[first]) ++t;
-        int32_t* c = h_commitb_ + (size_t) rows[first] * CB;
-        c[0] = t - first;
-        c[1] = t - first - 1;
-        for (int64_t j = 0; j < max_t_; ++j)
-            c[2 + j] = j < t - first ? (int32_t) pos[first + j] : -1;
-    }
+    (void) write_slot_prefixes(rows, S, nullptr, pos, h_commitb_, err);
     *(volatile uint32_t*) h_seq_ = 0;
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
@@ -4857,22 +4816,9 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err, bool chai
     if (!last_batch_ || last_t_ < 1) { err = "verify: commit_slots without a batch window"; return false; }
     const int S = last_t_;
     const Clock::time_point t0 = Clock::now();
-    const int64_t CB = 2 + max_t_;
     // One prefix per slot: rejected draft rows must not enter recurrent state.
-    for (int t = 0; t < S;) {
-        const int first = t;
-        while (t < S && last_rows_[t] == last_rows_[first]) ++t;
-        const int n = keep[last_rows_[first]];
-        if (n < 1 || n > t - first) {
-            err = "verify: accepted prefix is outside its slot group";
-            return false;
-        }
-        int32_t* c = h_commitb_ + (size_t) last_rows_[first] * CB;
-        c[0] = n;
-        c[1] = n - 1;
-        for (int j = 0; j < max_t_; ++j)
-            c[2 + j] = j < n ? (int32_t) last_pos_b_[first + j] : -1;
-    }
+    if (!write_slot_prefixes(last_rows_, S, keep, last_pos_b_, h_commitb_, err))
+        return false;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     if (!can_self_commit(last_rows_, S)) {   // (else the window has kept its rows)
         const cudaError_t le = cudaGraphLaunch(commit_bm_[bkey(last_rows_, S, row_base_)], cs_);
@@ -4881,15 +4827,7 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err, bool chai
             return false;
     }
     if (ple_stage())
-        for (int t = 0; t < S;) {
-            const int first = t;
-            while (t < S && last_rows_[t] == last_rows_[first]) ++t;
-            SessionState& sx = *slots_[(size_t) last_rows_[first]];
-            for (int u = first; u < first + keep[last_rows_[first]]; ++u) {
-                sx.ple_prev[0] = sx.ple_prev[1];
-                sx.ple_prev[1] = last_tokens_[u];
-            }
-        }
+        advance_ple_prev(last_rows_, S, keep, last_tokens_);
     ms_commit += ms_since(t0);
     return !chain || next_ == nullptr || next_->commit_slot_prefixes(keep, err);
 }
@@ -5711,6 +5649,34 @@ void Verifier::absorb_stats(Verifier& o) {
 
 bool Verifier::can_self_commit(const int* rows, int count) const {
     return batch_self_commit_ && one_row_per_slot(rows, count);
+}
+
+bool Verifier::write_slot_prefixes(const int* rows, int S, const int* keep, const int64_t* pos, int32_t* records,
+                                   std::string& err) const {
+    const int64_t CB = 2 + max_t_;
+    return for_each_slot_group(rows, 0, S, [&](int first, int t) {
+        const int n = keep ? keep[rows[first]] : t - first;
+        if (n < 1 || n > t - first) {
+            err = "verify: accepted prefix is outside its slot group";
+            return false;
+        }
+        int32_t* c = records + (size_t) rows[first] * CB;
+        c[0] = n;
+        c[1] = n - 1;
+        for (int64_t j = 0; j < max_t_; ++j)
+            c[2 + j] = j < n ? (int32_t) pos[first + j] : -1;
+        return true;
+    });
+}
+
+void Verifier::advance_ple_prev(const int* rows, int S, const int* keep, const int32_t* tokens) {
+    for_each_slot_group(rows, 0, S, [&](int first, int) {
+        SessionState& sx = *slots_[(size_t) rows[first]];
+        for (int u = first; u < first + keep[rows[first]]; ++u) {
+            sx.ple_prev[0] = sx.ple_prev[1];
+            sx.ple_prev[1] = tokens[u];
+        }
+    });
 }
 
 bool Verifier::try_record_qsa_commit_layers(const SessionState& ss, int first, int count,

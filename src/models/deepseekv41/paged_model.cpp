@@ -977,16 +977,12 @@ bool PagedDeepSeek::run_rows(const std::vector<strata::spec::StepRow>& rows, std
             return false;
         picks = g.picks;
         const auto& pending = g.pending;
-        for (size_t first = 0; first < pending.size();) {
-            size_t end = first + 1;
-            const int session = rows[pending[first]].session;
-            while (end < pending.size() && rows[pending[end]].session == session)
-                ++end;
+        strata::spec::for_each_window(pending.size(), [&](size_t i) { return rows[pending[i]].session; },
+                                      [&](size_t first, size_t end) {
             const int count = (int) (end - first);
-            joint_windows_.push_back({session, (int) first, count});
+            joint_windows_.push_back({rows[pending[first]].session, (int) first, count});
             counts.push_back(count);
-            first = end;
-        }
+        });
         if (!pending.empty() && !m_.step_conversations(tokens, [&](int r) {
                 leads_[(size_t) rows[pending[(size_t) r]].session]->take_seat();
             }, [&](int r) {
@@ -1066,30 +1062,26 @@ bool PagedDeepSeek::prepare_inputs(GroupRows& g, const std::vector<strata::spec:
     g.rows = rows;
     g.pending.clear();
     g.picks.assign(rows.size(), -1);
-    for (size_t r = 0; r < rows.size();) {
-        size_t end = r + 1;
-        while (end < rows.size() && rows[end].session == rows[r].session)
-            ++end;
-        Part& p = *leads_[(size_t) rows[r].session];
-        const bool primed = end == r + 1 && p.primed_pos == rows[r].pos &&
-                            p.primed_token == rows[r].token && p.get_pos() == rows[r].pos + 1;
+    return strata::spec::for_each_window(rows, [&](size_t first, size_t end) {
+        Part& p = *leads_[(size_t) rows[first].session];
+        const bool primed = end == first + 1 && p.primed_pos == rows[first].pos &&
+                            p.primed_token == rows[first].token && p.get_pos() == rows[first].pos + 1;
         p.primed_pos = -1;
         if (primed) {
-            g.picks[r] = p.primed_pick;
-            r = end;
-            continue;
+            g.picks[first] = p.primed_pick;
+            return true;
         }
         p.take_seat();
-        if (!go_to(rows[r].pos, err))
+        if (!go_to(rows[first].pos, err))
             return false;
         if (p.prompt_open)
             m_.checkpoint(kBeforeLastCheck);
-        for (; r < end; ++r) {
+        for (size_t r = first; r < end; ++r) {
             g.pending.push_back(r);
             tokens.push_back(rows[r].token);
         }
-    }
-    return true;
+        return true;
+    });
 }
 
 /// Samples in row order after every stage has finished writing retained logits.
@@ -1110,19 +1102,15 @@ void PagedDeepSeek::sample_pending_rows(GroupRows& g) {
 bool PagedDeepSeek::keep_rows(const std::vector<strata::spec::StepRow>& rows, const std::vector<int>& kept, bool,
                               std::string& err) {
     if (!joint_windows_.empty()) {
-        size_t row = 0, group = 0;
-        for (const JointWindow& window : joint_windows_) {
-            while (rows[row].session != window.session) {
-                const int session = rows[row].session;
-                while (row < rows.size() && rows[row].session == session)
-                    ++row;
-                ++group;
-            }
+        size_t joint = 0, group = 0;
+        return strata::spec::for_each_window(rows, [&](size_t first, size_t) {
+            const int k = kept[group++];
+            if (joint == joint_windows_.size() || joint_windows_[joint].session != rows[first].session)
+                return true;
+            const JointWindow& window = joint_windows_[joint++];
             leads_[(size_t) window.session]->take_seat();
-            if (!m_.keep_joint_rows(window.first, window.count, kept[group], err))
-                return false;
-        }
-        return true;
+            return m_.keep_joint_rows(window.first, window.count, k, err);
+        });
     }
     if (verified_ == 0)
         return true;

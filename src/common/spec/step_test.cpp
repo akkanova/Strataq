@@ -73,6 +73,36 @@ Decoding conversation(int session, int32_t next, int64_t pos, int64_t max_new) {
 
 int main() {
     {
+        std::vector<std::pair<size_t, size_t>> windows;
+        check(!for_each_window(std::vector<StepRow>{{3}, {3}, {1}, {3}}, [&](size_t first, size_t end) {
+                  windows.emplace_back(first, end);
+                  return first == 0;
+              }) && windows == std::vector<std::pair<size_t, size_t>>{{0, 2}, {2, 3}},
+              "windows are runs of one conversation's rows, and a false return stops the walk");
+        windows.clear();
+        check(for_each_window(std::vector<StepRow>{{3}, {3}, {1}, {3}}, [&](size_t first, size_t end) {
+                  windows.emplace_back(first, end);
+              }) && windows == std::vector<std::pair<size_t, size_t>>{{0, 2}, {2, 3}, {3, 4}},
+              "void callbacks visit every run, including a repeated conversation and the final singleton");
+        check(for_each_window(std::vector<StepRow>{}, [](size_t, size_t) { return false; }), "no rows, no windows");
+    }
+    {
+        const int slots[] = {3, 3, 3, 1, 3, 3};
+        std::vector<std::pair<int, int>> windows;
+        check(for_each_window(4, [&](int r) { return slots[1 + r]; }, [&](int first, int end) {
+                  windows.emplace_back(1 + first, 1 + end);
+                  return true;
+              }) && windows == std::vector<std::pair<int, int>>{{1, 3}, {3, 4}, {4, 5}},
+              "signed indices preserve a subrange's clipped first and last runs");
+        int reads = 0, calls = 0;
+        check(for_each_window(0, [&](int) { ++reads; return 0; }, [&](int, int) { ++calls; }) &&
+                  reads == 0 && calls == 0,
+              "an empty range invokes neither the session lookup nor the callback");
+        reads = 0;
+        check(!for_each_window(4, [&](int r) { ++reads; return r; }, [](int, int) { return false; }) && reads == 2,
+              "stopping at the first window does not inspect later windows");
+    }
+    {
         std::vector<StepGroup> groups(1);
         std::string err;
         check(!run_stage_groups({}, groups, err), "missing stages are rejected without polling");
