@@ -82,7 +82,7 @@ The NVFP4 table does not fit in RAM beside the page cache the 68 GB expert file 
 decode, against 1,252 and 39 without. Leave it on the SSD (setup does).
 
 DeepSeek-V4.1-Flash 2.00 bpw places 12,163 of its 15,744 experts in the GPU's share and runs the rest on the CPU lane from the model's files.
-The engine sizes that from the memory Linux can still give back (`MemAvailable` less 6 GiB, `DS4_UMA_HEADROOM_GIB`), because the model files' page
+The engine sizes that from the memory Linux can still give back (`MemAvailable` less 6 GiB, `STRATA_UMA_HEADROOM_GIB`), because the model files' page
 cache is most of the memory `cudaMemGetInfo` calls used.
 
 ## Speeds

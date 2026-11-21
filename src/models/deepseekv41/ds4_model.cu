@@ -13,6 +13,7 @@
 //   moe(x): 6 of 384 routed experts (sqrt-softplus scores, biased top-k) + the shared expert
 //   h = post * moe + comb^T h;  pre = f_pre
 // and after the last layer logits = head(rmsnorm(sum_s pre[s] h[s])).
+#include "strata/common/experts/ram_tier.hpp"
 #include "strata/common/state/restore_points.hpp"
 #include "ds4_ring_link.hpp"
 #include "ds4_launch.h"   // strata_ds4_launch: <<<>>> on CUDA and HIP, a dispatch on Metal
@@ -26,6 +27,7 @@
 #include "ds4_gguf_cpu.hpp"
 #include "ds4_kernels.cuh"
 #include "strata/models/deepseekv41/geometry.hpp"
+#include "strata/base/gpu/gpu_set.hpp"
 #include "strata/base/gpu/memory_info.hpp"
 #include "strata/base/gpu/runtime.hpp"
 #include "strata/base/gpu/on_device.hpp"
@@ -244,71 +246,20 @@ void free_node_memory(void* p, size_t bytes) {
     platform::anon_free(p, bytes);
 }
 void pin_self(int cpu) { platform::pin_self(cpu); }
-// the RAM this process can still get: MemAvailable, and below it the tightest cgroup v2 limit on the way to the root
-// (its limit less what is charged, the page cache counted as free: the kernel takes it back); ~0: not known
+// the RAM this process can still get (~0: not known), cgroup limits included.  macOS: not known (this engine's
+// placement has not been tried with host_available_memory's vm_stat figure there)
 uint64_t ram_avail() {
-#if defined(_WIN32)
-    return platform::ram_avail();
+#if defined(__APPLE__)
+    return ~uint64_t{0};
+#else
+    strata::core::detail::HostMemory m;
+    const bool known = strata::core::detail::host_available_memory(m);
+    // Windows supplies commit capacity on a successful read even when no physical RAM remains.
+    return known || m.commit != ~uint64_t{0} ? m.available : ~uint64_t{0};
 #endif
-    uint64_t avail = ~uint64_t{0};
-    {
-        std::istringstream mi(read_file("/proc/meminfo"));
-        std::string k;
-        uint64_t kb = 0;
-        while (mi >> k >> kb) {
-            if (k == "MemAvailable:") avail = kb << 10;
-            mi.ignore(64, '\n');
-        }
-    }
-    std::string cg = read_file("/proc/self/cgroup");   // "0::/user.slice/..."
-    const size_t at = cg.find("0::");
-    if (at == std::string::npos) return avail;
-    cg = cg.substr(at + 3);
-    cg = cg.substr(0, cg.find('\n'));
-    for (;;) {
-        const std::string dir = "/sys/fs/cgroup" + (cg == "/" ? std::string() : cg);
-        const std::string mx = read_file(dir + "/memory.max");
-        if (!mx.empty() && mx.compare(0, 3, "max") != 0) {
-            const uint64_t lim = std::strtoull(mx.c_str(), nullptr, 10);
-            const uint64_t cur = std::strtoull(read_file(dir + "/memory.current").c_str(), nullptr, 10);
-            uint64_t file = 0;
-            std::istringstream st(read_file(dir + "/memory.stat"));
-            std::string k;
-            uint64_t v = 0;
-            while (st >> k >> v)
-                if (k == "file") file = v;
-            const uint64_t used = cur > file ? cur - file : 0;
-            avail = std::min(avail, lim > used ? lim - used : 0);
-        }
-        if (cg.empty() || cg == "/") break;
-        const size_t sl = cg.rfind('/');
-        cg = sl == 0 || sl == std::string::npos ? "/" : cg.substr(0, sl);
-    }
-    return avail;
 }
 
-// the device memory the experts' placement may count on: cudaMemGetInfo's free, but on an integrated NVIDIA GPU on Linux
-// (a DGX Spark's GB10, one memory with the CPU) what the kernel can still give back, MemAvailable less
-// DS4_UMA_HEADROOM_GIB (6): cudaMemGetInfo counts only MemFree there, and the model's files just read fill the page cache
-// (measured on a GB10: 55 GB "free" with 115 GB available).  Not on HIP: a Strix Halo's GPU memory is its carve-out plus
-// the GTT pool, which hipMemGetInfo already counts and MemAvailable may exceed
-size_t uma_free(int dev, size_t fr) {
-#if !defined(_WIN32) && !defined(STRATA_USE_HIP)
-    int integrated = 0;
-    if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) != cudaSuccess) {
-        (void) cudaGetLastError();
-        return fr;
-    }
-    if (!integrated) return fr;
-    const char* h = std::getenv("DS4_UMA_HEADROOM_GIB");
-    const uint64_t head = (uint64_t) (h ? std::atof(h) : 6.0) << 30, avail = ram_avail();
-    if (avail != ~uint64_t{0} && avail > head && avail - head > fr) return (size_t) (avail - head);
-#else
-    (void) dev;
-#endif
-    return fr;
-}
-// a GPU that shares the PC's memory (a Mac, a Spark's GB10, a Strix Halo, an APU): nothing to give back by keeping the tower in host memory
+// whether GPU `dev` shares the PC's memory (a Mac, a Spark's GB10, a Strix Halo, an APU); false when the runtime cannot say
 bool gpu_integrated(int dev) {
 #if defined(STRATA_METAL)
     (void) dev;
@@ -321,6 +272,21 @@ bool gpu_integrated(int dev) {
     }
     return v != 0;
 #endif
+}
+// the device memory the experts' placement may count on: cudaMemGetInfo's free, but on an integrated NVIDIA GPU on Linux
+// (a DGX Spark's GB10, one memory with the CPU) get_uma_free_bytes's view of ram_avail: cudaMemGetInfo counts only
+// MemFree there, and the model's files just read fill the page cache (measured on a GB10: 55 GB "free" with 115 GB
+// available).  Not on HIP: a Strix Halo's GPU memory is its carve-out plus the GTT pool, which hipMemGetInfo already
+// counts and MemAvailable may exceed
+size_t uma_free(int dev, size_t fr) {
+#if !defined(_WIN32) && !defined(STRATA_USE_HIP)
+    const uint64_t avail = gpu_integrated(dev) ? ram_avail() : ~uint64_t{0};
+    if (avail != ~uint64_t{0})
+        return strata::core::detail::get_uma_free_bytes(fr, avail);
+#else
+    (void) dev;
+#endif
+    return fr;
 }
 // cudaMemGetInfo for the current device, with uma_free's view on an integrated GPU (Maya v1.1.20's mem_info; the Windows APU
 // dedicated-memory clamp (strata/platform/dedicated.hpp) is not ported: commit_charged covers that PC here)
@@ -1069,25 +1035,11 @@ struct Model::Impl {
     std::vector<Group> groups;
     std::vector<std::unique_ptr<Worker>> workers;   // threads mode: one per device
     bool par = false;                 // threads mode (the windows: decode)
-    mutable int all_gfx12 = -1;       // rdna4(): -1 not asked yet
+    strata::core::GpuSetFacts gpu_set;   // the traits every GPU in devs shares (read at the load)
     // Every GPU the engine uses is a gfx1200 / gfx1201 (RDNA4: R9700, RX 9000) in a HIP build.  The DeepSeek engine's share-based defaults (the small
     // chunk for multi-card tp runs, the whole-chunk slab, the small staging ring, the pinned copy at share >= 0.5) and the drafter's cumulative cut are
     // the 4 x R9700 measurements, so only RDNA4 takes them until another AMD part is tested (Strix Halo next).
-    bool rdna4() const {
-        if (all_gfx12 < 0) {
-            bool yes = false;
-#if defined(STRATA_USE_HIP)
-            yes = !devs.empty();
-            for (const auto& d : devs) {
-                cudaDeviceProp prop{};
-                yes = yes && cudaGetDeviceProperties(&prop, d.id) == cudaSuccess &&
-                      (std::strncmp(prop.gcnArchName, "gfx1200", 7) == 0 || std::strncmp(prop.gcnArchName, "gfx1201", 7) == 0);
-            }
-#endif
-            all_gfx12 = yes ? 1 : 0;
-        }
-        return all_gfx12 == 1;
-    }
+    bool rdna4() const { return gpu_set.all_gfx12; }
     bool prompt_par = false;          // the prompt path's chunks (a thread a GPU), as --tp / --threads asked
     unsigned win_seq = 0;             // the windows the threads ran (the hand-offs' seq)
     // the chunked prompt path (threads mode): chunk tokens a pass, runs shorter than chunk_min in windows
@@ -1597,12 +1549,7 @@ struct Model::Impl {
     bool commit_charged(const Dev& d) const {
         if (std::getenv("DS4_COMMIT_CAP_GB") != nullptr) return true;
 #if defined(_WIN32)
-        int v = 0;
-        if (cudaDeviceGetAttribute(&v, cudaDevAttrIntegrated, d.id) != cudaSuccess) {
-            (void) cudaGetLastError();
-            return false;
-        }
-        return v != 0;
+        return gpu_integrated(d.id);
 #else
         (void) d;
         return false;
@@ -2746,6 +2693,7 @@ struct Model::Impl {
         if (ids.empty())
             for (int i = 0; i < ndev; ++i) ids.push_back(i);
         devs.resize(ids.size());
+        gpu_set = strata::core::read_gpu_set_facts(ids);
         if (prof_on) prof_pool.resize((size_t) ndev);
         for (size_t i = 0; i < ids.size(); ++i) {
             Dev& d = devs[i];
@@ -2936,12 +2884,9 @@ struct Model::Impl {
             if (!l.mtp) {   // experts a word takes: --experts N / the faster-mode rule (ds4_experts_rule.hpp), DS4_TOPK=N over both (a test)
                 if (il == 0) {
                     uint64_t vram_all = 0;
-                    bool integrated = false;   // (a GPU that shares the PC's RAM: Strix Halo)
-                    for (const Dev& dv : devs) {
+                    for (const Dev& dv : devs)
                         vram_all += (uint64_t) dv.total;
-                        cudaDeviceProp ip{};
-                        if (cudaGetDeviceProperties(&ip, dv.id) == cudaSuccess && ip.integrated) integrated = true;
-                    }
+                    const bool integrated = gpu_set.all_integrated;
                     // two or more RDNA4 cards holding at least half of the experts (the 4 x R9700 class): Faster by default too
                     const bool multi_rdna4 = rdna4() && devs.size() >= 2 && gpu_expert_share() >= 0.5;
                     const bool single_rdna4 = rdna4() && devs.size() == 1;   // one R9700 / RX 9000 card: the CPU lane does most of the experts
@@ -6820,12 +6765,9 @@ struct Model::Impl {
         if (avail == ~uint64_t{0}) return gb;
         // (the prompt buffers and the context's caches are touched after this point and, on such a machine, take RAM too: measured on
         // Strix Halo about 0.11 MB a token of context beyond 16384, a 40960 context ending 2.5 GB lower than a 16384 one)
-        bool any_integrated = false;   // (only a device the driver calls integrated can share the RAM: a discrete card's pinned buffers also lower the free RAM, #4147)
-        for (const Dev& d : devs) {
-            int v = 0;
-            if (cudaDeviceGetAttribute(&v, cudaDevAttrIntegrated, d.id) == cudaSuccess) any_integrated = any_integrated || v != 0;
-            else (void) cudaGetLastError();
-        }
+        // (only a device the driver calls integrated can share the RAM: a discrete card's pinned buffers also lower the free RAM, #4147)
+        const bool any_integrated = std::any_of(devs.begin(), devs.end(),
+                                               [](const Dev& d) { return gpu_integrated(d.id); });
         const bool uma = strata::ds4::store_gpu_shares_ram(any_integrated, avail0_, avail);
         const double ctx_gb = uma ? 1.1e-4 * std::max(0.0, (double) o.max_context - 16384.0) : 0.0;
         const double room = (double) avail / 1e9 - 12.0 - ctx_gb;

@@ -703,17 +703,11 @@ inline std::vector<std::vector<int>> node_cores(bool smt = false) {
     }
     return out;
 }
-/// The RAM this process can still get (~0: not known).
-inline uint64_t ram_avail() {
-    MEMORYSTATUSEX s{};
-    s.dwLength = sizeof(s);
-    return GlobalMemoryStatusEx(&s) ? (uint64_t) s.ullAvailPhys : ~uint64_t{0};
-}
 #endif
 
 /// Windows' commit (RAM + page file, what every private allocation is charged to - on an integrated GPU the GPU's
 /// own allocations too): the limit, what this process can still commit, the RAM; all ~0 where there is no such limit
-/// (Linux overcommits; its RAM is ram_avail's business).
+/// (Linux overcommits).
 struct Commit {
     uint64_t limit = ~uint64_t{0}, avail = ~uint64_t{0}, ram = ~uint64_t{0};
 };

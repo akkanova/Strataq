@@ -6,6 +6,7 @@
 
 #include "strata/base/gpu/emulate.hpp"
 #include "strata/base/gpu/gfx_arch.hpp"
+#include "strata/base/gpu/gpu_set.hpp"
 #include "strata/base/gpu/pinned.hpp"
 #include "strata/base/platform/aux_cpus.hpp"
 #include "strata/base/platform/host_limits.hpp"
@@ -21,6 +22,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <charconv>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +30,7 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <numeric>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -763,32 +766,22 @@ int apply_device_defaults(Options& o, bool paged) {
         // any engine code reads its switches (they are read at first use), and the user's own settings are kept
         cudaDeviceProp ad{};
         if (cudaGetDeviceProperties(&ad, 0) == cudaSuccess) {
+            int ndev = 0;
+            const bool count_known = cudaGetDeviceCount(&ndev) == cudaSuccess;
+            std::vector<int> visible(count_known ? std::clamp(ndev, 0, 64) : 0);
+            std::iota(visible.begin(), visible.end(), 0);
+            const strata::core::GpuSetFacts gpus = strata::core::read_gpu_set_facts(visible);
             // an integrated Radeon (UMA / APU: the device property, not the name): the matrix-core prompt set is on by
             // default.  Only when EVERY visible GPU is integrated and of the same architecture, so a box that also holds a
             // discrete card (whichever the engine ends up using) keeps the old defaults.
-            bool all_igpu = ad.integrated != 0;
-            int ndev = 0;
-            if (all_igpu && cudaGetDeviceCount(&ndev) == cudaSuccess) {
-                for (int d = 1; d < ndev && d < 64; ++d) {
-                    cudaDeviceProp od{};
-                    if (cudaGetDeviceProperties(&od, d) != cudaSuccess || od.integrated == 0 ||
-                        std::strncmp(od.gcnArchName, ad.gcnArchName, 7) != 0) { all_igpu = false; (void) cudaGetLastError(); break; }
-                }
-            }
+            const bool all_igpu = !count_known || ndev < 1 ? ad.integrated != 0 :
+                                 gpus.all_integrated && gpus.same_arch;
             if (!paged) {   // Linux, every visible card gfx12: the chunked GDN scan from the first chunk (owner yes 2026-11-07; was the launcher's GDN_STACK_GFX12).
                 // Before apply_arch_defaults, so its "30,000+ tokens" line is not printed when the variable is set.
-                bool all_gfx12 = true;
-                int nd12 = 0;
-                if (cudaGetDeviceCount(&nd12) != cudaSuccess || nd12 < 1) all_gfx12 = false;
-                for (int d = 0; all_gfx12 && d < nd12 && d < 64; ++d) {
-                    cudaDeviceProp od{};
-                    if (cudaGetDeviceProperties(&od, d) != cudaSuccess || !strata::kernels::gfx_arch_is_gfx12(od.gcnArchName)) all_gfx12 = false;
-                }
-                (void) cudaGetLastError();
 #if defined(_WIN32)
-                strata::core::apply_gdn_chunked_default(false, all_gfx12);
+                strata::core::apply_gdn_chunked_default(false, gpus.all_gfx12);
 #else
-                strata::core::apply_gdn_chunked_default(true, all_gfx12);
+                strata::core::apply_gdn_chunked_default(true, gpus.all_gfx12);
 #endif
             }
             strata::core::apply_arch_defaults(ad.gcnArchName, all_igpu, paged ? 0 : o.batch);

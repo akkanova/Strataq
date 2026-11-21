@@ -28,8 +28,9 @@ target_link_libraries(strata_serve PUBLIC Threads::Threads)
 # The page pool (src/common/state): no GPU, the caller allocates its chunks.
 add_library(strata_state STATIC src/common/state/page_pool.cpp)
 target_include_directories(strata_state PUBLIC include)
-# The layer split's planner and the rules for experts on several cards (src/common/experts): no GPU.
-add_library(strata_split STATIC src/common/experts/layer_split.cpp src/common/experts/card_rules.cpp)
+# The layer split's planner, the rules for experts on several cards and the RAM tier (src/common/experts): no GPU.
+add_library(strata_split STATIC src/common/experts/layer_split.cpp src/common/experts/card_rules.cpp
+            src/common/experts/ram_tier.cpp)
 target_include_directories(strata_split PUBLIC include)
 if(STRATA_BUILD_TESTS)
   add_executable(arch_defaults_test src/core/arch_defaults_test.cpp src/core/arch_defaults.cpp)

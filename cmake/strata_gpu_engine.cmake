@@ -289,7 +289,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
   add_library(strata_engine STATIC src/base/gpu/vmm.cpp
     src/common/state/conversation_memory.cpp src/common/state/conversation_file.cpp
-    src/common/experts/expert_profile.cpp src/common/experts/ram_tier.cpp src/common/experts/expert_pages.cpp
+    src/common/experts/expert_profile.cpp src/common/experts/expert_pages.cpp
     src/common/experts/ram_experts.cpp src/common/state/pool_copy.cpp src/common/state/pause_file.cpp
     src/core/expert_source.cpp src/core/remote_experts.cpp src/core/remote_expert_opt.cu src/core/expert_cache.cpp
     src/core/peer_experts.cpp src/core/arch_defaults.cpp src/core/nv_defaults.cpp
@@ -297,7 +297,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/models/qwen38/native_dense.cpp src/models/qwen38/verify.cpp src/models/qwen38/mtp.cpp
     src/models/qwen38/dflash2.cpp src/models/qwen38/conversation_snapshot.cpp src/models/qwen38/conversation_state.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu strata_state
+  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu strata_state strata_split
                         ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
     add_executable(host_graph_launch_test tests/core/host_graph_launch_test.cu)
@@ -607,7 +607,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # on gfx11 (measured 4.97 -> 20-40 TFLOPS on this part: the chunked prompt's dense GEMM is 11.1 s of a 4K prompt at the
     # library's rate)
     target_link_libraries(strata_dsv41 PUBLIC strata_prefill strata_dsv41_kernels strata_dsv41_state strata_serve
-                          ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
+                          strata_split ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
     find_package(Threads REQUIRED)
     target_link_libraries(strata_dsv41 PUBLIC Threads::Threads)
     if(WIN32 AND STRATA_ENABLE_HIP)   # cudaMemGetInfo is the DXGI-budgeted hip_compat::mem_get_info (src/base/gpu/device.cu): on a Strix Halo the
