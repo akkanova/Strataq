@@ -15,6 +15,7 @@
 // and after the last layer logits = head(rmsnorm(sum_s pre[s] h[s])).
 #include "strata/common/experts/ram_tier.hpp"
 #include "strata/common/state/restore_points.hpp"
+#include "strata/common/artifact/tensor_directory.hpp"
 #include "ds4_ring_link.hpp"
 #include "ds4_launch.h"   // strata_ds4_launch: <<<>>> on CUDA and HIP, a dispatch on Metal
 #include "ds4_model.hpp"
@@ -323,12 +324,7 @@ float f16_to_f32(uint16_t h) {
 }
 
 // ------------------------------------------------------------------ the pack
-struct Tensor {
-    std::string dtype;
-    int file = -1;
-    uint64_t off = 0, bytes = 0;
-    std::vector<int64_t> shape;
-};
+using Tensor = artifact::TensorEntry;
 
 struct Pack {
     std::string dir, model_dir;
@@ -382,41 +378,11 @@ struct Pack {
             }
         }
         model_dir = str("model_dir");
-        std::FILE* f = std::fopen((d + "/tensors.txt").c_str(), "r");
-        if (f == nullptr) {
-            err = d + "/tensors.txt: not found";
+        artifact::TensorDirectory toc;
+        if (!toc.load(d + "/tensors.txt", err))
             return false;
-        }
-        std::vector<char> buf(1 << 16);
-        while (std::fgets(buf.data(), (int) buf.size(), f) != nullptr) {
-            char* s = buf.data();
-            if (s[0] == 'f') {   // file <i> <name>
-                char name[4096];
-                int i = 0;
-                if (std::sscanf(s, "file %d %4095s", &i, name) == 2) {
-                    if ((int) files.size() <= i) files.resize((size_t) i + 1);
-                    files[(size_t) i] = name;
-                }
-                continue;
-            }
-            if (s[0] != 't') continue;
-            char* save = nullptr;
-            ::strtok_r(s, " \n", &save);
-            const char* name = ::strtok_r(nullptr, " \n", &save);
-            const char* dt = ::strtok_r(nullptr, " \n", &save);
-            const char* fi = ::strtok_r(nullptr, " \n", &save);
-            const char* off = ::strtok_r(nullptr, " \n", &save);
-            const char* nb = ::strtok_r(nullptr, " \n", &save);
-            if (name == nullptr || nb == nullptr) continue;
-            Tensor x;
-            x.dtype = dt;
-            x.file = std::atoi(fi);
-            x.off = std::strtoull(off, nullptr, 10);
-            x.bytes = std::strtoull(nb, nullptr, 10);
-            while (const char* dim = ::strtok_r(nullptr, " \n", &save)) x.shape.push_back(std::atoll(dim));
-            t.emplace(name, std::move(x));
-        }
-        std::fclose(f);
+        files = std::move(toc.files);
+        t = std::move(toc.tensors);
         for (const std::string& fn : files) {
             const std::string p = model_dir + "/" + fn;
             const platform::fd_t fd = platform::open_ro(p);
@@ -2046,15 +2012,18 @@ struct Model::Impl {
     }
 
     // ---- weights
+    // Copies tensor t whole to dst on device d in staged rounds, so that a large tensor needs no host copy of itself.
     bool upload(Dev& d, const Tensor& t, void* dst, std::string& err) {
-        std::vector<uint8_t> tmp(t.bytes);
-        if (!pk.read(t, tmp.data())) {
-            err = "read failed";
-            return false;
-        }
+        std::vector<uint8_t> stage((size_t) std::min(t.bytes, artifact::kStageRound));
         cudaSetDevice(d.id);
-        CK(cudaMemcpy(dst, tmp.data(), t.bytes, cudaMemcpyHostToDevice));
-        return true;
+        return artifact::for_each_round(t.bytes, [&](uint64_t done, uint64_t n) {
+            if (!pk.read_at(t.file, t.off + done, n, stage.data())) {
+                err = "read failed";
+                return false;
+            }
+            CK(cudaMemcpy((uint8_t*) dst + done, stage.data(), n, cudaMemcpyHostToDevice));
+            return true;
+        });
     }
     // a dense matrix in a ggml block type (x3::Mat fmt kFmtGG, row = k / 256 blocks): whole, or part of its rows / inputs
     bool mat_gg(Dev& d, const std::string& pre, const Tensor& t, int ggt, x3::Mat& m, std::string& err, size_t* acct, int part,
