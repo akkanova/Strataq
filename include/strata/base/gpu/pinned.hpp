@@ -14,6 +14,7 @@
 //     fallback is the common case and not an error path.
 #pragma once
 
+#include "strata/base/hash.hpp"
 #include <atomic>
 #include <cstdint>
 #include <string>
@@ -190,10 +191,6 @@ LoadStats load_experts_direct(const std::string& path, uint8_t* dst, const std::
 constexpr uint64_t kAllFileBytes = ~0ull;
 bool experts_unbuffered(const std::vector<std::string>& files, uint64_t arena_bytes, std::string& why,
                         bool cache_counts = true, uint64_t read_bytes = kAllFileBytes);
-
-// FNV-1a 64.  Per layer, so a corrupt or short read names WHICH layer rather than just failing a whole-file
-// comparison - the same reason the Phase 1 tools report the first differing element.
-uint64_t fnv1a64(const uint8_t* p, uint64_t n, uint64_t seed = 1469598103934665603ull);
 
 // ---- the expert stream -----------------------------------------------------
 //

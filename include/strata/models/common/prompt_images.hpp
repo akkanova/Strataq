@@ -1,25 +1,23 @@
 #pragma once
-#include "strata/common/state/conversation_cache.hpp"
+#include "strata/base/hash.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstdint>
 #include <string>
 #include <vector>
 
-namespace strata::qwen38 {
-/// Hashes a picture's grid and content for conversation reuse.
-inline uint64_t hash_image_bytes(const void* data, size_t n, uint64_t h = 1469598103934665603ull) {
-    const auto* bytes = static_cast<const uint8_t*>(data);
-    for (size_t i = 0; i < n; ++i)
-        h = (h ^ bytes[i]) * 1099511628211ull;
-    return h;
-}
-
-/// Reads strata-vision records and builds the prompt's replacement rows and rotary coordinates.
-inline bool read_prompt_images(const std::string& path, const std::vector<int64_t>& ids, int64_t width,
-                               const std::vector<uint64_t>& image_keys, std::vector<int32_t>& positions,
-                               std::vector<float>& img_rows, std::vector<const float*>& row_ptr,
-                               std::vector<strata::core::ConversationImageKey>& image_hashes, std::string& ve) {
+namespace strata::models {
+/// Reads strata-vision records (int32 'SVE1', n, nx, ny, width, then n x width floats, in prompt order) and lays the
+/// pictures over the prompt's <|image_pad|> runs, as mtmd does: text counts up by one, a picture's cells take
+/// (t, h, w) = (p, p + row, p + column) and the text after it continues at p + max(nx, ny). `positions` holds
+/// [cell][3] for every cell the caller can reach (at least the prompt's); cells past the prompt count on by one.
+/// `image_keys`: the server's key for each picture, else a picture's hash covers its embeddings. `image_hashes` gets
+/// {first cell, hash} per picture, which the conversation cache compares. Used by Qwen3.6 and Qwen3.8.
+template <class Id, class ImageKey>
+bool read_prompt_images(const std::string& path, const std::vector<Id>& ids, int64_t width,
+                        const std::vector<uint64_t>& image_keys, std::vector<int32_t>& positions,
+                        std::vector<float>& img_rows, std::vector<const float*>& row_ptr,
+                        std::vector<ImageKey>& image_hashes, std::string& ve) {
     constexpr int64_t kImagePad = 248056;
     const int64_t n = (int64_t) ids.size(), cells = (int64_t) positions.size() / 3;
     if (n > cells || cells == 0) {
@@ -75,11 +73,11 @@ inline bool read_prompt_images(const std::string& path, const std::vector<int64_
         const Img& im = imgs[k++];
         {
             const int64_t grid[3] = {im.n, im.nx, im.ny};
-            uint64_t h = hash_image_bytes(grid, sizeof grid);
+            uint64_t h = core::fnv1a64(grid, sizeof grid);
             if (image_keys.size() == imgs.size())
-                h = hash_image_bytes(&image_keys[k - 1], sizeof(uint64_t), h);
+                h = core::fnv1a64(&image_keys[k - 1], sizeof(uint64_t), h);
             else
-                h = hash_image_bytes(img_rows.data() + im.off, (size_t) im.n * (size_t) width * sizeof(float), h);
+                h = core::fnv1a64(img_rows.data() + im.off, (size_t) im.n * (size_t) width * sizeof(float), h);
             image_hashes.push_back({i, h});
         }
         for (int64_t j = 0; j < im.n && ve.empty(); ++j)
@@ -100,4 +98,4 @@ inline bool read_prompt_images(const std::string& path, const std::vector<int64_
         put(c, p + (c - n), p + (c - n), p + (c - n));
     return ve.empty();
 }
-}  // namespace strata::qwen38
+}  // namespace strata::models

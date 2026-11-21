@@ -539,18 +539,6 @@ void release(void* p, uint64_t bytes) {
 #endif
 }
 
-}  // namespace
-
-uint64_t fnv1a64(const uint8_t* p, uint64_t n, uint64_t seed) {
-    uint64_t h = seed;
-    for (uint64_t i = 0; i < n; ++i) {
-        h ^= p[i];
-        h *= 1099511628211ull;
-    }
-    return h;
-}
-
-namespace {
 bool clear_error() { (void) cudaGetLastError(); return true; }
 }  // namespace
 
@@ -1179,6 +1167,7 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
     if (threads < 1) threads = 1;
 
     const auto t0 = std::chrono::steady_clock::now();
+    // Per layer, so a corrupt or short read names which layer.
     std::vector<uint64_t> layer_hash((size_t) layers, 1469598103934665603ull);
     std::atomic<uint64_t> next_layer{0};
     std::atomic<uint64_t> read_ns_sum{0};   // summed over the threads: see LoadStats::read_seconds

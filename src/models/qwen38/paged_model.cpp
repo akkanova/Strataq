@@ -8,7 +8,7 @@
 #include "strata/base/gpu/gfx_arch.hpp"
 #include "strata/common/artifact/gguf_reader.hpp"
 #include "strata/base/gpu/runtime.hpp"
-#include "strata/models/qwen38/prompt_images.hpp"
+#include "strata/models/common/prompt_images.hpp"
 #include "strata/common/experts/card_rules.hpp"
 #include "strata/common/experts/expert_pages.hpp"
 #include "strata/common/experts/expert_swaps.hpp"
@@ -333,7 +333,6 @@ bool init_card_paths(Model& m, Conversation& conv, PagedCards& cards, ModelCards
 std::string get_unsupported_reason(const Model& m);
 /// Selects the single-gfx1151 IQ3_S policy; the verifier applies it only to fully resident batch graphs.
 bool should_inline_resident_shared(const Model& m);
-void append_size(std::vector<uint8_t>& bytes, uint64_t n);
 uint64_t read_size(const std::vector<uint8_t>& bytes, size_t& at);
 
 }  // namespace
@@ -805,8 +804,8 @@ bool PagedQwen::prepare_images(const strata::serve::RequestLine& request, const 
     for (const auto& [name, value] : request.keys)
         if (name == "img_keys")
             keys = strata::serve::parse_hex_list(value);
-    return read_prompt_images(request.file, ids, m_.g.n_embd, keys, pending_positions_, image_rows_, image_row_ptrs_,
-                              images, err);
+    return strata::models::read_prompt_images(request.file, ids, m_.g.n_embd, keys, pending_positions_, image_rows_,
+                                              image_row_ptrs_, images, err);
 }
 
 bool PagedQwen::activate_images(int session, std::string& err, bool shared) {
@@ -869,21 +868,17 @@ bool PagedQwen::save_running_state(const PagedParts& parts, std::vector<uint8_t>
             return false;
         const size_t n = one.size() - (size_t) p.ss.qsa_alloc * (z.tail + z.dead + z.block_pos);
         if (p.ss.layer_lo <= 1 && p.ss.layer_hi > 1) {
-            append_size(ple, n);
-            ple.insert(ple.end(), one.begin(), one.begin() + (std::ptrdiff_t) n);
+            strata::core::append_state_u64(ple, n);
+            strata::core::append_state_bytes(ple, one.data(), n);
         }
         qsa.insert(qsa.end(), one.begin() + (std::ptrdiff_t) n, one.end());
     }
     state.clear();
-    append_size(state, qsa.size());
-    state.insert(state.end(), qsa.begin(), qsa.end());
+    strata::core::append_state_vector(state, qsa);
     state.insert(state.end(), ple.begin(), ple.end());
     const auto& positions = get_part(*parts.front()).image_positions;
-    if (!positions.empty()) {
-        append_size(state, positions.size());
-        const auto* bytes = reinterpret_cast<const uint8_t*>(positions.data());
-        state.insert(state.end(), bytes, bytes + positions.size() * sizeof(int32_t));
-    }
+    if (!positions.empty())
+        strata::core::append_state_vector(state, positions);
     return true;
 }
 
@@ -950,8 +945,7 @@ bool PagedQwen::save_state(const PagedParts& parts, std::vector<uint8_t>& state,
     if (!save_running_state(parts, running, err))
         return false;
     state.clear();
-    append_size(state, running.size());
-    state.insert(state.end(), running.begin(), running.end());
+    strata::core::append_state_vector(state, running);
     write_rewind_checkpoints(state, get_part(*parts.front()).checks);
     return true;
 }
@@ -1072,8 +1066,8 @@ bool PagedQwen::save_checkpoint(const PagedParts& parts, const std::vector<int64
     saved.turn = turn;
     saved.pinned = pinned;
     saved.used = ++checkpoint_clock_;
-    append_size(saved.state, tokens > 1 ? (uint64_t) ids[(size_t) tokens - 2] : UINT64_MAX);
-    append_size(saved.state, (uint64_t) ids[(size_t) tokens - 1]);
+    strata::core::append_state_u64(saved.state, tokens > 1 ? (uint64_t) ids[(size_t) tokens - 2] : UINT64_MAX);
+    strata::core::append_state_u64(saved.state, (uint64_t) ids[(size_t) tokens - 1]);
     std::vector<uint8_t> state;
     if (!save_running_state(parts, state, err))
         return false;
@@ -1618,12 +1612,7 @@ bool init_card_paths(Model& m, Conversation& conv, PagedCards& cards, ModelCards
     return true;
 }
 
-/// Appends `n` to `bytes` (save_state's sizes).
-void append_size(std::vector<uint8_t>& bytes, uint64_t n) {
-    strata::core::append_state_u64(bytes, n);
-}
-
-/// Reads a size append_size wrote at `at` in `bytes` and moves `at` past it.
+/// Reads a size append_state_u64 wrote at `at` in `bytes` and moves `at` past it.
 uint64_t read_size(const std::vector<uint8_t>& bytes, size_t& at) {
     uint64_t n = 0;
     if (at > bytes.size() || bytes.size() - at < sizeof n)

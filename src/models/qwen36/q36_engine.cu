@@ -30,6 +30,7 @@
 #include "strata/common/kernels/native_mmvq.hpp"
 #include "strata/models/common/kernels/native_moe.hpp"
 #include "strata/models/common/kernels/native_router.hpp"
+#include "strata/models/common/prompt_images.hpp"
 #include "strata/common/kernels/prefill/gemm.hpp"
 #include "strata/common/kernels/prefill/moe_mmq.hpp"
 #include "strata/models/qwen36/engine.hpp"
@@ -3073,13 +3074,6 @@ std::vector<int32_t> parse_ids(const char* s) {
 bool is_eos(int t) { return t == 248044 || t == 248046; }
 
 // ------------------------------------------------------------------------------------------------ pictures
-constexpr int32_t kImagePad = 248056;   // <|image_pad|>
-
-uint64_t fnv1a(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
-    const uint8_t* b = (const uint8_t*) p;
-    for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
-    return h;
-}
 
 /// A request's pictures: the encoder's rows in prompt order, each picture's cell run, and the positions.
 struct ImgReq {
@@ -3090,70 +3084,28 @@ struct ImgReq {
     int32_t delta = 0;               // the text after the prompt: rotary position = cell + delta
 };
 
-/// Reads a strata-vision file (one or more records: int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats, in prompt
-/// order) and lays the pictures over the prompt's <|image_pad|> runs.  Positions as mtmd's: text counts up by one; a
-/// picture's cells take (t, h, w) = (p, p + row, p + column) and the text after it continues at p + max(nx, ny).  "" or
-/// the error.  `keys`: the server's key for each picture (img_keys=), else the embeddings' hash.
+/// Fills `r` from a strata-vision file (see strata::models::read_prompt_images); returns "" or the error.
 std::string build_images(const std::string& path, const std::vector<int32_t>& ids, int64_t n_embd,
                          const std::vector<uint64_t>& keys, ImgReq& r) {
-    struct Img { int64_t n, nx, ny; size_t off; };
-    std::vector<Img> imgs;
-    std::FILE* f = std::fopen(path.c_str(), "rb");
-    if (!f) return "cannot open " + path;
-    std::string ve;
-    while (ve.empty()) {
-        int32_t hdr[5];
-        const size_t got = std::fread(hdr, sizeof(int32_t), 5, f);
-        if (got == 0) break;
-        if (got != 5 || hdr[0] != 0x31455653 || hdr[1] < 1 || hdr[2] < 1 || hdr[3] < 1 || (int64_t) hdr[2] * hdr[3] != hdr[1] ||
-            hdr[4] != (int32_t) n_embd) {
-            ve = "bad embeddings file (expected strata-vision records of width " + std::to_string((long long) n_embd) + ")";
-            break;
-        }
-        const size_t off = r.rows.size(), cnt = (size_t) hdr[1] * (size_t) hdr[4];
-        r.rows.resize(off + cnt);
-        if (std::fread(r.rows.data() + off, sizeof(float), cnt, f) != cnt) { ve = "short embeddings file"; break; }
-        imgs.push_back({hdr[1], hdr[2], hdr[3], off});
-    }
-    std::fclose(f);
-    if (!ve.empty()) return ve;
     const int64_t n = (int64_t) ids.size();
-    r.cell_row.assign((size_t) n, -1);
+    std::vector<const float*> row_ptr;
+    std::vector<std::pair<int64_t, uint64_t>> starts;   // per picture: its first cell, its hash
+    std::string ve;
     r.mrope.assign((size_t) n * 3, 0);
-    auto put = [&](int64_t c, int64_t t, int64_t h, int64_t w) {
-        r.mrope[(size_t) c * 3] = (int32_t) t;
-        r.mrope[(size_t) c * 3 + 1] = (int32_t) h;
-        r.mrope[(size_t) c * 3 + 2] = (int32_t) w;
-    };
-    int64_t p = 0, i = 0;
-    size_t k = 0;
-    while (i < n) {
-        if (ids[(size_t) i] != kImagePad) { put(i, p, p, p); ++p; ++i; continue; }
-        if (k >= imgs.size()) return "the prompt has more images than the embeddings file";
-        const Img& im = imgs[k++];
-        uint64_t h;
-        {   // what the conversation cache compares: a picture is its grid and its key (or its embeddings)
-            const int64_t grid[3] = {im.n, im.nx, im.ny};
-            h = fnv1a(grid, sizeof grid);
-            if (keys.size() == imgs.size()) h = fnv1a(&keys[k - 1], sizeof(uint64_t), h);
-            else h = fnv1a(r.rows.data() + im.off, (size_t) im.n * (size_t) n_embd * sizeof(float), h);
-        }
-        r.imgs.push_back({i, im.n, h});
-        for (int64_t j = 0; j < im.n; ++j)
-            if (i + j >= n || ids[(size_t) (i + j)] != kImagePad)
-                return "image " + std::to_string(k) + " has " + std::to_string((long long) im.n) +
-                       " rows but fewer <|image_pad|> tokens";
-        for (int64_t j = 0; j < im.n; ++j) {
-            const int64_t y = j / im.nx, x = j % im.nx;
-            put(i + j, p, p + y, p + x);
-            r.cell_row[(size_t) (i + j)] = (int32_t) ((im.off / (size_t) n_embd) + (size_t) j);
-        }
-        i += im.n;
-        p += std::max(im.nx, im.ny);
+    if (!strata::models::read_prompt_images(path, ids, n_embd, keys, r.mrope, r.rows, row_ptr, starts, ve))
+        return ve;
+    r.cell_row.assign((size_t) n, -1);
+    for (int64_t c = 0; c < n; ++c)
+        if (row_ptr[(size_t) c] != nullptr)
+            r.cell_row[(size_t) c] = (int32_t) ((row_ptr[(size_t) c] - r.rows.data()) / n_embd);
+    // the pictures' rows follow each other in `rows`, so a picture's rows run to the next picture's first
+    for (size_t k = 0; k < starts.size(); ++k) {
+        const int64_t first = r.cell_row[(size_t) starts[k].first];
+        const int64_t end = k + 1 < starts.size() ? r.cell_row[(size_t) starts[k + 1].first] :
+                                                     (int64_t) r.rows.size() / n_embd;
+        r.imgs.push_back({starts[k].first, end - first, starts[k].second});
     }
-    if (k != imgs.size()) return "the embeddings file has more images than the prompt";
-    if (n > 0 && ids[(size_t) (n - 1)] == kImagePad) return "the prompt cannot end in an image";
-    r.delta = (int32_t) (p - n);
+    r.delta = r.mrope[(size_t) (n - 1) * 3] + 1 - (int32_t) n;   // the prompt is not empty and ends in text
     return "";
 }
 

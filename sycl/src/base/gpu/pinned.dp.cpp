@@ -282,18 +282,6 @@ void release(void* p, uint64_t bytes) {
 #endif
 }
 
-}  // namespace
-
-uint64_t fnv1a64(const uint8_t* p, uint64_t n, uint64_t seed) {
-    uint64_t h = seed;
-    for (uint64_t i = 0; i < n; ++i) {
-        h ^= p[i];
-        h *= 1099511628211ull;
-    }
-    return h;
-}
-
-namespace {
 /*
 DPCT1010: SYCL uses exceptions to report errors and does not use the error
 codes. The cudaGetLastError function call was replaced with 0. You need to

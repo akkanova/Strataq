@@ -92,7 +92,7 @@
 #endif
 #include "strata/models/qwen38/conversation.hpp"
 #include "strata/models/qwen38/model.hpp"
-#include "strata/models/qwen38/prompt_images.hpp"
+#include "strata/models/common/prompt_images.hpp"
 #include "strata/program/batch_read.hpp"
 #include "strata/models/qwen38/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
@@ -1048,12 +1048,6 @@ private:
 // just the checkpoints that are prefixes of the tokens the session holds now.
 using ImgKey = strata::core::ConversationImageKey;
 using ConvCheckpoint = strata::core::ConversationCheckpoint;
-
-uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull) {
-    const uint8_t* p = (const uint8_t*) data;
-    for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
-    return h;
-}
 
 using ConvStateSizes = strata::core::ConversationStateSizes;
 
@@ -7625,7 +7619,7 @@ int main(int argc, char** argv) {
                 if (!geni) {
                     for (int64_t c = 0; c < cells; ++c) put(c, c, c, c);
                 } else {
-                    strata::qwen38::read_prompt_images(emb_path, ids, g.n_embd, req_img_keys, mrope_host,
+                    strata::models::read_prompt_images(emb_path, ids, g.n_embd, req_img_keys, mrope_host,
                                                        img_rows, row_ptr, req_imgs, ve);
                 }
                 tr("positions built", (long long) img_rows.size());
@@ -11014,7 +11008,7 @@ int main(int argc, char** argv) {
                             hash_ok = false;
                             break;
                         }
-                        h = fnv1a(hash_buffer.data(), n, h);
+                        h = strata::core::fnv1a64(hash_buffer.data(), n, h);
                         offset += n;
                     }
                     return h;
