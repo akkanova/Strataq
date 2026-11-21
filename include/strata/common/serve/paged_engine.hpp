@@ -97,6 +97,9 @@ struct PagedSettings {
     std::string copy_back = "auto";                ///< --copy-back
     std::string batch_groups = "1";             ///< --batch-groups: live-concurrency divisor or auto.
     std::string remote_experts = "auto";           ///< --remote-experts
+    /// --prompt-order auto|layer|chunk: a prompt of several chunks is read layer by layer over all its chunks, chunk
+    /// by chunk through every layer, or as each model's own rule picks (set_paged_runtime_env passes it on).
+    std::string prompt_order = "auto";
     /// --expert-popularity-decay: the factor by which each decode step multiplies the adaptive tier's routing counts;
     /// 0: --adapt-decay's (a factor per 4 steps) to the power 0.25
     double popularity_decay = 0;
@@ -132,7 +135,7 @@ int serve_paged_model(PagedModel& model, PagedCards& cards, strata::core::RamExp
 int take_paged_options(int& argc, char** argv, const std::string& program, PagedSettings& s);
 /// Sets the GPU runtime's environment for the engine, before the runtime starts (an explicit setting wins): on HIP on
 /// Windows, no resource cache, so that the pools can shrink; when `hops_possible` (stages on separate GPUs) and
-/// `s.remote_experts` is not off, more hardware queues.
+/// `s.remote_experts` is not off, more hardware queues; the models' prompt-order switches for `s.prompt_order`.
 void set_paged_runtime_env(const PagedSettings& s, bool hops_possible);
 /// Adds a stage running [lb, le), named gpu<dev> with .<index> for repeated GPUs. With `trim_weights`, only its
 /// layers' weights stay loaded. Measures the link before pool allocation, reports it after `program`, and sets speed

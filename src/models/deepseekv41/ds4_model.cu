@@ -13227,12 +13227,12 @@ struct Model::Impl {
     }
     // a run layer-major? - one device holding every layer on the flow, several chunks, and what the chunks after the
     // first would read from the files again more than the chunks' states moved to host memory and back at every layer
-    // (DS4_LAYER_MAJOR=0: never); then its host memory: the chunks' states (pinned, else pageable) and the layer cache,
-    // the largest layer's experts read from the files if RAM allows (ram_avail() less kRamMargin; DS4_LAYER_CACHE_MB
-    // sets it) - at least one expert, or not layer-major
+    // (DS4_LAYER_MAJOR=0: never; any other number: whatever the cost; --prompt-order sets it); then its host memory:
+    // the chunks' states (pinned, else pageable) and the layer cache, the largest layer's experts read from the files
+    // if RAM allows (ram_avail() less kRamMargin; DS4_LAYER_CACHE_MB sets it) - at least one expert, or not layer-major
     bool lm_begin(const Run& run) {
-        static const char* env = std::getenv("DS4_LAYER_MAJOR");
-        if (devs.size() != 1 || run.T.size() < 2 || (env != nullptr && std::atoi(env) == 0)) return false;
+        static const int asked = env_tri("DS4_LAYER_MAJOR");
+        if (devs.size() != 1 || run.T.size() < 2 || asked == 0) return false;
         Chunk& c = *chunks[0];
         if (!c.flow) return false;
         size_t need = 0, n_exp = 0, blob_max = 0;
@@ -13252,7 +13252,7 @@ struct Model::Impl {
         for (int T : run.T) rows += T;
         const size_t hb = chunk_hand_bytes(), state_b = run.T.size() * hb;
         const double moved = 2.0 * (double) rows * ((double) hb / (double) chunk) * (double) g.nl;
-        if (need == 0 || (double) (run.T.size() - 1) * file_b <= moved) return false;
+        if (need == 0 || (asked < 0 && (double) (run.T.size() - 1) * file_b <= moved)) return false;
         size_t lc_bytes = need;
         if (const char* mb = std::getenv("DS4_LAYER_CACHE_MB")) lc_bytes = std::min(need, (size_t) std::atoll(mb) << 20);
         else {

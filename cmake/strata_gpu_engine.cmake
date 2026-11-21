@@ -511,6 +511,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(strata_paged PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata_paged PUBLIC strata_engine strata_serve strata_spec strata_state strata_split
                         ${_strata_gpu_runtime_target})
+  if(STRATA_BUILD_TESTS)
+    add_executable(paged_start_test src/common/serve/paged_start_test.cpp)
+    target_include_directories(paged_start_test PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(paged_start_test PRIVATE strata_paged)
+    add_test(NAME paged_start_test COMMAND paged_start_test)
+  endif()
 
   # Qwen3.8's model loader (strata::qwen38::Model), which the `strata` program below calls
   add_library(strata_qwen38 STATIC src/models/qwen38/model.cpp src/models/qwen38/conversation.cpp

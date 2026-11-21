@@ -23,6 +23,7 @@
 #include <map>
 #include <memory>
 #include <numeric>
+#include <tuple>
 
 namespace strata::serve {
 
@@ -57,6 +58,7 @@ int take_paged_options(int& argc, char** argv, const std::string& program, Paged
                        {"--pause-dir", nullptr, &s.pause_dir}, {"--copy-back", nullptr, &s.copy_back},
                        {"--drafter", nullptr, &drafter},      {"--remote-experts", nullptr, &s.remote_experts},
                        {"--save-on-shutdown", nullptr, &save_on_shutdown},
+                       {"--prompt-order", nullptr, &s.prompt_order},
                        {"--expert-popularity-decay", nullptr, &popularity_decay},
                        {"--step-profile", &s.step_profile}};
     const char* const name = program.c_str();
@@ -100,22 +102,19 @@ int take_paged_options(int& argc, char** argv, const std::string& program, Paged
         std::fprintf(stderr, "%s: --batch-groups takes auto or a positive integer\n", name);
         return 2;
     }
-    if (s.copy_back != "auto" && s.copy_back != "on" && s.copy_back != "off") {
-        std::fprintf(stderr, "%s: --copy-back takes auto, on or off\n", name);
-        return 2;
-    }
     if (!popularity_decay.empty() &&
         !((s.popularity_decay = std::strtod(popularity_decay.c_str(), nullptr)) > 0 && s.popularity_decay <= 1)) {
         std::fprintf(stderr, "%s: --expert-popularity-decay takes a factor above 0 and at most 1\n", name);
         return 2;
     }
-    if (s.remote_experts != "auto" && s.remote_experts != "on" && s.remote_experts != "off") {
-        std::fprintf(stderr, "%s: --remote-experts takes auto, on or off\n", name);
-        return 2;
-    }
-    for (const auto& [flag, word] : {std::pair{"--drafter", &drafter}, {"--save-on-shutdown", &save_on_shutdown}})
-        if (*word != "on" && *word != "off") {
-            std::fprintf(stderr, "%s: %s takes on or off\n", name, flag);
+    for (const auto& [flag, word, words] : {std::tuple{"--copy-back", &s.copy_back, "auto|on|off"},
+                                            {"--remote-experts", &s.remote_experts, "auto|on|off"},
+                                            {"--prompt-order", &s.prompt_order, "auto|layer|chunk"},
+                                            {"--drafter", &drafter, "on|off"},
+                                            {"--save-on-shutdown", &save_on_shutdown, "on|off"}})
+        if (word->find('|') != std::string::npos ||
+            ("|" + std::string(words) + "|").find("|" + *word + "|") == std::string::npos) {
+            std::fprintf(stderr, "%s: %s takes %s\n", name, flag, words);
             return 2;
         }
     if (std::string err; !gpu_mib.empty() && !parse_i64_list(gpu_mib.c_str(), s.gpu_mib, err)) {
@@ -138,6 +137,10 @@ void set_paged_runtime_env(const PagedSettings& s, bool hops_possible) {
         strata::platform::set_env("GPU_MAX_HW_QUEUES", "16", false);
         strata::platform::set_env("CUDA_DEVICE_MAX_CONNECTIONS", "32", false);
     }
+    // Each model reads its switch at its first prompt (STRATA_LM_HIP: Qwen3.8's opt-in on AMD); one the user set wins.
+    if (s.prompt_order != "auto")
+        for (const char* name : {"STRATA_PREFILL_LAYER_MAJOR", "DS4_LAYER_MAJOR", "STRATA_LM_HIP"})
+            strata::platform::set_env(name, s.prompt_order == "layer" ? "1" : "0", false);
 }
 
 PagedCard& add_paged_card(PagedCards& cards, int dev, int64_t lb, int64_t le, int64_t n_layers, bool trim_weights,
