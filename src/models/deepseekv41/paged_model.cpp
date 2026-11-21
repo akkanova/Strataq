@@ -14,6 +14,7 @@
 #include "strata/common/serve/option_names.hpp"
 #include "strata/common/serve/paged_engine.hpp"
 #include "strata/common/serve/paged_model.hpp"
+#include "strata/common/state/conversation_block_tables.hpp"
 #include "strata/common/state/restore_points.hpp"
 #include "strata/common/state/state_bytes.hpp"
 #include "strata/models/common/adapt_decay.hpp"
@@ -79,13 +80,9 @@ struct Part final : strata::serve::PagedPart {
     std::vector<Part*> peers;                  ///< The lead reconnects every stage when it takes the seat.
     const bool has_drafter;                    ///< Only the last stage keeps DSpark's rings.
     Part*& seated;                             ///< Owns the host side currently in Model, or null.
-    strata::core::PagePool* pool = nullptr;     ///< null before init
-    strata::core::ConversationId cid = 0;
-    /// per region of the layout (empty for a fixed one): the first address of each of its blocks, on the host, and
-    /// the device copy the kernels read; sized once for the whole context, so that KvRows may point at them
-    std::vector<std::vector<uint8_t*>> blocks;
-    std::vector<uint8_t**> tables;
-    std::vector<size_t> zeroed;                 ///< per region: its blocks that are zeroed and in the table
+    /// its place in the card's pool and, per growing region, the table of its blocks' first addresses that KvRows
+    /// point at
+    strata::core::ConversationBlockTables tables;
     ConversationState state;                    ///< On the lead: its host side while not seated (take_seat).
     strata::serve::Sampling smp;                ///< its request's sampling
     /// the prompt's last token when the prompt's read took it along (feed_mark): its position (-1: none), the token
@@ -103,43 +100,24 @@ struct Part final : strata::serve::PagedPart {
     ~Part() override {
         if (seated == this)
             seated = nullptr;
-        const strata::core::OnDevice on(dev);
-        for (uint8_t** t : tables)
-            strata::core::gpu_free(t);
     }
 
-    bool is_ready() const override { return pool != nullptr; }
+    bool is_ready() const override { return tables.is_ready(); }
     bool init(strata::core::PagePool& p, strata::core::ConversationId id, std::string& err) override {
-        if (const std::string why = p.grow_conversation(id, 0); !why.empty()) {
-            err = "the page pool: " + why;
+        if (!tables.attach(p, id, dev, get_table_sizes(p), 0, err))
             return false;
-        }
         p.set_conversation_label(id, "Conversation " + std::to_string(id));
-        pool = &p;
-        cid = id;
-        return alloc_tables(err) && write_tables(err);
+        return point_model_if_seated(tables.grow(0, err));
     }
-    bool reserve(int64_t tokens, std::string& err) override {
-        if (const std::string why = pool->grow_conversation(cid, tokens); !why.empty()) {
-            err = "the conversation's memory is full: " + why;
-            return false;
-        }
-        return write_tables(err);
-    }
-    void truncate(int64_t tokens) override {
-        pool->truncate_conversation(cid, tokens);
-        for (size_t r = 0; r < blocks.size(); ++r)
-            zeroed[r] = std::min(zeroed[r], pool->conversation_blocks(cid, r).size());
-    }
+    bool reserve(int64_t tokens, std::string& err) override { return point_model_if_seated(tables.grow(tokens, err)); }
+    void truncate(int64_t tokens) override { tables.truncate(tokens); }
     void release() override {
         leave_seat();
         state = {};
         primed_pos = -1;
-        pool->remove_conversation(cid);
-        pool = nullptr;
-        std::fill(zeroed.begin(), zeroed.end(), 0);
+        tables.release();
     }
-    bool refresh(std::string& err) override { return write_tables(err, false); }
+    bool refresh(std::string& err) override { return point_model_if_seated(tables.refresh(err)); }
     void clear_state() override {
         if (lead != this)
             return;
@@ -149,23 +127,12 @@ struct Part final : strata::serve::PagedPart {
         pin_next = true;
     }
     void set_layers(int64_t lb, int64_t le) override {
-        const strata::core::OnDevice on(dev);
-        for (uint8_t** table : tables)
-            strata::core::gpu_free(table);
-        tables.clear();
-        blocks.clear();
-        zeroed.clear();
         strata::core::StateLayout layout;
         std::string err;
         describe_conversation(m.geometry(), (int) lb, (int) le, has_drafter, layout, at, err);
     }
-    uint64_t bytes() const override {
-        uint64_t bytes = 0;
-        for (size_t r = 0; is_ready() && r < blocks.size(); ++r)
-            bytes += pool->conversation_blocks(cid, r).size() * pool->block_bytes(r);
-        return bytes;
-    }
-    strata::core::ConversationId id() const override { return cid; }
+    uint64_t bytes() const override { return tables.bytes(); }
+    strata::core::ConversationId id() const override { return tables.id(); }
     int64_t get_pool_tokens(int64_t tokens) const override { return tokens; }
 
     /// Makes the model compute this conversation: the seated one's host side goes back to it, this one's into the
@@ -196,57 +163,27 @@ struct Part final : strata::serve::PagedPart {
     /// Gets the tokens its state holds.
     int64_t get_pos() const { return seated == this ? m.pos() : (int64_t) state.tokens.size(); }
 
-    /// Sizes the host and device tables of the growing regions for a conversation of the whole context.
-    bool alloc_tables(std::string& err) {
-        if (!tables.empty())
-            return true;
-        const strata::core::StateLayout& layout = pool->layout();
-        const strata::core::OnDevice on(dev);
-        blocks.resize(layout.regions.size());
-        tables.assign(layout.regions.size(), nullptr);
-        zeroed.assign(layout.regions.size(), 0);
+    using TableSize = strata::core::ConversationBlockTables::TableSize;
+    /// Gets the size of each region's table for a conversation of the whole context: a block's first row's address
+    /// (as KvRows::blocks holds it) per block of a growing region.
+    std::vector<TableSize> get_table_sizes(const strata::core::PagePool& p) const {
+        const strata::core::StateLayout& layout = p.layout();
+        std::vector<TableSize> sizes(layout.regions.size());
         for (size_t r = 0; r < layout.regions.size(); ++r) {
             const strata::core::StateRegion& region = layout.regions[r];
             if (region.kind == strata::core::RegionKind::fixed)
                 continue;
-            const uint64_t rows = region.units_for(m.max_context()), per_block = get_rows_per_block(r);
-            const size_t most = (size_t) ((rows + per_block - 1) / per_block + 1);
-            blocks[r].reserve(most);
-            tables[r] = (uint8_t**) strata::core::gpu_alloc_zeroed(most * sizeof(uint8_t*));
-            if (tables[r] == nullptr) {
-                for (uint8_t** table : tables)
-                    strata::core::gpu_free(table);
-                tables.clear();
-                err = "no room for the conversation's block tables";
-                return false;
-            }
+            const uint64_t rows = region.units_for(m.max_context()), per_block = p.block_bytes(r) / region.unit_bytes;
+            sizes[r].entries = (int64_t) ((rows + per_block - 1) / per_block + 1);
         }
-        return true;
+        return sizes;
     }
 
-    /// Writes the blocks the pool gives the conversation into the tables, zeroing the new ones first with
-    /// `zero_new` (their pages held other data), and points the model at them when it is seated.
-    bool write_tables(std::string& err, bool zero_new = true) {
-        const strata::core::OnDevice on(dev);
-        const strata::core::StateLayout& layout = pool->layout();
-        for (size_t r = 0; r < layout.regions.size(); ++r) {
-            if (tables[r] == nullptr)
-                continue;
-            const std::vector<strata::core::PageId>& runs = pool->conversation_blocks(cid, r);
-            blocks[r].clear();
-            for (const strata::core::PageId page : runs)
-                blocks[r].push_back(pool->page_address(page));
-            for (size_t i = zeroed[r]; zero_new && i < blocks[r].size(); ++i)
-                if (!strata::core::gpu_memset_async(blocks[r][i], 0, pool->block_bytes(r), nullptr))
-                    return fail("zeroing the conversation's new pages", err);
-            zeroed[r] = blocks[r].size();
-            if (!blocks[r].empty() &&
-                !strata::core::gpu_copy(tables[r], blocks[r].data(), blocks[r].size() * sizeof(uint8_t*)))
-                return fail("writing the conversation's block tables", err);
-        }
-        if (seated == lead)
+    /// Points the model at the conversation's blocks when it is seated, after `ok` (a change of its blocks).
+    bool point_model_if_seated(bool ok) {
+        if (ok && seated == lead)
             point_model();
-        return true;
+        return ok;
     }
 
     /// Points the model at its fixed region and its rows.
@@ -261,7 +198,7 @@ struct Part final : strata::serve::PagedPart {
 
     /// Gets the address of fixed region `r`; null for kNoRegion.
     uint8_t* get_fixed(size_t r) const {
-        return r != kNoRegion ? pool->page_address(pool->conversation_blocks(cid, r).at(0)) : nullptr;
+        return r != kNoRegion ? tables.get_fixed_address(r) : nullptr;
     }
 
     /// Gets how region `r`'s rows lie in its blocks; none for kNoRegion.
@@ -269,16 +206,12 @@ struct Part final : strata::serve::PagedPart {
         KvRows rows;
         if (r == kNoRegion)
             return rows;
-        rows.blocks = tables[r];
-        rows.host_blocks = blocks[r].data();
-        rows.per_block = (uint32_t) get_rows_per_block(r);
-        rows.bytes = (uint32_t) pool->layout().regions[r].unit_bytes;
+        const strata::core::PagePool& p = tables.pool();
+        rows.blocks = (uint8_t* const*) tables.table(r);
+        rows.host_blocks = tables.blocks(r).data();
+        rows.bytes = (uint32_t) p.layout().regions[r].unit_bytes;
+        rows.per_block = (uint32_t) (p.block_bytes(r) / rows.bytes);
         return rows;
-    }
-    uint64_t get_rows_per_block(size_t r) const { return pool->block_bytes(r) / pool->layout().regions[r].unit_bytes; }
-    static bool fail(const char* what, std::string& err) {
-        err = std::string(what) + " failed";
-        return false;
     }
 };
 

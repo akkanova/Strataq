@@ -1,10 +1,9 @@
-#include "strata/base/gpu/managed_memory.hpp"
 // src/models/qwen38/conversation_pages.cpp - a Qwen3.8 conversation's state in a GPU page pool
 // (conversation_pages.hpp).
 #include "strata/models/qwen38/conversation_pages.hpp"
 #include "strata/models/qwen38/kernels/qsa.hpp"
 
-#include "strata/base/gpu/on_device.hpp"
+#include "strata/base/gpu/runtime.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/models/qwen38/conversation_snapshot.hpp"
 #include "strata/models/qwen38/layer.hpp"
@@ -15,12 +14,6 @@
 #include <stdexcept>
 
 namespace strata::qwen38 {
-
-ConversationPages::~ConversationPages() {
-    const strata::core::OnDevice on(device_);
-    for (int64_t* t : tables_)
-        strata::core::release_device(t);
-}
 
 bool ConversationPages::get_layout(const strata::core::ModelGeometry& g, const strata::core::SessionState& ss,
                                    const strata::core::QsaState* drafter, strata::core::StateLayout& layout,
@@ -58,54 +51,32 @@ bool ConversationPages::get_layout(const strata::core::ModelGeometry& g, const s
 }
 
 bool ConversationPages::init(const strata::core::ModelGeometry& g, strata::core::SessionState& ss,
-                             strata::core::PagePool& pool, strata::core::ConversationId id, std::string& err) {
+                             strata::core::PagePool& pool, strata::core::ConversationId id, int device,
+                             std::string& err) {
     using namespace strata::core;
-    const strata::kernels::QsaShapes s = strata::kernels::qsa_shapes(g);
     const int64_t n_qsa = count_qsa_layers(g, ss);
-    unit_bytes_.clear();
-    run_bytes_.clear();
-    fixed_regions_ = 0;
-    while (fixed_regions_ < pool.layout().regions.size() &&
-           pool.layout().regions[fixed_regions_].kind == RegionKind::fixed)
-        ++fixed_regions_;
-    for (size_t r = fixed_regions_; r < pool.layout().regions.size(); ++r) {
-        unit_bytes_.push_back(pool.layout().regions[r].unit_bytes);
-        run_bytes_.push_back(pool.block_bytes(r));
-    }
-    has_drafter_ = (int64_t) unit_bytes_.size() == n_qsa + 1;
-    if (const std::string why = pool.grow_conversation(id, 0); !why.empty()) {
-        err = "the page pool: " + why;
+    const std::vector<StateRegion>& regions = pool.layout().regions;
+    size_t fixed_regions = 0;
+    while (fixed_regions < regions.size() && regions[fixed_regions].kind == RegionKind::fixed)
+        ++fixed_regions;
+    drafter_region_ = (int64_t) (regions.size() - fixed_regions) == n_qsa + 1 ? regions.size() - 1 : 0;
+    idx_block_ = strata::kernels::qsa_shapes(g).idx_block;
+    max_blocks_ = ss.max_cells / idx_block_ + 2;
+    std::vector<ConversationBlockTables::TableSize> sizes(regions.size());
+    for (size_t r = fixed_regions; r < regions.size(); ++r)
+        sizes[r] = {max_blocks_, pool.block_bytes(r) / regions[r].unit_bytes};
+    // QSA reads live units and the spare at n_bid; reserve() publishes those before a kernel can use them.
+    if (!tables_.attach(pool, id, device, sizes, strata::kernels::kKvUnitOrigin, err))
         return false;
-    }
     pool.set_conversation_label(id, id == 1 ? "Main conversation" : "Conversation " + std::to_string(id - 1));
-    ss.gdn_state = (float*) pool.page_address(pool.conversation_blocks(id, 0).at(0));
-    idx_block_ = s.idx_block;
-    max_blocks_ = ss.max_cells / s.idx_block + 2;
-    for (size_t j = unit_bytes_.size(); j < tables_.size(); ++j)   // the pool's layout lost layers (a moved cut)
-        (void) strata::core::release_device(tables_[j]);
-    tables_.resize(unit_bytes_.size(), nullptr);
-    (void) cudaGetDevice(&device_);
-    runs_in_table_.assign(unit_bytes_.size(), 0);
-    for (size_t j = 0; j < tables_.size(); ++j) {
-        if (tables_[j] == nullptr &&
-            strata::core::allocate_device((void**) &tables_[j], (size_t) max_blocks_ * sizeof(int64_t),
-                {"other", "Device allocations", "Conversation page tables"}) != cudaSuccess) {
-            (void) cudaGetLastError();
-            tables_[j] = nullptr;
-            err = "the page pool: no room for the K/V's unit tables";
-            return false;
-        }
-        cudaMemset(tables_[j], 0, (size_t) max_blocks_ * sizeof(int64_t));
-        if ((int64_t) j < n_qsa)
-            qsa_use_units(g, ss.qsa_states[ss.qsa_ord0 + (int64_t) j], tables_[j]);
-    }
-    if (cudaMemset(ss.gdn_state, 0, pool.block_bytes(0)) != cudaSuccess ||
-        cudaDeviceSynchronize() != cudaSuccess) {
-        err = std::string("the page pool: ") + cudaGetErrorString(cudaGetLastError());
+    ss.gdn_state = (float*) tables_.get_fixed_address(0);
+    for (int64_t j = 0; j < n_qsa; ++j)
+        qsa_use_units(g, ss.qsa_states[ss.qsa_ord0 + j], tables_.table(fixed_regions + (size_t) j));
+    if (!gpu_memset_async(ss.gdn_state, 0, pool.block_bytes(0), nullptr) || !gpu_stream_synchronize(nullptr)) {
+        err = "the page pool: zeroing the conversation's recurrent state failed";
+        tables_.release();
         return false;
     }
-    pool_ = &pool;
-    id_ = id;
     return true;
 }
 
@@ -113,76 +84,30 @@ bool ConversationPages::reserve(int64_t tokens, std::string& err) {
     const int64_t need = get_pool_tokens(tokens);
     if (need <= reserved_)
         return true;
-    if (const std::string why = pool_->grow_conversation(id_, need); !why.empty()) {
-        err = "the conversation's memory is full: " + why;
+    if (!tables_.grow(need, err))
         return false;
-    }
     reserved_ = need;
-    return write_tables(true, err);
-}
-
-bool ConversationPages::refresh(strata::core::SessionState& ss, std::string& err) {
-    ss.gdn_state = (float*) pool_->page_address(pool_->conversation_blocks(id_, 0).at(0));
-    std::fill(runs_in_table_.begin(), runs_in_table_.end(), 0);
-    return write_tables(false, err);
-}
-
-/// Writes the units of the pool's blocks that the device tables lack (runs_in_table_ on), zeroing the new blocks'
-/// pages first with `zero_new`.
-bool ConversationPages::write_tables(bool zero_new, std::string& err) {
-    bool added = false;
-    for (size_t j = 0; j < tables_.size(); ++j) {
-        const std::vector<strata::core::PageId>& runs = pool_->conversation_blocks(id_, fixed_regions_ + j);
-        if (runs.size() == runs_in_table_[j])
-            continue;
-        std::vector<uint8_t*> at;
-        for (const strata::core::PageId p : runs)
-            at.push_back(pool_->page_address(p));
-        for (size_t i = runs_in_table_[j]; zero_new && i < at.size(); ++i)
-            cudaMemset(at[i], 0, run_bytes_[j]);
-        const uint64_t per_run = run_bytes_[j] / unit_bytes_[j];
-        const int64_t blocks = std::min((int64_t) (at.size() * per_run), max_blocks_);
-        const int64_t first = std::min((int64_t) (runs_in_table_[j] * per_run), blocks);
-        const std::vector<int64_t> table = strata::kernels::kv_unit_table(at, run_bytes_[j], unit_bytes_[j], blocks);
-        cudaMemcpy(tables_[j] + first, table.data() + first, (size_t) (blocks - first) * sizeof(int64_t),
-                   cudaMemcpyHostToDevice);
-        runs_in_table_[j] = runs.size();
-        added = true;
-    }
-    // the kernels that read the tables and pages run on non-blocking streams, which do not wait for these copies
-    if (added && cudaDeviceSynchronize() != cudaSuccess) {
-        err = std::string("the conversation's pages: ") + cudaGetErrorString(cudaGetLastError());
-        return false;
-    }
     return true;
 }
 
+bool ConversationPages::refresh(strata::core::SessionState& ss, std::string& err) {
+    ss.gdn_state = (float*) tables_.get_fixed_address(0);
+    return tables_.refresh(err);
+}
+
 void ConversationPages::truncate(int64_t tokens) {
-    const int64_t keep = tokens > 0 ? std::min(((tokens - 1) / idx_block_ + 2) * idx_block_, reserved_) : 0;
-    pool_->truncate_conversation(id_, keep);
-    reserved_ = keep;
-    for (size_t j = 0; j < tables_.size(); ++j)
-        runs_in_table_[j] = pool_->conversation_blocks(id_, fixed_regions_ + j).size();
+    reserved_ = tokens > 0 ? std::min(((tokens - 1) / idx_block_ + 2) * idx_block_, reserved_) : 0;
+    tables_.truncate(reserved_);
 }
 
 void ConversationPages::release() {
-    pool_->remove_conversation(id_);
-    pool_ = nullptr;
+    tables_.release();
     reserved_ = 0;
 }
 
 int64_t ConversationPages::get_pool_tokens(int64_t tokens) const {
     // blocks up to the last position's, and the spare one after it that the indexer writes ahead
     return std::min((std::max<int64_t>(tokens, 1) - 1) / idx_block_ + 2, max_blocks_) * idx_block_;
-}
-
-uint64_t ConversationPages::bytes() const {
-    if (!is_ready())
-        return 0;
-    uint64_t bytes = 0;
-    for (size_t r = 0; r < pool_->layout().regions.size(); ++r)
-        bytes += pool_->conversation_blocks(id_, r).size() * pool_->block_bytes(r);
-    return bytes;
 }
 
 int64_t ConversationPages::count_qsa_layers(const strata::core::ModelGeometry& g,
@@ -192,14 +117,7 @@ int64_t ConversationPages::count_qsa_layers(const strata::core::ModelGeometry& g
 }
 
 bool ConversationPages::can_reserve_without_growth(int64_t tokens) const {
-    if (!is_ready())
-        return false;
-    // The logical high-water mark can advance inside units whose device addresses are already published.
-    const int64_t blocks = get_pool_tokens(tokens) / idx_block_;
-    for (size_t j = 0; j < unit_bytes_.size(); ++j)
-        if ((uint64_t) blocks > runs_in_table_[j] * (run_bytes_[j] / unit_bytes_[j]))
-            return false;
-    return true;
+    return is_ready() && tables_.has_blocks_for(get_pool_tokens(tokens));
 }
 
 }  // namespace strata::qwen38
