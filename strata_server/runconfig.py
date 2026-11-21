@@ -53,7 +53,8 @@ LIVE_FLAGS = {"memory_mib.gpu0": "--gpu-mib", "memory_mib.ram": "--ram-mib", "to
               "tokens_max": "--tokens-max", "ssd_pause_mib": "--ssd-pause-mib", "rows": "--rows",
               "suffix_draft": "--suffix-draft", "lookup_chain": "--lookup-chain",
               "lookahead": "--lookahead", "concurrent": "--concurrent", "drafter": "--drafter",
-              "save_on_shutdown": "--save-on-shutdown", "vram_reserve_mib": "--vram-reserve-mib"}
+              "save_on_shutdown": "--save-on-shutdown", "vram_reserve_mib": "--vram-reserve-mib",
+              "batch_groups": "--batch-groups"}
 # The live settings that are switches: CHANGE_SETTINGS and the run config spell them "on" or "off".
 _LIVE_SWITCHES = ("drafter", "save_on_shutdown", "shared_memory")
 # The switches that hold for the one change they come with, so have no default: shared_memory=on lets that change's

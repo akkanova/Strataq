@@ -106,7 +106,10 @@ struct PagedSettings {
     int64_t ssd_pause_mib = kDefaultSsdPauseMib;   ///< --ssd-pause-mib
     std::string pause_dir;                         ///< --pause-dir; empty: the temporary folder's <program name>
     std::string copy_back = "auto";                ///< --copy-back
-    std::string batch_groups = "1";             ///< --batch-groups: live-concurrency divisor or auto.
+    /// --batch-groups (live: batch_groups): how many groups a step's conversations split into, each group running on
+    /// a different card of a layer split at once; 0 (also --batch-groups auto): the largest divisor of live
+    /// concurrency no greater than the stage count.  A count that does not divide live concurrency runs one group.
+    int64_t batch_groups = 1;
     std::string remote_experts = "auto";           ///< --remote-experts
     /// --expert-popularity-decay: the factor by which each decode step multiplies the adaptive tier's routing counts;
     /// 0: --adapt-decay's (a factor per 4 steps) to the power 0.25

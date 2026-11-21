@@ -1075,9 +1075,8 @@ class StrataEngine:
             print(f"[strata] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
                   "(its log says why)", flush=True)
         _bg = args[args.index("--batch-groups") + 1] if "--batch-groups" in args else "default"
-        # no `--batch-groups` (the default on a layer split) or `auto`: the engine picks the groups and says so
-        # (INFO batch_groups=G); a number is the group count asked for (1 = off)
-        groups = int(self.info.get("batch_groups") or 1) if _bg in ("auto", "default") else int(_bg)
+        # No flag or auto (0) uses INFO batch_groups; an explicit positive number requests that count (1 = off).
+        groups = int(self.info.get("batch_groups") or 1) if _bg in ("auto", "0", "default") else int(_bg)
         groups = groups if self.batch and groups > 0 and self.batch % groups == 0 else 1
         gs = self.batch // groups if self.batch else 0
         # slots in the order that spreads requests over the pipeline's groups first: 0, gs, 2gs, .., 1, gs+1, ..

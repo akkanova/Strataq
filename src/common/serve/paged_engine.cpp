@@ -729,11 +729,11 @@ int PagedEngine::serve() {
     print_response("INFO save_on_shutdown=%d\n", settings_.save_on_shutdown ? 1 : 0);
     print_response("INFO tokens_max=%lld\n", (long long) settings_.tokens_max);
     print_response("INFO context_capacity=%lld\n", (long long) facts_.context);
-    if (settings_.batch_groups != "1") {
+    if (settings_.batch_groups != 1) {
         print_response("INFO batch_groups=%d\n", step_.settings.groups);
         if (step_.settings.groups == 1)
-            say("--batch-groups %s: one group (needs stage launch/poll support and a divisor of live concurrency)\n",
-                settings_.batch_groups.c_str());
+            say("--batch-groups %lld: one group (needs stage launch/poll support and a divisor of live concurrency)\n",
+                (long long) settings_.batch_groups);
     }
     print_response("INFO request_capacity=%d request_queue=1\n", get_most_concurrent());
     print_response(
@@ -2305,6 +2305,10 @@ strata::serve::MemoryReport PagedEngine::describe_memory() const {
                            {{"memory_mib.ram", (int64_t) ((rr.total.bytes + ram_.ring_bytes()) >> 20)},
                             {"token_bytes", (int64_t) ((grown - fixed) / probe)},
                             {"conversation_bytes", (int64_t) fixed}});
+    if (cards_.size() > 1)
+        report.settings.insert(report.settings.end(), {{"batch_groups", settings_.batch_groups},
+                                                       {"batch_groups_now", step_.settings.groups},
+                                                       {"pipeline_stages", model_.get_pipeline_stages()}});
     report.settings.emplace_back("drafter", settings_.drafter && facts_.has_drafter ? 1 : 0);
     report.settings.emplace_back("save_on_shutdown", settings_.save_on_shutdown ? 1 : 0);
     report.settings.emplace_back("suffix_draft", settings_.suffix_draft);
@@ -2383,6 +2387,8 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
             s.step.rows = (int) v;
         else if (name == "lookahead")
             s.step.lookahead = (int) v;
+        else if (name == "batch_groups" && cards_.size() > 1)
+            s.batch_groups = v;
         else
             return facts_.name + " has no setting " + name;
     }
@@ -2445,6 +2451,7 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
     settings_.ssd_pause_mib = s.ssd_pause_mib;
     trim_ssd();
     settings_.step = s.step;
+    settings_.batch_groups = s.batch_groups;
     settings_.suffix_draft = s.suffix_draft;
     settings_.lookup_chain = s.lookup_chain;
     const auto note = [&shortfall](const char* what, const std::string& why) {
@@ -2853,9 +2860,8 @@ void PagedEngine::apply_step_settings() {
     step_.settings = settings_.step;
     const int stages = model_.get_pipeline_stages();
     const int concurrent = settings_.step.concurrent;
-    int groups = settings_.batch_groups == "auto" ? std::min(stages, concurrent) :
-                 std::atoi(settings_.batch_groups.c_str());
-    if (settings_.batch_groups == "auto") {
+    int groups = settings_.batch_groups == 0 ? std::min(stages, concurrent) : (int) settings_.batch_groups;
+    if (settings_.batch_groups == 0) {
         while (groups > 1 && concurrent % groups != 0)
             --groups;
     }

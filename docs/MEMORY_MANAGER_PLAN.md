@@ -239,6 +239,7 @@ parallelism ([MULTI_GPU.md](MULTI_GPU.md)). The new step has one shared way:
   count must divide live concurrency, otherwise it uses one group. `1` keeps the synchronous path; omitting the
   option keeps that existing default, so pipeline groups remain opt-in. `--batch` only
   seeds concurrency; raising it live can grow the groups. The Python launcher forwards the existing option.
+  The Memory panel changes the group count live on a layer split (`batch_groups`, 0 for auto; 21 November 2026).
   DeepSeek now exposes stage launch/poll through that same scheduler. Its pass separates immutable group inputs,
   row-local attention binding, stage execution and deferred sampling. Group-owned compressed-row copy buffers and
   DSpark taps survive until the wave drains; stage ownership follows live cuts. Its one-group path remains separate

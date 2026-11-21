@@ -45,6 +45,13 @@ class Apply(unittest.TestCase):
         with self.assertRaises(ValueError):
             runconfig.check_live({"prompt_turn_ms": -1}, True)
 
+    def test_batch_groups_are_live_and_saved_with_0_for_auto(self):
+        values = runconfig.check_live({"batch_groups": 0}, True)
+        new, changed = runconfig.apply_live({"args": ["--batch-groups", "auto"]}, values)
+        self.assertEqual((new["args"], changed), (["--batch-groups", "0"], ["batch_groups"]))
+        with self.assertRaises(ValueError):
+            runconfig.check_live({"batch_groups": -1}, True)
+
     def test_saving_conversations_on_shutdown_is_a_switch_saved_as_on_or_off(self):
         values = runconfig.check_live({"save_on_shutdown": True}, True)
         new, changed = runconfig.apply_live({"args": []}, values)

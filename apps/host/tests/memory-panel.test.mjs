@@ -641,6 +641,31 @@ test('decoding while a prompt is read has a share and a turn length to change', 
   assert.deepEqual(calls, [[{decode_share_percent: 0}, 'session']]);
 });
 
+test('batch groups are a control only on a layer split, with the groups running now', async () => {
+  assert.doesNotMatch(mount(live, recorder().onChange).element.innerHTML, /data-setting="batch_groups"/);
+  const view = {...live, settings: {...live.settings, batch_groups: 1, batch_groups_now: 1, pipeline_stages: 2}};
+  const {calls, onChange} = recorder(), {element, fire} = mount(view, onChange);
+  assert.match(element.innerHTML, /data-setting="batch_groups" value="1" min="0"/);
+  assert.match(element.innerHTML, /Groups now: 1\./);
+  assert.doesNotMatch(element.innerHTML, /batch_groups_now|pipeline_stages/);
+  fire('change', {target: control('[data-setting]', {dataset: {setting: 'batch_groups'}, value: '0'})});
+  apply(fire);
+  await settle();
+  assert.deepEqual(calls, [[{batch_groups: 0}, 'session']]);
+  const drafting = mount({...view, settings: {...view.settings, drafter: 0, pipeline_stages: 0}}, onChange).element;
+  assert.match(drafting.innerHTML, /runs one group when a drafter is loaded, even if it is switched off/);
+});
+
+test('a startup group count above the slot limit does not block other live changes', async () => {
+  const view = {...live, settings: {...live.settings, batch_groups: 2147483647, batch_groups_now: 1,
+    pipeline_stages: 2}};
+  const {calls, onChange} = recorder(), {fire} = mount(view, onChange);
+  fire('change', {target: control('[data-setting]', {dataset: {setting: 'prompt_turn_ms'}, value: '0'})});
+  apply(fire);
+  await settle();
+  assert.deepEqual(calls, [[{prompt_turn_ms: 0}, 'session']]);
+});
+
 test('saving conversations on shutdown is a checkbox sent as a switch', async () => {
   const view = {...live, settings: {...live.settings, save_on_shutdown: 0, ssd_pause_mib: 8192}};
   const {calls, onChange} = recorder(), {element, fire} = mount(view, onChange);

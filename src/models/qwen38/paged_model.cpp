@@ -65,7 +65,8 @@ const std::string kProgram = "strata-q38";
 /// another card is weighed (--remote-experts auto, card_rules' is_hop_cheaper): the Strix Halo's pool computed 70,349
 /// experts in 2,449 ms and 43,808 in 1,550 ms (two stages, 6 requests each, the reads from the SSD not counted).
 constexpr double kCpuExpertMs = 0.035;
-/// With drafting, the verify windows' graphs kept for the most recent row layouts (the old engine's --batch-mtp).
+/// With drafting or a layer split (batch groups), the verify windows' graphs kept for the most recent row layouts
+/// (the old engine's --batch-mtp).
 constexpr size_t kWindowGraphs = 64;
 /// The largest chunk a prompt is read in with `--prefill auto` or no --prefill: the old engine's auto ceiling.
 constexpr int64_t kPromptCeiling = 8192;
@@ -473,15 +474,15 @@ int run_paged_engine(int argc, char** argv) {
     m.arm_prompt_cpu_share();
     ConversationDrafter drafter;
     SplitDrive split;
-    const int handoff_rows = strata::kernels::kVerifyMaxT *
-                             (settings.batch_groups == "1" ? 1 : strata::kernels::kVerifyMaxT);
+    // Live grouping needs up to kVerifyMaxT groups, each starting at group * kVerifyMaxT in the hand-offs.
+    const int handoff_rows = strata::kernels::kVerifyMaxT * strata::kernels::kVerifyMaxT;
     if (!init_card_paths(m, conv, cards, model_cards, split, handoff_rows, err) ||
         (drafting && !drafter.init(m, slots, err))) {
         std::fprintf(stderr, "strata-q38: %s\n", err.c_str());
         return 1;
     }
     // Proposals and changing group membership create many layouts; keep only recent captured graphs.
-    if (drafting || settings.batch_groups != "1")
+    if (drafting || model_cards.size() > 1)
         for (const ModelCard& mc : model_cards)
             mc.ver->set_batch_graph_limit(kWindowGraphs);
     if (drafting && !settings.drafter)   // loaded for the pool's layout of the drafter's K/V, switched on later

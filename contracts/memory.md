@@ -131,6 +131,12 @@ engine, when its command loop ends (QUIT or the end of stdin), pause its convers
 paused in RAM to the SSD, highest ranked first, within `ssd_pause_mib`. It keeps the files instead of deleting
 them, for the next start's adoption. CHANGE_SETTINGS takes `on` or `off`; the report gives 1 or 0.
 
+A paged engine on more than one GPU reports `batch_groups` (`--batch-groups`, default 1; 0 is `auto`),
+`batch_groups_now` (the groups its steps run now) and `pipeline_stages` (0 when DeepSeek has a drafter loaded, even
+if switched off; it runs one group). CHANGE_SETTINGS takes a whole number from 0 to 2147483647 for `batch_groups`,
+applied from the next step, as a change to `concurrent` is; an engine on one GPU refuses it. Qwen sizes a layer
+split's hand-offs for groups at every start, so that they can be turned on later.
+
 RAM checkpoints are serialized inside the shared pause-file host header, so named
 SAVE/RESTORE and automatic SSD pauses retain them. Disk-paused payloads are released
 from RAM after writing and read back on resume. Qwen uses layout identity 4; files

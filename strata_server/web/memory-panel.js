@@ -75,7 +75,7 @@ const SETTINGS = {context: "Per-conversation token limit", concurrent: "Conversa
                   tokens_max: "Max conversation tokens", ssd_pause_mib: "SSD for paused conversations (MiB)",
                   drafter: "Drafter", save_on_shutdown: "Save conversations on shutdown",
                   vram_reserve_mib: "VRAM kept free for other programs (MiB)",
-                  slots: "Maximum conversations at once"};
+                  slots: "Maximum conversations at once", batch_groups: "Batch groups (0: auto)"};
 /** The settings that are switches: the engine reports them as 1 or 0 and takes "on" or "off". */
 const SWITCHES = ["drafter", "save_on_shutdown"];
 /** Guidance shared by the per-conversation limit's tooltip and capacity error. */
@@ -83,7 +83,7 @@ const CONTEXT_CAPACITY_HELP = "To raise this limit, increase --max-context in th
   "then reload the model.";
 /** Settings the engine reports that the panel shows elsewhere (the bars) or not at all. */
 const UNLISTED = new RegExp("^memory_mib\\.|^(token_bytes|conversation_bytes|context_capacity|" +
-  "has_drafter|suffix_draft|lookup_chain|slots|ssd_pause_mib)$");
+  "has_drafter|suffix_draft|lookup_chain|slots|ssd_pause_mib|batch_groups_now|pipeline_stages)$");
 /**
  * The number settings the panel's controls change, with the range each accepts given the reading's settings `s`
  * (the engine checks them again).
@@ -97,6 +97,7 @@ const CONTROLS = [["concurrent", () => 1, (s) => Math.min(s.slots ?? 8, s.rows ?
                   ["prompt_turn_ms", () => 0, () => Infinity],
                   ["rows", (s) => s.concurrent ?? 1, () => 8],
                   ["lookahead", () => 0, (s) => (s.rows ?? 1) - 1],
+                  ["batch_groups", () => 0, () => 2147483647],
                   ["tokens_min", () => 0, (s) => s.tokens_max ?? Infinity],
                   ["tokens_max", (s) => s.tokens_min ?? 0, () => Infinity],
                   ["context", () => 1, (s) => s.context_capacity ?? s.context ?? Infinity],
@@ -509,6 +510,13 @@ function getControlHelp(key, settings, details = {}) {
   if (key === "prompt_turn_ms")
     return "The least time a prompt is read before the answering conversations get their turn. 0 means one chunk " +
       "of the prompt. Longer turns switch less often between reading and answering.";
+  if (key === "batch_groups")
+    return "With the model split over several GPUs, the conversations decoding together can split into groups, so " +
+      "that one GPU works on one group while the next GPU works on another. 1 turns this off; 0 picks the most " +
+      "groups that divide the conversations at once evenly, up to one per GPU. A number that does not divide them " +
+      "runs one group. " + (settings.pipeline_stages === 0 ?
+      "This model runs one group when a drafter is loaded, even if it is switched off. " : "") +
+      `Groups now: ${fmt(settings.batch_groups_now ?? 1)}.`;
   if (key === "vram_reserve_mib")
     return "Graphics memory, in MiB, that Strata leaves free on each GPU for other programs and for its own buffers " +
       "outside the pools. A change applies when a pool next grows, and at the next start when it is saved as the " +
