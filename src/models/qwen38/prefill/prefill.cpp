@@ -752,6 +752,14 @@ struct Stager {
     // `from` set: the blob is copied by the source itself (CS-T: a GGUF read in place assembles it from its three
     // role slices; a pointer to it would not live as long as the queue)
     struct Job { const uint8_t* src; size_t bytes; core::ExpertSource* from = nullptr; int32_t l = 0, e = 0; };
+    /// Finishes a walk's pending host copies on scope exit; a null stager is ignored.
+    struct Done {
+        Stager* st;
+        ~Done() {
+            if (st)
+                st->finish();
+        }
+    };
     std::vector<uint8_t*> buf;
     std::vector<char> pinned;
     std::vector<std::vector<uint8_t>> pageable;   // the fallback when no more RAM can be pinned
@@ -1392,6 +1400,17 @@ struct Prefill::Impl {
         if (job >= 0)
             stager->issued_one(job, copy);
         return job < 0;
+    }
+    /// Queues an unpinned expert for the prefill walks and returns its job index.
+    /// Transient blobs are copied by the source. With copy_missing, the source also copies blobs without a stable
+    /// pointer (an unmapped file on Windows); otherwise those return -1 without adding a job.
+    int stage_job(std::vector<Stager::Job>& js, int64_t l, int32_t e, size_t bytes, bool copy_missing) const {
+        const bool transient = src->transient(l, e);
+        const uint8_t* b = transient ? nullptr : src->blob_stable(l, e);
+        if (b == nullptr && !transient && !copy_missing)
+            return -1;
+        js.push_back(b ? Stager::Job{b, bytes} : Stager::Job{nullptr, bytes, src, (int32_t) l, e});
+        return (int) js.size() - 1;
     }
 };
 
@@ -3923,26 +3942,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                     if (m.pp && m.pp->peer && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
-                    int job = -1;
-                    const uint8_t* b = nullptr;
-                    if (m.src->transient(l, e)) {   // CS-T: copied by the source into the stager's buffer
-                        job = (int) js.size();
-                        js.push_back({nullptr, (size_t) lay0.blob_bytes(l), m.src, (int32_t) l, e});
-                    } else {
-                        b = m.src->blob_stable(l, e);
-                        if (!b) { err = "prefill: expert source has no blob"; return false; }
-                        if (ps_on && m.src->pinned(l, e)) {   // multi-GPU: every ps_frac-th one goes to the peer's ring
-                            ps_acc += m.pp->ps_frac;
-                            if (ps_acc >= 1.0) {
-                                ps_acc -= 1.0;
-                                m.pp->pseq.push_back({(int32_t) l, e, b});
-                                m.pp->ps_flag[(size_t) l * m.g->n_expert + e] = 1;
-                                continue;
-                            }
-                        }
-                        if (!m.src->pinned(l, e)) {
-                            job = (int) js.size();
-                            js.push_back({b, (size_t) lay0.blob_bytes(l)});
+                    const bool pinned = !m.src->transient(l, e) && m.src->pinned(l, e);   // DMA'd in place
+                    const uint8_t* b = pinned ? m.src->blob_stable(l, e) : nullptr;
+                    const int job = pinned ? -1 : m.stage_job(js, l, e, (size_t) lay0.blob_bytes(l), false);
+                    if (pinned ? !b : job < 0) {
+                        err = "prefill: expert source has no blob";
+                        return false;
+                    }
+                    if (ps_on && pinned) {   // multi-GPU: every ps_frac-th one goes to the peer's ring
+                        ps_acc += m.pp->ps_frac;
+                        if (ps_acc >= 1.0) {
+                            ps_acc -= 1.0;
+                            m.pp->pseq.push_back({(int32_t) l, e, b});
+                            m.pp->ps_flag[(size_t) l * m.g->n_expert + e] = 1;
+                            continue;
                         }
                     }
                     seq.push_back({(int32_t) l, e, b, job});
@@ -3954,10 +3967,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
             m.stager->start(std::move(js));
         }
-        struct StagerDone {
-            Stager* st;
-            ~StagerDone() { if (st) st->finish(); }
-        } chunk_stager_done{stream_all ? m.stager.get() : nullptr};
+        Stager::Done chunk_stager_done{stream_all ? m.stager.get() : nullptr};
         auto issue_until = [&](size_t limit) {
             limit = std::min(limit, seq.size());
             while (issued < limit) {
@@ -5835,14 +5845,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 const int32_t e = order[j];
                                 if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                                 if (m.src->pinned(l, e)) continue;
-                                job_of[j] = (int) js.size();
-                                if (m.src->transient(l, e)) {   // CS-T: copied by the source
-                                    js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
-                                    continue;
+                                if ((job_of[j] = m.stage_job(js, l, e, (size_t) lay.blob_bytes(l), false)) < 0) {
+                                    err = "prefill: expert source has no blob";
+                                    return false;
                                 }
-                                const uint8_t* b = m.src->blob_stable(l, e);
-                                if (!b) { err = "prefill: expert source has no blob"; return false; }
-                                js.push_back({b, (size_t) lay.blob_bytes(l)});
                             }
                             if (m.warmer) {
                                 std::vector<int64_t> cur;
@@ -5863,7 +5869,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             m.stager->start(std::move(js));
                         }
-                        StagerDone stager_done{stream_all ? nullptr : m.stager.get()};
+                        Stager::Done stager_done{stream_all ? nullptr : m.stager.get()};
                         auto stage_one = [&](size_t j) -> bool {
                             const int32_t e = order[j];
                             const bool resident = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
@@ -7164,28 +7170,15 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
         std::fill(pf_job.begin(), pf_job.end(), -1);
         if (m.src == nullptr || !pf_on) return true;
         std::vector<Stager::Job> js;
-        const bool pdirect = false;   // (STRATA_PREFILL_DIRECT, #1670's other commit, is not ported)
         for (int32_t e = 0; e < NE; ++e) {
-            if ((m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0) || m.src->pinned(l, e)) continue;
-            pf_job[(size_t) e] = (int) js.size();
-            if (pdirect || m.src->transient(l, e)) {
-                js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
+            if ((m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0) || m.src->pinned(l, e))
                 continue;
-            }
-            const uint8_t* b = m.src->blob_stable(l, e);
-            if (!b) {   // #4695: no contiguous mapped blob (Windows, the mapping dropped for unbuffered reads): the source copies it itself
-                js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
-                continue;
-            }
-            js.push_back({b, (size_t) lay.blob_bytes(l)});
+            pf_job[(size_t) e] = m.stage_job(js, l, e, (size_t) lay.blob_bytes(l), true);
         }
         m.stager->start(std::move(js));
         return true;
     };
-    struct StagerStop {
-        Stager* st;
-        ~StagerStop() { if (st) st->finish(); }   // an early return in a layer's attention halves
-    } stager_stop{m.stager.get()};
+    Stager::Done stager_stop{m.stager.get()};   // an early return in a layer's attention halves
     int64_t lm_streamed = 0, lm_resident = 0, lm_groups = 0, lm_supers = 0, lm_groups_f16 = 0;
     uint64_t lm_bytes = 0;
     const int64_t G = m.T * K;   // the MoE buffers' rows (Xq, GU, H, Hq, Dm): a group's most
@@ -7229,28 +7222,15 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
             if (cnt[(size_t) e] == 0 && pf_job[(size_t) e] >= 0) m.stager->skip(pf_job[(size_t) e]);
         if (!pf_on && m.src != nullptr) {   // STRATA_LM_PREFETCH=0: the routed experts only, started now
             std::vector<Stager::Job> js;
-            const bool pdirect = false;   // (STRATA_PREFILL_DIRECT, #1670's other commit, is not ported)
             for (size_t u = 0; u < uniq.size(); ++u) {
                 const int32_t e = uniq[u];
-                if (resident(e) || m.src->pinned(l, e)) continue;
-                job_of[u] = (int) js.size();
-                if (pdirect || m.src->transient(l, e)) {
-                    js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
+                if (resident(e) || m.src->pinned(l, e))
                     continue;
-                }
-                const uint8_t* b = m.src->blob_stable(l, e);
-                if (!b) {   // #4695: as in lm_prefetch
-                    js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
-                    continue;
-                }
-                js.push_back({b, (size_t) lay.blob_bytes(l)});
+                job_of[u] = m.stage_job(js, l, e, (size_t) lay.blob_bytes(l), true);
             }
             m.stager->start(std::move(js));
         }
-        struct StagerDone {
-            Stager* st;
-            ~StagerDone() { if (st) st->finish(); }
-        } stager_done{m.stager.get()};
+        Stager::Done stager_done{m.stager.get()};
         // the tables: rows sorted by expert (token order within one), then per group its bounds and per-token CSR
         int32_t* th = lb.tab_host;
         int32_t* row_tok = th;
