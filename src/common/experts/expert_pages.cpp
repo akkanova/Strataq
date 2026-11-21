@@ -15,7 +15,8 @@ constexpr int kChunkTries = 4;
 
 bool ExpertPages::open(ExpertCache& cache, ChunkMemory memory, uint64_t bytes, const StateLayout& layout,
                        PagePoolConfig config, const std::vector<uint64_t>& blob_bytes, int64_t n_expert,
-                       int64_t max_experts, const std::vector<ExpertKey>& ranking, std::string& err) {
+                       int64_t max_experts, const std::vector<ExpertKey>& ranking, const PoolGrowth& growth,
+                       std::string& err) {
     const uint64_t page = (uint64_t) cache.slot_bytes(), pages = (uint64_t) cache.slots();
     if (!cache.valid() || cache.slot_offsets() != nullptr || cache.resident() != 0 || page == 0) {
         err = "the expert pages need an open, empty cache of uniform slots";
@@ -26,7 +27,7 @@ bool ExpertPages::open(ExpertCache& cache, ChunkMemory memory, uint64_t bytes, c
     cache_ = &cache;
     arena_ = cache.device_slot(0);
     if (!open_pool(std::move(memory), std::max(bytes, config.chunk_bytes), layout, config, blob_bytes, n_expert,
-                   max_experts, ranking, err))
+                   max_experts, ranking, growth, err))
         return false;
     cache.set_admitter([this](int64_t layer, int64_t expert) { return admit(layer, expert); });
     want_missing();
@@ -35,13 +36,14 @@ bool ExpertPages::open(ExpertCache& cache, ChunkMemory memory, uint64_t bytes, c
 
 bool ExpertPages::open(ChunkMemory memory, uint64_t bytes, const StateLayout& layout, PagePoolConfig config,
                        const std::vector<uint64_t>& blob_bytes, int64_t n_expert, int64_t max_experts,
-                       const std::vector<ExpertKey>& ranking, std::string& err) {
-    return open_pool(std::move(memory), bytes, layout, config, blob_bytes, n_expert, max_experts, ranking, err);
+                       const std::vector<ExpertKey>& ranking, const PoolGrowth& growth, std::string& err) {
+    return open_pool(std::move(memory), bytes, layout, config, blob_bytes, n_expert, max_experts, ranking, growth,
+                     err);
 }
 
-PoolResize ExpertPages::resize(uint64_t bytes) {
+PoolResize ExpertPages::resize(uint64_t bytes, const PoolGrowth& growth) {
     const uint64_t had = pool_->report().total.pages;
-    PoolResize r = pool_->resize(bytes);
+    PoolResize r = pool_->resize(bytes, growth);
     if (pool_->report().total.pages > had)   // the experts that did not fit before may come in now
         want_missing();
     return r;
@@ -100,7 +102,7 @@ int32_t ExpertPages::get_slot(PageId page) const {
 /// (the cache's arena first) up to `bytes`.
 bool ExpertPages::open_pool(ChunkMemory memory, uint64_t bytes, const StateLayout& layout, PagePoolConfig config,
                             const std::vector<uint64_t>& blob_bytes, int64_t n_expert, int64_t max_experts,
-                            const std::vector<ExpertKey>& ranking, std::string& err) {
+                            const std::vector<ExpertKey>& ranking, const PoolGrowth& growth, std::string& err) {
     const uint64_t page = config.page_bytes;
     config.expert_bytes = blob_bytes;
     config.join_chunks = memory.contiguous;
@@ -121,6 +123,10 @@ bool ExpertPages::open_pool(ChunkMemory memory, uint64_t bytes, const StateLayou
     PagePoolHooks hooks;
     hooks.alloc = [this](size_t n) -> void* { return alloc_chunk(n); };
     hooks.free = [this](void* chunk) { free_chunk((uint8_t*) chunk); };
+    hooks.is_outside = [this](void* chunk) {   // (the cache's arena, its first chunk, has no raw_ entry and stays)
+        const auto it = raw_.find((uint8_t*) chunk);
+        return memory_.is_outside && it != raw_.end() && memory_.is_outside(it->second);
+    };
     hooks.evicted = [this](ExpertKey key, PageId first) { on_evicted(key, first); };
     hooks.copy = [this, page](PageId to, PageId from, uint32_t pages) {
         return memory_.copy(pool_->page_address(to), pool_->page_address(from), pages * page);
@@ -134,7 +140,9 @@ bool ExpertPages::open_pool(ChunkMemory memory, uint64_t bytes, const StateLayou
         err = std::string("the page pool: ") + e.what();
         return false;
     }
-    if (const PoolResize r = pool_->resize(bytes); !r.refusal.empty() || pool_->report().total.pages == 0) {
+    // (a start that reaches the end of the memory's own takes that much: its room was an estimate, get_gpu_room)
+    if (const PoolResize r = pool_->resize(bytes, growth);
+        (!r.refusal.empty() && !r.own_memory_full) || pool_->report().total.pages == 0) {
         err = "the page pool: " + (r.refusal.empty() ? std::string("no room for a chunk") : r.refusal);
         return false;
     }

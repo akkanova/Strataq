@@ -266,9 +266,17 @@ beside a lot of RAM.
 The boundaries between a bar's segments can be dragged (step M6).
 
 - While dragging, the bar shows the new boundary and its numbers, and nothing is sent to the engine. A size the
-  engine would refuse (for example below what the biggest active conversation needs) shows in red with the reason.
+  engine may not give (for example below what the biggest active conversation needs, or more than the GPU's
+  dedicated memory held when last measured) shows in red with the reason.
 - The change is sent (`CHANGE_SETTINGS`) only when the mouse button is released. Escape cancels; dropping it where it
-  started changes nothing; releasing on a refused size changes nothing.
+  started changes nothing. Only the engine refuses a size: the panel sends it even when it shows red (owner,
+  2026-11-21).
+- On a PC whose graphics memory is the system RAM (Windows), a GPU pool grows until a chunk lands in shared memory,
+  gives that chunk back, and keeps the room the model leaves free (`--vram-reserve-mib`). The panel then asks: "29.0
+  of 30.0 GiB is available as dedicated memory. If you wish, you can allocate the remainder as shared memory, which may
+  be slower." Yes sends the change again with `shared_memory=on`, for that change only. Prompt buffers are lent from
+  below the first shared chunk. A shrink frees top chunks first, normally the shared ones; dedicated chunks can
+  follow them if another program frees memory between growths, and the pool does not reorder them.
 - After a change, a small prompt offers "This session" (the default) or "Save as default", and an Undo stays for a
   few seconds.
 - Easy to find: each draggable boundary has a visible grip and a resize cursor, and a tooltip says what dragging it

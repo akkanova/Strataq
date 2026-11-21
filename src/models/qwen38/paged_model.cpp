@@ -1520,7 +1520,7 @@ bool open_pages(Model& m, PagedCard& card, ModelCard& mc, int64_t tokens_min, in
     }
     if (!mc.cache->open((int64_t) (chunk / page), m.g.n_layers, m.g.n_expert, (int64_t) page, err, arena) ||
         !card.experts.open(*mc.cache, std::move(memory), pool_b, layout, config, blobs, m.g.n_expert, max_experts,
-                           ranking, err))
+                           ranking, {false, keep}, err))
         return false;
     strata::serve::say_gpu_pool(kProgram, card, room, chunk, gpu_mib);
     return true;

@@ -1562,7 +1562,8 @@ class StrataEngine:
                              "paused_budget": keys.pop("paused_budget", None),
                              "allocated_pct": share["allocated"], "fragmented_pct": share["fragmented"],
                              **{k: keys.pop(k, None) for k in
-                                ("setting", "smallest", "largest", "mapped", "pool_offset")},
+                                ("setting", "smallest", "largest", "mapped", "pool_offset", "pool_shared")},
+                             "dedicated_full": bool(keys.pop("dedicated_full", 0)),
                              "uses": keys})
         for key in ("concurrent", "tokens_max", "vram_conversations", "conversation_idle_seconds",
                     "save_on_shutdown"):

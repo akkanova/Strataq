@@ -36,6 +36,8 @@ struct ChunkMemory {
     std::function<bool(uint8_t* to, const uint8_t* from, uint64_t bytes)> copy;
     /// Each chunk `alloc` gives starts where the last one ended (one virtual range), so runs may cross chunks.
     bool contiguous = false;
+    /// Tells whether a chunk `alloc` gave lies outside the memory's own (PagePoolHooks::is_outside); null: none does.
+    std::function<bool(const uint8_t*)> is_outside;
 };
 
 /// Experts in the pages of a page pool made over one arena: a GPU's expert cache (whose slots are the pages) or host
@@ -65,17 +67,19 @@ public:
     /// the ones of the first `max_experts` that fit (PagePoolConfig::expert_ranking).  From then on the cache's
     /// `admit` takes pages from the pool.  The pool opens without experts: `refill` brings in those of the first
     /// `max_experts` that fit (is_refill_wanted).
+    /// The pool grows to `bytes` as `growth` says (PagePool::resize).
     bool open(ExpertCache& cache, ChunkMemory memory, uint64_t bytes, const StateLayout& layout,
               PagePoolConfig config, const std::vector<uint64_t>& blob_bytes, int64_t n_expert, int64_t max_experts,
-              const std::vector<ExpertKey>& ranking, std::string& err);
+              const std::vector<ExpertKey>& ranking, const PoolGrowth& growth, std::string& err);
     /// The same in chunks of `config.chunk_bytes` of `memory` only, without a cache: `admit` gives experts their
     /// pages, and a slot is a page's number.
     bool open(ChunkMemory memory, uint64_t bytes, const StateLayout& layout, PagePoolConfig config,
               const std::vector<uint64_t>& blob_bytes, int64_t n_expert, int64_t max_experts,
-              const std::vector<ExpertKey>& ranking, std::string& err);
-    /// Takes or gives back chunks so that the pool holds `bytes` (PagePool::resize, whose refusal it gets).  After a
-    /// growth, `refill` brings in the experts of the first `max_experts` that the pool lacks.
-    PoolResize resize(uint64_t bytes);
+              const std::vector<ExpertKey>& ranking, const PoolGrowth& growth, std::string& err);
+    /// Takes or gives back chunks so that the pool holds `bytes`, growing as `growth` says (PagePool::resize, whose
+    /// refusal it gets).  After a growth, `refill` brings in the experts of the first `max_experts` that the pool
+    /// lacks.
+    PoolResize resize(uint64_t bytes, const PoolGrowth& growth = {});
     /// Makes `ranking` (hottest first) the experts the pool holds, at most `max_experts` of them, as `open` does: the
     /// experts it holds that are not among the first `max_experts` leave (the `leaving` and `moved` hooks), and
     /// `refill` brings in the others.  strata-q38 gives a layer split's card its new layers' experts when the cut
@@ -136,7 +140,7 @@ public:
 private:
     bool open_pool(ChunkMemory memory, uint64_t bytes, const StateLayout& layout, PagePoolConfig config,
                    const std::vector<uint64_t>& blob_bytes, int64_t n_expert, int64_t max_experts,
-                   const std::vector<ExpertKey>& ranking, std::string& err);
+                   const std::vector<ExpertKey>& ranking, const PoolGrowth& growth, std::string& err);
     uint8_t* alloc_chunk(uint64_t bytes);
     void free_chunk(uint8_t* chunk);
     void on_evicted(ExpertKey key, PageId first);

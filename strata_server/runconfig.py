@@ -57,7 +57,10 @@ LIVE_FLAGS = {"memory_mib.gpu0": "--gpu-mib", "memory_mib.ram": "--ram-mib", "to
               "lookahead": "--lookahead", "concurrent": "--concurrent", "drafter": "--drafter",
               "save_on_shutdown": "--save-on-shutdown"}
 # The live settings that are switches: CHANGE_SETTINGS and the run config spell them "on" or "off".
-_LIVE_SWITCHES = ("drafter", "save_on_shutdown")
+_LIVE_SWITCHES = ("drafter", "save_on_shutdown", "shared_memory")
+# The switches that hold for the one change they come with, so have no default: shared_memory=on lets that change's
+# GPU pools grow past the dedicated memory into shared memory.
+_ONE_CHANGE = ("shared_memory",)
 # The numeric live settings whose range is not "at least 0": (least, most); the engine checks the rest (concurrent
 # against its batch slots, lookahead against rows, rows against its verify windows: 8, or 16 in a wide build).
 _LIVE_RANGE = {"rows": (1, 16), "concurrent": (1, None), "context": (1, None), "vram_conversations": (1, None)}
@@ -102,10 +105,10 @@ def check_live(changes, to_default: bool, cards: list[str] | None = None) -> dic
         raise ValueError('send {"set": {"<setting>": <value>, ...}}')
     out = {}
     for key, v in changes.items():
-        if key not in LIVE_FLAGS and not _is_card_setting(key):
+        if key not in LIVE_FLAGS and key not in _ONE_CHANGE and not _is_card_setting(key):
             raise ValueError(f"{key!r} is not a memory setting (expected memory_mib.gpu<N>, "
-                             f"memory_mib.gpu<N>.<card> or one of {', '.join(LIVE_FLAGS)})")
-        if to_default and key not in LIVE_FLAGS and key not in (cards or []):
+                             f"memory_mib.gpu<N>.<card> or one of {', '.join((*LIVE_FLAGS, *_ONE_CHANGE))})")
+        if to_default and key not in LIVE_FLAGS and key not in _ONE_CHANGE and key not in (cards or []):
             raise ValueError(f"{key} has no default in the run config; change it for this session only")
         if key in _LIVE_SWITCHES:
             if not isinstance(v, bool) and v not in ("on", "off"):
@@ -139,7 +142,7 @@ def apply_live(cfg: dict, values: dict, settings: dict | None = None) -> tuple[d
             _set_arg(new, "--gpu-mib", sizes)
             changed = list(cards)
     for key, v in values.items():
-        if key not in cards and _arg(new, LIVE_FLAGS[key]) != v:
+        if key not in cards and key not in _ONE_CHANGE and _arg(new, LIVE_FLAGS[key]) != v:
             _set_arg(new, LIVE_FLAGS[key], v)
             changed.append(key)
     return new, changed

@@ -191,18 +191,55 @@ test('Undo sends a live size change back for the session', async () => {
     [{'memory_mib.gpu0': Math.round(pool / MIB)}, 'session']]);
 });
 
-test('a size outside what the engine accepts shows red with the reason, and releasing there changes nothing', () => {
+test('a size outside what the engine accepts shows red with the reason, and releasing there still asks the engine',
+  async () => {
   const { calls, onChange } = recorder(), { element, fire } = mount(live, onChange);
   fire('pointerdown', { target: onDivider('gpu0'), clientX: 500 });
   fire('pointermove', { clientX: 250 });                 // about 16.9 GiB less: below the 4 GiB the engine needs
-  assert.match(element.innerHTML, /class="mem-divider mem-refused"/);
+  assert.match(element.innerHTML, /class="mem-divider mem-warned"/);
   assert.match(element.innerHTML,
-    /<p class="mem-preview mem-refused">19[.,]83 GiB → [^:]*: at least 7[.,]75 GiB is needed here now/);
-  assert.match(element.innerHTML, /releasing here changes nothing/);
+    /<p class="mem-preview mem-warned">19[.,]83 GiB → [^:]*: at least 7[.,]75 GiB is needed here now/);
   fire('pointerup', {});
-  assert.equal(calls.length, 0);
-  assert.match(element.querySelector('.mem-notice.mem-error').textContent, /Nothing changed: at least 7[.,]75 GiB/);
+  await settle();
+  assert.equal(calls.length, 1);
 });
+
+for (const choice of ['accept', 'decline', 'retry fails']) {
+  test(`a GPU pool asks before taking shared memory: ${choice}`, async () => {
+    const view = {available: true, can_change: true, settings: {}, memories: [{id: 'gpu0', total: 64 * GIB,
+      free: 33 * GIB, setting: 24 * GIB, pool_offset: 7 * GIB, largest: 28 * GIB, pool_shared: GIB,
+      uses: {weights: 7 * GIB, experts: 24 * GIB}}]};
+    const full = {...view, memories: [{...view.memories[0], setting: 29 * GIB, dedicated_full: true,
+      uses: {weights: 7 * GIB, experts: 29 * GIB}}]};
+    const calls = [], asked = [];
+    const {element, fire} = mount(view, async (set, save) => {
+      calls.push([set, save]);
+      return calls.length === 2 && choice === 'retry fails' ? {ok: false, error: 'allocation failed'} :
+        {ok: true, view: full};
+    });
+    assert.match(element.querySelector('[data-divider="gpu0"]').title, /pool has 1[.,]00 GiB in shared memory/);
+    fire('pointerdown', {target: onDivider('gpu0'), clientX: 1000 * 31 / 64});
+    fire('pointermove', {clientX: 1000 * 37 / 64});
+    assert.match(element.querySelector('.mem-preview').textContent, /about 35[.,]00 GiB fits in dedicated memory/);
+    globalThis.confirm = text => { asked.push(text); return choice !== 'decline'; };
+    try {
+      fire('pointerup', {});
+      await settle();
+    } finally {
+      delete globalThis.confirm;
+    }
+    assert.equal(asked.length, 1);
+    assert.equal(asked[0], '35.0 of 37.0 GiB is available as dedicated memory. If you wish, you can ' +
+      'allocate the remainder as shared memory, which may be slower');
+    const expected = [[{'memory_mib.gpu0': 30 * 1024}, 'session']];
+    if (choice !== 'decline')
+      expected.push([{'memory_mib.gpu0': 30 * 1024, shared_memory: true}, 'session']);
+    assert.deepEqual(calls, expected);
+    assert.match(element.querySelector('[data-divider="gpu0"]').getAttribute('aria-valuetext'), /36[.,]00 GiB total/);
+    if (choice === 'retry fails')
+      assert.match(element.querySelector('.mem-notice.mem-error').textContent, /allocation failed/);
+  });
+}
 
 test('Escape cancels a drag, and dropping a divider where it started changes nothing', () => {
   const { calls, onChange } = recorder(), { element, fire } = mount(live, onChange);

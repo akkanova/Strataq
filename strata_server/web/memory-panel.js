@@ -132,14 +132,16 @@ export function drawMemoryPanel(element, view, onChange) {
  *   config?: boolean, details?: Record<string, string>, memories: MemoryUse[], settings: Record<string, number>,
  *   conversations?: HeldConversation[], shortfall?: string, pause_directory?: string}} MemoryView
  * `setting`: the size of the engine's page pool there now, which `memory_mib.<id>` changes; `smallest`, `largest`:
- * the sizes it accepts now.  Bytes.
+ * the sizes it accepts now (a GPU's `largest`: what its dedicated memory holds, as last measured).  `pool_shared`: the
+ * bytes of the pool in a GPU's shared memory; `dedicated_full`: its last growth stopped where the dedicated memory
+ * ended.  Bytes.
  * @typedef {{id: string, name: string | null, total: number | null, free: number | null, unified: boolean,
  *   uses: Record<string, number>, paused_count: number | null, paused_budget: number | null,
  *   other?: number, other_apps?: number,
  *   blocks?: MemoryBlock[],
  *   in_share?: number, borrowed?: number | null, gpu_borrowed?: number, allocated_pct?: number | null,
  *   fragmented_pct?: number | null, setting?: number | null, pool_offset?: number | null, smallest?: number | null,
- *   largest?: number | null}} MemoryUse
+ *   largest?: number | null, pool_shared?: number | null, dedicated_full?: boolean}} MemoryUse
  * @typedef {{category: string, pool: string, label: string, bytes: number,
  *   identity_group?: string, ids?: number[]}} MemoryBlock
  * @typedef {{id: string, place: string, state: string, count: number, capacity: number, bytes: number,
@@ -159,9 +161,10 @@ export function drawMemoryPanel(element, view, onChange) {
  *   busy: boolean, notice: Notice | null, pending: SettingsChange}} Panel
  * A boundary of a bar that can be dragged.  `key`: the setting it changes; `from`: the size now; `start`: where the
  * segment it ends begins on the bar; `scale`: drawn bytes per byte of the engine's; `total`: the drawn bytes the
- * bar's width stands for; `fixed`: Strata allocations outside the adjustable pool. Bytes.
+ * bar's width stands for; `fixed`: Strata allocations outside the adjustable pool; `shared`: the pool's bytes in
+ * shared memory. Bytes.
  * @typedef {{key: string, from: number, smallest: number, largest: number, start: number, scale: number,
- *   total: number, fixed: number}} Divider
+ *   total: number, fixed: number, shared: number}} Divider
  * A divider being moved.  `value`: the size it would set (bytes); `x0`: the pointer's x where the drag started (null
  * for the keyboard); `perPx`: bytes per pixel of the bar.
  * @typedef {{id: string, value: number, x0: number | null, perPx: number}} Drag
@@ -272,16 +275,14 @@ function listen(element, panel) {
   }
 }
 
-/** Ends the drag that has the divider at its new size: sends the change, unless it is outside the range the engine
- *  accepts (said instead) or where it started.
+/** Ends the drag that has the divider at its new size: sends the change unless it is where it started.  The engine
+ *  alone refuses a size (findWarning only foretells it).
  * @param {HTMLElement} element
  * @param {Panel} panel */
 function finishDrag(element, panel) {
-  const {id, value} = /** @type {Drag} */ (panel.drag), d = panel.dividers[id], refusal = findRefusal(d, value);
+  const {id, value} = /** @type {Drag} */ (panel.drag), d = panel.dividers[id];
   panel.drag = null;
-  if (refusal)
-    panel.notice = {text: `Nothing changed: ${refusal}.`, error: true, until: Infinity};
-  if (refusal || mib(value) === mib(d.from))
+  if (mib(value) === mib(d.from))
     render(element, panel);
   else
     void change(element, panel, {[d.key]: mib(value)}, {[d.key]: mib(d.from)});
@@ -355,10 +356,15 @@ async function change(element, panel, set, undo, save = "session") {
     .catch((/** @type {Error} */ e) => ({ok: false, error: e.message, view: undefined}));
   panel.busy = false;
   if (answer.ok) {
-    for (const key of Object.keys(set))
-      delete panel.pending[key];
     if (answer.view)
       panel.view = answer.view;
+    const full = set.shared_memory ? undefined :
+      answer.view?.memories.find((m) => m.dedicated_full &&
+        Number(set[`memory_mib.${m.id}`]) * MIB > (m.setting ?? 0));
+    if (full && isSharedMemoryWanted(full, Number(set[`memory_mib.${full.id}`]) * MIB))
+      return change(element, panel, {...set, shared_memory: true}, undo, save);
+    for (const key of Object.keys(set))
+      delete panel.pending[key];
     try {
       localStorage.setItem(CHANGED_KEY, "1");
     } catch { /* no storage (a private window): the hint stays */ }
@@ -369,6 +375,17 @@ async function change(element, panel, set, undo, save = "session") {
   } else
     panel.notice = {text: answer.error || "The engine changed nothing.", error: true, until: Infinity};
   render(element, panel);
+}
+
+/** Asks the reader whether GPU memory `x`, whose pool stopped growing where its dedicated memory ended, may take the
+ *  rest of the `asked` bytes (its pool's) from shared memory.
+ * @param {MemoryUse} x
+ * @param {number} asked */
+function isSharedMemoryWanted(x, asked) {
+  const fixed = findDivider(x)?.fixed ?? 0;
+  const dedicated = fixed + (x.setting ?? 0) - (x.pool_shared ?? 0);
+  return confirm(`${(dedicated / 1073741824).toFixed(1)} of ${((fixed + asked) / 1073741824).toFixed(1)} GiB is ` +
+    "available as dedicated memory. If you wish, you can allocate the remainder as shared memory, which may be slower");
 }
 
 /** Gets whether the reader has changed a size before (in this browser), which retires the hint. */
@@ -532,16 +549,19 @@ function findDivider(x) {
     (first < 0 ? parts : parts.slice(0, first)).reduce((a, p) => a + (p.drawn ?? p.bytes), 0);
   const fixed = ssd ? 0 : Math.max(0, Object.values(x.uses).reduce((a, b) => a + b, 0) - from);
   return {key: ssd ? "ssd_pause_mib" : `memory_mib.${x.id}`, from, smallest: x.smallest ?? 0,
-          largest: x.largest ?? Infinity, start, scale, total, fixed};
+          largest: x.largest ?? Infinity, start, scale, total, fixed, shared: x.pool_shared ?? 0};
 }
 
-/** Gets why the engine would refuse a divider's size, or "" when it accepts it.
+/** Gets why the engine may not give a divider's size: it refuses less than it needs and more than a RAM pool can
+ *  take; a GPU pool past its dedicated memory gets shared memory only when the reader agrees.  "" when it may.
  * @param {Divider} d
  * @param {number} value  bytes */
-function findRefusal(d, value) {
+function findWarning(d, value) {
   return value < d.smallest ? `at least ${size(d.fixed + d.smallest)} is needed here now (fixed allocations, ` +
-    `the biggest active conversation and the minimum conversation tokens)` : value > d.largest ?
-    `at most ${size(d.fixed + d.largest)} is available to Strata here (${size(d.fixed)} fixed)` : "";
+    `the biggest active conversation and the minimum conversation tokens)` : value <= d.largest ? "" :
+    d.key.startsWith("memory_mib.gpu") ? `about ${size(d.fixed + d.largest)} fits in dedicated memory ` +
+    `(${size(d.fixed)} fixed); the rest would be shared memory, which may be slower` :
+    `at most ${size(d.fixed + d.largest)} is available to Strata here (${size(d.fixed)} fixed)`;
 }
 
 /** Gets the markup of one memory's row: its name and size, its bar (with its divider, moved by `drag`) and the
@@ -602,29 +622,32 @@ function drawBar(x, divider, drag, view) {
  * @param {Divider} d
  * @param {Drag | null} drag */
 function drawDivider(id, d, drag) {
-  const value = drag ? drag.value : d.from, refused = drag && findRefusal(d, value) ? " mem-refused" : "";
+  const value = drag ? drag.value : d.from, warned = drag && findWarning(d, value) ? " mem-warned" : "";
   const at = (/** @type {number} */ b) => Math.min(100, Math.max(0, (100 * (d.start + b * d.scale)) / d.total));
   const what = id === "ssd" ? "the SSD space paused conversations may take" :
     `Strata's total memory ${id === "ram" ? "in RAM" : "on this GPU"}`;
   const allocation = `${size(d.fixed + value)}${id === "ssd" ? "" :
     ` total (${size(d.fixed)} fixed, ${size(value)} resizable pool)`}`;
-  const moved = drag && value !== d.from ? `<span class="mem-change${refused}" style="left:` +
+  const shared = d.shared ? ` The pool has ${size(d.shared)} in shared memory, which is slower; prompt buffers ` +
+    "are lent below the lowest shared chunk." : "";
+  const moved = drag && value !== d.from ? `<span class="mem-change${warned}" style="left:` +
     `${Math.min(at(d.from), at(value))}%;width:${Math.abs(at(value) - at(d.from))}%"></span>` : "";
-  return `${moved}<span class="mem-divider${refused}" data-divider="${esc(id)}" tabindex="0" role="slider" ` +
+  return `${moved}<span class="mem-divider${warned}" data-divider="${esc(id)}" tabindex="0" role="slider" ` +
     `aria-label="${esc(what)}" aria-valuetext="${allocation}" title="Drag to change ${esc(what)}. ` +
-    `${allocation}. Arrow keys move it too; Enter applies, Escape cancels." style="left:${at(value)}%"></span>`;
+    `${allocation}.${esc(shared)} Arrow keys move it too; Enter applies, Escape cancels." ` +
+    `style="left:${at(value)}%"></span>`;
 }
 
-/** Gets the markup of the line under a bar whose divider is being moved: the size before and after, or in red why
- *  the engine would refuse it.
+/** Gets the markup of the line under a bar whose divider is being moved: the size before and after, and in red why
+ *  the engine may not give it (findWarning).
  * @param {Divider} d
  * @param {Drag} drag */
 function drawPreview(d, drag) {
-  const refusal = findRefusal(d, drag.value);
-  return `<p class="mem-preview${refusal ? " mem-refused" : ""}">` +
+  const warning = findWarning(d, drag.value);
+  return `<p class="mem-preview${warning ? " mem-warned" : ""}">` +
     `${size(d.fixed + d.from)} → ${size(d.fixed + drag.value)}` +
     (d.key === "ssd_pause_mib" ? "" : ` Strata total (${size(d.fixed)} fixed; ${size(drag.value)} resizable pool)`) +
-    (refusal ? `: ${esc(refusal)}; releasing here changes nothing` : ": release to apply, Escape cancels") + "</p>";
+    (warning ? `: ${esc(warning)}; ` : ": ") + "release to apply, Escape cancels</p>";
 }
 
 /** Gets the API monitor's selectable contexts, including engine-reported activity ages when available.

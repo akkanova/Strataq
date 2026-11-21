@@ -5,7 +5,7 @@
 //   GET_MEMORY_USE
 //     MEMORY <id> [total=<B>] [free=<B>] [unified=1] [<use>=<B> ...] [paused_count=<n>] [paused_budget=<B>]
 //            [pool_pages=<n> allocated_pages=<n> fragmented_pages=<n>] [setting=<B> smallest=<B> largest=<B>]
-//            [mapped=<B>] [name=<text>]                                                   one line per memory, then
+//            [pool_shared=<B>] [dedicated_full=1] [mapped=<B>] [name=<text>]             one line per memory, then
 //     [MEMORY_BLOCK <memory-id> <bytes> <category> <pool> <label> [<identity-group> <ids>]] labelled allocations
 //     [PAUSE_DIRECTORY <path>]                                                  folder for automatic SSD pauses
 //     [CONVERSATION <id> <place> <state> <tokens> <capacity> <bytes> <used>]     with per_conversation: one per
@@ -28,7 +28,10 @@
 // parked conversations there; paused_budget: the most they may take.  pool_pages: the pages of a page pool there
 // (strata-q38's), of which allocated_pages hold experts or conversations and fragmented_pages are free in runs
 // shorter than the smallest expert, which no expert can use.  setting: the bytes the engine's pool there takes now
-// (its `memory_mib.<id>` setting), and smallest, largest: the range CHANGE_SETTINGS accepts for it now.  mapped: the
+// (its `memory_mib.<id>` setting), and smallest, largest: the range CHANGE_SETTINGS accepts for it now (largest: the
+// estimate of what the GPU's dedicated memory holds; a growth finds the real end).  pool_shared: the bytes of an
+// integrated GPU's pool that went to shared memory; dedicated_full=1: the pool's last growth stopped
+// where the dedicated memory ended (CHANGE_SETTINGS' shared_memory=on lets the next one go on).  mapped: the
 // bytes of it that are page-locked for the GPUs to read (strata-q38's RAM pool); Windows counts them in a GPU's shared
 // use too, so a reader takes them off that.  name: the device's name, to the end of the line.  settings: the context
 // in tokens, the conversations decoded at once, the rows one step computes, the most guesses one conversation adds in
@@ -78,6 +81,8 @@ struct Memory {
     uint64_t setting = 0, smallest = 0, largest = 0;
     uint64_t pool_offset = 0;   ///< bytes drawn before the adjustable pool, independent of category names
     uint64_t mapped = 0;   ///< the bytes of it the GPUs map (page-locked); 0: none or not said
+    uint64_t pool_shared = 0;     ///< the bytes of the GPU's pool in shared memory instead of dedicated
+    bool dedicated_full = false;  ///< the pool's last growth stopped at the end of the GPU's dedicated memory
 
     /// Adds `bytes` to use `use`; a zero adds nothing.
     void add(const std::string& use, uint64_t bytes) {
@@ -189,6 +194,10 @@ inline std::string format_memory_report(MemoryReport report, const std::vector<c
             put("smallest", m.smallest);
             put("largest", m.largest);
         }
+        if (m.pool_shared > 0)
+            put("pool_shared", m.pool_shared);
+        if (m.dedicated_full)
+            put("dedicated_full", 1);
         if (m.mapped > 0) put("mapped", m.mapped);
         if (!m.name.empty()) s += " name=" + m.name;
         s += '\n';

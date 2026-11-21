@@ -53,6 +53,12 @@ class Apply(unittest.TestCase):
         with self.assertRaises(ValueError):
             runconfig.check_live({"save_on_shutdown": 1}, True)
 
+    def test_shared_memory_holds_for_one_change_and_is_never_saved(self):
+        values = runconfig.check_live({"memory_mib.gpu0": 30720, "shared_memory": True}, True, ["memory_mib.gpu0"])
+        self.assertEqual(values, {"memory_mib.gpu0": 30720, "shared_memory": "on"})
+        new, changed = runconfig.apply_live({"args": []}, values, {"memory_mib.gpu0": 30208})
+        self.assertEqual((new["args"], changed), (["--gpu-mib", "30720"], ["memory_mib.gpu0"]))
+
     def test_live_residency_default_survives_a_restart_without_changing_concurrency(self):
         values = runconfig.check_live({"vram_conversations": 3}, True)
         new, changed = runconfig.apply_live({"args": ["--concurrent", "2"]}, values)

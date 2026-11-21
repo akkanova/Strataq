@@ -1043,6 +1043,22 @@ and by Linux in the GTT; it is drawn once, as the engine's RAM, and taken off `b
 share, Windows 11) strata-q38 at start held 58.3 GiB in the share and Windows counted 22.1 GiB of shared use, of which
 20.9 GiB was its page-locked RAM pool.
 
+How much of the BIOS share a program can really use is not a figure Windows reports. It depends on the size of the
+pieces it takes and on the other programs: a test program on the Strix Halo filled the 63.8 GiB share to 55.6 GiB in
+pieces of 256 MiB, 58.7 in 64 MiB and 61.0 in 16 MiB. So the new engines (strata-q38, strata-ds41) find out each time
+a GPU pool grows, at start too: they take its 256 MiB chunks one at a time and stop at the first one Windows puts in
+shared memory, which is slower (with the pool's top there, strata-ds41 read 4K to 32K prompts 21-24% slower). That
+chunk goes back, and so does the room the model leaves free (`--vram-reserve-mib`). The Memory panel says how much
+fits in dedicated memory and asks whether to take the rest as shared memory; yes sends the same size with
+`shared_memory=on`.
+A GPU's `largest` estimates the pool size that fits in dedicated memory, using the last measured edge (before that,
+the share's size), current use and the reserve. The panel shows a larger size in red but still sends it.
+`pool_shared` is the part of the pool in shared memory. Prompt buffers are lent below the first shared chunk.
+A shrink frees the top chunks first. If another program frees memory between growths, dedicated chunks can follow
+shared ones; the pool does not reorder them. `dedicated_full` says
+that the last growth stopped where the dedicated memory ended. Linux and discrete GPUs have no such check: their pools
+grow until the runtime has no more.
+
 The engine's command (include/strata/common/serve/memory_report.hpp; the engine's `READY` line says `memory`):
 
 - `GET_MEMORY_USE` answers `MEMORY <id> [total=<B>] [free=<B>] [unified=1] [<use>=<B> ...] [paused_count=<n>]

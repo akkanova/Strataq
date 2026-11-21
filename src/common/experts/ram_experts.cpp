@@ -51,7 +51,7 @@ bool RamExperts::open(ExpertSource& files, uint64_t bytes, int ring, const State
     // every expert may come in (the pool's room decides how many)
     if (ring_ == nullptr || pool == 0 ||
         !pages_.open(std::move(memory), pool, layout, config, blob_bytes, n_expert, (int64_t) first_page_.size(),
-                     ranking, err)) {
+                     ranking, {}, err)) {
         err = "the RAM's page pool: no room for " + std::to_string(bytes >> 20) + " MiB" +
               (err.empty() ? "" : " (" + err + ")");
         return false;

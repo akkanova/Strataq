@@ -39,8 +39,8 @@
 .mem-change { position: absolute; top: 1px; bottom: 1px; background: var(--st-accent); opacity: .35;
               pointer-events: none; }
 .mem-preview { margin: 2px 0 0; font-size: var(--st-fs-xs); font-variant-numeric: tabular-nums; }
-.mem-divider.mem-refused, .mem-change.mem-refused { background-color: var(--st-danger); }
-.mem-preview.mem-refused, .mem-notice.mem-error { color: var(--st-danger-text); }
+.mem-divider.mem-warned, .mem-change.mem-warned { background-color: var(--st-danger); }
+.mem-preview.mem-warned, .mem-notice.mem-error { color: var(--st-danger-text); }
 .mem-controls { display: flex; flex-wrap: wrap; align-items: center; gap: var(--st-s-2) var(--st-s-4);
                 margin-top: var(--st-s-4); font-size: var(--st-fs-sm); }
 .mem-controls label { display: flex; flex-direction: column; gap: 6px; width: 212px; max-width: 100%; }

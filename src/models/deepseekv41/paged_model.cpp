@@ -1397,7 +1397,7 @@ bool open_card_pool(const Model& m, const PagedSettings& s, const strata::core::
     const strata::core::OnDevice on(card.dev);
     if (!card.experts.open(strata::serve::get_gpu_chunk_memory(card.dev, config.chunk_bytes), bytes, layout, config,
                            blobs,
-                           m.geometry().n_exp, max_experts, ranking, err))
+                           m.geometry().n_exp, max_experts, ranking, {false, keep}, err))
         return false;
     card.experts.set_ranking(ranking, max_experts);   // (opened without a cache, it wants none of them until then)
     strata::serve::say_gpu_pool(kProgram, card, room, config.chunk_bytes, mib);

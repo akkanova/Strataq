@@ -4,7 +4,8 @@
 // evict and giving them back whole, the allocated and fragmented pages, the token limits and the experts' overflow
 // into the reserve, the hysteresis, growing and shrinking, the report, long random trading without fragmentation, a
 // new layout and expert ranking (a layer split's cut moved), joined chunks (one virtual range) and the run a prompt
-// borrows from the top (lend), and a pool of two million pages (Qwen3.8 IQ3_S's experts in pages of 25,600 bytes).
+// borrows from the top (lend), a growth that reaches the end of the memory's own, and a pool of two million pages
+// (Qwen3.8 IQ3_S's experts in pages of 25,600 bytes).
 #include "strata/common/state/page_pool.hpp"
 
 #include <algorithm>
@@ -68,6 +69,9 @@ PagePoolConfig get_joined_config() {
 struct Fixture {
     uint64_t clock = 0;
     int chunks = 0, max_chunks = 100;
+    /// The chunks the memory has of its own: a chunk taken beyond them lies outside it (PagePoolHooks::is_outside,
+    /// which the pool asks right after each alloc).
+    int own_chunks = 100;
     std::vector<ExpertKey> evicted;
     std::vector<std::pair<ExpertKey, PageId>> relocated;
     /// With join_chunks, the chunks' buffer: they are back to back in it (one virtual range), else each is an
@@ -94,6 +98,7 @@ struct Fixture {
             if (range.empty())
                 std::free(p);
         };
+        hooks.is_outside = [this](void*) { return chunks > own_chunks; };
         hooks.now = [this] { return clock; };
         hooks.evicted = [this](ExpertKey key, PageId) { evicted.push_back(key); };
         hooks.copy = [this](PageId to, PageId from, uint32_t pages) {
@@ -490,6 +495,32 @@ void test_joined() {
     check(f.pool.resize(4 * chunk).refusal.empty() && f.pool.report().free.pages == 13, "and grows again");
 }
 
+/// A growth past the memory's own: the chunk outside it is given back and so is the spare of the chunks the growth
+/// took, unless such chunks are allowed; then lends stay below them, and a shrink gives them back first.
+void test_outside() {
+    Fixture f(get_joined_config(), get_layout(), 2);   // 8 pages
+    f.own_chunks = 3;
+    const PoolResize r = f.pool.resize(6 * chunk, {false, chunk + 1});
+    check(r.own_memory_full && r.refusal == "its own memory had room for 3 of 6 chunks" && f.chunks == 2,
+          "a growth stops at the first chunk outside and gives back the spare of what it took");
+    check(f.pool.resize(4 * chunk, {true, chunk}).refusal.empty() && f.chunks == 4 &&
+              f.pool.report().outside.pages == 4,
+          "allowed, the chunk outside is kept");
+    check(!f.pool.can_lend(13) && f.pool.lend(4, 0).first == 8, "a lend stays below the chunk outside");
+    f.pool.give_back();
+    check(f.pool.grow_conversation(7, 4).empty(), "a conversation fits below the shared chunk");
+    check(f.pool.can_lend(12) && f.pool.lend(12, 0).refusal.empty(),
+          "a lend can move conversation blocks into shared memory");
+    f.pool.give_back();
+    f.own_chunks = 5;
+    check(f.pool.resize(5 * chunk).refusal.empty() && f.pool.report().outside.pages == 4 &&
+              !f.pool.can_lend(13),
+          "dedicated chunks above a shared chunk are counted accurately but stay above the lending boundary");
+    check(f.pool.resize(3 * chunk).refusal.empty() && f.pool.report().outside.pages == 0 &&
+              f.pool.lend(4, 0).first == 8,
+          "a shrink gives back the chunk outside first");
+}
+
 /// PagePool::lend: a free run at the top as it is, else experts moved (leaving the pages the prompt's K/V needs) or
 /// evicted, stray conversation blocks moved, never across chunks that are not joined, everything back after give_back.
 void test_lend() {
@@ -831,6 +862,7 @@ int main() {
     test_report();
     test_joined();
     test_lend();
+    test_outside();
     test_block_runs();
     test_random_trading();
     test_many_pages();

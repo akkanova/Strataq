@@ -20,14 +20,24 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <numeric>
+#include <set>
 
 namespace strata::serve {
 
 /// The bytes each way that measure a GPU's link to RAM at start: the old engine's probe's burst (probe_pcie_h2d_gbps
 /// in src/models/qwen38/model.cpp), about 10 ms on PCIe 4.0 x16 and 90 ms on 3.0 x4.
 constexpr size_t kLinkProbeBytes = 256ull << 20;
+
+namespace {
+strata::core::ChunkMemory watch_share(int dev, strata::core::ChunkMemory memory);
+/// Per integrated GPU: every program's bytes in its dedicated memory when a pool's chunk last landed outside it.
+std::map<int, uint64_t> share_tops;
+std::mutex share_tops_mutex;   ///< guards share_tops
+}  // namespace
 
 int take_paged_options(int& argc, char** argv, const std::string& program, PagedSettings& s) {
     struct Own {
@@ -181,7 +191,7 @@ strata::core::ChunkMemory get_gpu_chunk_memory(int dev, uint64_t chunk_bytes, bo
             const auto i = (int64_t) ((uint64_t) (p - range->base()) / range->chunk_bytes());
             strata::core::vmm_chunk_free(range->unmap(i));
         };
-        return memory;
+        return watch_share(dev, std::move(memory));
     }
     memory.alloc = [dev, zeroed](uint64_t n) {
         const strata::core::OnDevice on(dev);
@@ -193,7 +203,16 @@ strata::core::ChunkMemory get_gpu_chunk_memory(int dev, uint64_t chunk_bytes, bo
         const strata::core::OnDevice on(dev);
         strata::core::gpu_free(p);
     };
-    return memory;
+    return watch_share(dev, std::move(memory));
+}
+
+std::optional<uint64_t> get_share_top(int dev) {
+    strata::platform::GpuLocalMemory share;
+    if (!strata::core::read_share_use(dev, share))
+        return std::nullopt;
+    const std::lock_guard<std::mutex> lock(share_tops_mutex);
+    const auto it = share_tops.find(dev);
+    return it != share_tops.end() ? it->second : share.size;
 }
 
 uint64_t get_gpu_pool_bytes(int dev, uint64_t keep, int64_t gpu_mib, uint64_t most, uint64_t& room) {
@@ -300,5 +319,40 @@ bool open_ram_pool(const std::string& program, const PagedSettings& s, strata::c
                  back, ssd, s.copy_back.c_str());
     return true;
 }
+
+namespace {
+
+/// Gets `memory` with chunks that tell whether they landed outside integrated GPU `dev`'s dedicated memory
+/// (ChunkMemory::is_outside): Windows puts a chunk that no longer fits there in the system RAM the GPU shares, where
+/// it is slower.  A chunk did when this process's bytes in the GPU's apertures (read_share_use) grew by half a chunk or
+/// more with it (concurrent frees there can hide one); get_share_top then gets what every program held in the
+/// dedicated memory before it.  How full the dedicated memory gets depends on the allocations' sizes and on the other
+/// programs, so each growth finds it anew.  `memory` as it is for another GPU.
+strata::core::ChunkMemory watch_share(int dev, strata::core::ChunkMemory memory) {
+    strata::platform::GpuLocalMemory share;
+    if (!strata::core::read_share_use(dev, share))
+        return memory;
+    auto outside = std::make_shared<std::set<const uint8_t*>>();
+    memory.alloc = [dev, alloc = std::move(memory.alloc), outside](uint64_t n) -> uint8_t* {
+        strata::platform::GpuLocalMemory before, after;
+        const bool read = strata::core::read_share_use(dev, before);
+        uint8_t* p = alloc(n);
+        if (p != nullptr && read && strata::core::read_share_use(dev, after) &&
+            after.mine_elsewhere >= before.mine_elsewhere + n / 2) {
+            outside->insert(p);
+            const std::lock_guard<std::mutex> lock(share_tops_mutex);
+            share_tops[dev] = before.all;
+        }
+        return p;
+    };
+    memory.free = [free = std::move(memory.free), outside](uint8_t* p) {
+        outside->erase(p);
+        free(p);
+    };
+    memory.is_outside = [outside](const uint8_t* p) { return outside->count(p) > 0; };
+    return memory;
+}
+
+}  // namespace
 
 }  // namespace strata::serve

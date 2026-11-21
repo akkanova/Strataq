@@ -50,6 +50,7 @@
 #include "strata/common/spec/step.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -133,9 +134,16 @@ void set_paged_runtime_env(const PagedSettings& s, bool hops_possible);
 void measure_card(PagedCard& card, const std::string& program, uint64_t expert_bytes);
 /// Gets GPU `dev`'s allocator of chunks of `chunk_bytes` (get_chunk_bytes).  On a GPU with virtual memory (vmm.hpp)
 /// the chunks are mapped back to back in one address range as large as the GPU's memory (ChunkMemory::contiguous), so
-/// that a pool's runs may cross them; else each is an allocation of its own.  Disable `zeroed` only when the adapter
-/// initializes every page before use.
+/// that a pool's runs may cross them; else each is an allocation of its own.  On Windows, an integrated GPU's chunks
+/// tell whether they went to shared memory instead of the dedicated memory (ChunkMemory::is_outside).  Disable
+/// `zeroed` only when the adapter initializes every page before use.
 strata::core::ChunkMemory get_gpu_chunk_memory(int dev, uint64_t chunk_bytes, bool zeroed = true);
+/// Gets how full integrated GPU `dev`'s dedicated memory (the share the BIOS gives it) was, every program's bytes in
+/// it together, when one of get_gpu_chunk_memory's chunks last went to shared memory instead; before any did, the
+/// share's size.  No figure Windows reports gives the real level, and it depends on the allocations' sizes: on the
+/// Strix Halo (a 63.8 GiB share) a test program filled it to 55.6 GiB in chunks of 256 MiB, 58.7 in 64 MiB and 61.0
+/// in 16 MiB.  No value for another GPU, or on Linux.
+std::optional<uint64_t> get_share_top(int dev);
 /// Gets the bytes a pool on GPU `dev` takes: `gpu_mib` (--gpu-mib), but no more than `room`; -1: `room` but no more
 /// than `most`.  `room` gets what the pool could take: get_gpu_room(dev, keep).
 uint64_t get_gpu_pool_bytes(int dev, uint64_t keep, int64_t gpu_mib, uint64_t most, uint64_t& room);
@@ -179,12 +187,13 @@ bool open_ram_pool(const std::string& program, const PagedSettings& s, strata::c
 /// Gets why the engine cannot decode with `s` on a model whose steps run at most `max_rows` rows (empty: it can).
 std::string get_step_settings_problem(const strata::spec::StepSettings& s, int max_rows);
 /// Gets the memory a pool on device `dev` may take besides what it holds: what the GPU has free less `keep`.  On
-/// Windows, for a GPU whose memory is the system RAM, what is free is what the share the BIOS gives it still takes
-/// of a pool's chunks (read_share_use, below the top the first call measures), not the runtime's free memory: that
-/// is the share and what the GPU may borrow beyond it, more slowly, and HIP takes page-locked host memory off it
-/// twice (on the Strix Halo, 8 GiB of hipHostMalloc took 16 GiB off it).  Its memory counts in Windows' commit
-/// charge, so no more than get_commit_room either.  Cards on one GPU each see what is free of it.
-uint64_t get_gpu_room(int dev, uint64_t keep);
+/// Windows, for a GPU whose memory is the system RAM, what is free is an estimate of what its dedicated memory still
+/// takes (get_share_top less every program's bytes there now), not the runtime's free memory: that is the share and
+/// what the GPU may borrow beyond it, more slowly, and HIP takes page-locked host memory off it twice (on the Strix
+/// Halo, 8 GiB of hipHostMalloc took 16 GiB off it); with `past_dedicated`, the shared memory too, where only the
+/// commit charge bounds it.  Its memory counts in Windows' commit charge, so no more than get_commit_room either.
+/// Cards on one GPU each see what is free of it.
+uint64_t get_gpu_room(int dev, uint64_t keep, bool past_dedicated = false);
 /// Gets the RAM a pool may take by default besides what the pools hold: what is available less `headroom`, and no more
 /// than get_commit_room.
 uint64_t get_ram_room(uint64_t headroom);
