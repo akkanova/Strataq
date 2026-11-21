@@ -323,6 +323,7 @@ private:
 
 std::string get_split_hop_refusal(const Options& o);
 std::vector<uint64_t> get_blob_bytes(const Model& m);
+int64_t get_pool_max_experts(const Model& m);
 PagedCard& add_card(Model& m, Conversation& conv, PagedCards& cards, ModelCards& model_cards, GpuStage* stage);
 bool open_pages(Model& m, PagedCard& card, ModelCard& mc, int64_t tokens_min, int64_t gpu_mib, int64_t max_experts,
                 std::string& err);
@@ -425,12 +426,13 @@ int run_paged_engine(int argc, char** argv) {
             std::fprintf(stderr, "strata-q38: WARNING: the experts are read through the file cache (%s)\n",
                          why.c_str());
         PagedCard& card = add_card(m, conv, cards, model_cards, nullptr);
-        return open_pages(m, card, model_cards[card.index], settings.tokens_min, get_gpu_mib(0), max_experts, err);
+        return open_pages(m, card, model_cards[card.index], settings.tokens_min, get_gpu_mib(0),
+                          m.auto_cache ? get_pool_max_experts(m) : max_experts, err);
     };
     m.open_stage_pages = [&](GpuStage& st, std::string& err) {
         PagedCard& card = add_card(m, conv, cards, model_cards, &st);
         return open_pages(m, card, model_cards[card.index], settings.tokens_min, get_gpu_mib(card.index),
-                          o.expert_cache, err);
+                          get_pool_max_experts(m), err);
     };
     if (const int status = m.load(); status != 0) return status;
     if (const int status = m.build_hit_tables(false); status != 0) return status;
@@ -511,9 +513,10 @@ PagedQwen::PagedQwen(Model& m, Conversation& conv, const PagedCards& cards, Mode
     facts.drafter_start = "--mtp and a --lookahead above 0";
     facts.expert_bytes = get_blob_bytes(m);
     staging_.resize(*std::max_element(facts.expert_bytes.begin(), facts.expert_bytes.end()));
-    for (size_t i = 0; i < m.profile_all.size() && (int64_t) i < o.expert_cache; ++i)
+    const int64_t pool_experts = get_pool_max_experts(m);
+    for (size_t i = 0; i < m.profile_all.size() && (int64_t) i < pool_experts; ++i)
         facts.split_ranking.push_back({m.profile_all[i].first, m.profile_all[i].second});
-    facts.gpu_experts = o.expert_cache;
+    facts.gpu_experts = pool_experts;
     facts.adapt_every = o.adapt_every;
     facts.adapt_swaps = o.adapt_swaps;
     facts.adapt_min_gain = o.adapt_min_gain;
@@ -585,6 +588,17 @@ std::vector<uint64_t> get_blob_bytes(const Model& m) {
 /// Gets whether `card` runs `m`'s MTP drafter (--mtp), which Model::load_drafter puts on a layer split's last card.
 bool has_drafter(const Model& m, const ModelCard& card) {
     return !m.o.mtp.empty() && card.stage == m.get_drafter_stage();
+}
+
+/// Gets the most experts the GPUs' page pools admit together: --expert-cache N as given, and with --expert-cache auto
+/// every profiled expert, so that each pool takes as many as its pages fit.  The auto slot count the load computes is
+/// the old engine's cache, sized from CUDA0's free VRAM in slots of the largest blob before the pools open; used as
+/// the pools' cap it left them nearly empty whatever --gpu-mib gave them (546 slots: ~1.5 GiB of 6.6 + 9.5 GiB).
+int64_t get_pool_max_experts(const Model& m) {
+    if (!m.auto_cache)
+        return m.o.expert_cache;
+    const int64_t all = m.profile_all.empty() ? (int64_t) m.profile.size() : (int64_t) m.profile_all.size();
+    return std::max<int64_t>(all, m.o.expert_cache);
 }
 
 /// Gets the experts of the expert profile of layers [lb, le), hottest first.  With a layer split, `max_experts` (the
