@@ -422,11 +422,13 @@ class Monitor(unittest.TestCase):
             {"id": "gpu0", "name": "GPU", "total": 1000, "free": 100, "unified": False, "paused_count": None,
              "paused_budget": None, "uses": {"experts": 600, "conversations": 200}},
             {"id": "ram", "name": None, "total": None, "free": None, "unified": False, "paused_count": 1,
-             "paused_budget": 50, "uses": {"paused": 20}}], "settings": {"context": 4096}}
+             "paused_budget": 50, "uses": {"paused": 20}}], "settings": {"context": 4096},
+            "expert_traffic": {"gpu0": {"hits": 7, "misses": 5}, "ram": {"ssd_bytes": 4096}}}
         self.enterContext(mock.patch("strata_base.memory.read_ram", return_value=mock.Mock(total=5000, available=3000)))
         code, body = self.request("/v1/memory")
         self.assertEqual((code, body["available"], body["busy"], body["settings"]),
                          (200, True, False, {"context": 4096}))
+        self.assertEqual(body["expert_traffic"], self.engine.memory()["expert_traffic"])
         self.assertEqual(body["machine"]["ram_total"], 5000)
         gpu, ram = body["memories"]
         self.assertEqual(gpu["other_apps"], 100)        # in use there, not named by the engine
@@ -435,6 +437,7 @@ class Monitor(unittest.TestCase):
         with self.svc.fifo:                              # a request is running: the last answer, marked busy
             again = self.request("/v1/memory")[1]
         self.assertEqual((again["busy"], again["at"], again["memories"]), (True, body["at"], body["memories"]))
+        self.assertEqual(again["expert_traffic"], body["expert_traffic"])
         web = Path(__file__).parent / "web"            # the Memory panel draws it
         html, js = (web / "index.html").read_text(encoding="utf-8"), (web / "app.js").read_text(encoding="utf-8")
         for el in ("mem-card", "mem-panel"):

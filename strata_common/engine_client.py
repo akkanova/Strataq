@@ -1498,7 +1498,9 @@ class StrataEngine:
         allocated, and that are free in runs too short for any expert (strata-q38's pool).  setting: the pool's size
         in bytes now (what CHANGE_SETTINGS' memory_mib.<id> sets); smallest and largest: the range of sizes it
         accepts now.  mapped: the bytes of it the GPUs map (page-locked), which Windows counts in a GPU's shared use
-        too.  A value the engine did not say is None (uses: absent).  The same turn rules as list_conversations."""
+        too.  "expert_traffic" (the paged engines): {memory id: {counter: count}}, each expert pool's EXPERT_TRAFFIC
+        counters since the engine started (memory_report.hpp).  A value the engine did not say is None (uses: absent).
+        The same turn rules as list_conversations."""
         return self._ask_memory_report("GET_MEMORY_USE")
 
     def change_settings(self, values: dict) -> dict:
@@ -1513,17 +1515,20 @@ class StrataEngine:
     def _ask_memory_report(self, command: str, refused: type[Exception] | None = None) -> dict:
         """Sends `command` and parses its GET_MEMORY_USE-style answer for memory() and change_settings()."""
         memories, settings, held, shortfall, pause_directory = [], {}, [], None, None
-        details, expert_fill = {}, {}
+        details, expert_fill, expert_traffic = {}, {}, {}
         for f in self._ask(command, "MEMORY", end="END_MEMORY",
                            timeout=self.MEMORY_QUERY_TIMEOUT_S,
                            also=("SETTINGS", "CONVERSATION", "SHORTFALL", "MEMORY_BLOCK",
-                                 "PAUSE_DIRECTORY", "MEMORY_DETAIL", "EXPERT_FILL"),
+                                 "PAUSE_DIRECTORY", "MEMORY_DETAIL", "EXPERT_FILL", "EXPERT_TRAFFIC"),
                            refused=refused):
             # MEMORY <id> [key=value ...] [name=<text to the end>]  /  CONVERSATION ...  /  SETTINGS [key=value ...]  /
             # SHORTFALL <text>
             if f[0] == "EXPERT_FILL":
                 values = dict(x.split("=", 1) for x in f[1:])
                 expert_fill = {"loaded": bool(int(values["loaded"])), "pending": int(values["pending"])}
+                continue
+            if f[0] == "EXPERT_TRAFFIC":
+                expert_traffic[f[1]] = {k: int(v) for k, _, v in (x.partition("=") for x in f[2:])}
                 continue
             if f[0] == "MEMORY_DETAIL":
                 details[f[1]] = unquote(f[2])
@@ -1572,6 +1577,7 @@ class StrataEngine:
             self.max_context = settings["context"]
         return {"memories": memories, "settings": settings, **({"details": details} if details else {}),
                 **({"expert_fill": expert_fill} if expert_fill else {}),
+                **({"expert_traffic": expert_traffic} if expert_traffic else {}),
                 **({"conversations": held} if held else {}),
                 **({"shortfall": shortfall} if shortfall else {}),
                 **({"pause_directory": pause_directory} if pause_directory else {})}

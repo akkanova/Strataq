@@ -62,6 +62,14 @@ int main() {
     fill.experts_loaded = true;
     check(format_memory_report(fill, {}).find("EXPERT_FILL loaded=1 pending=42") == 0,
           "loaded while experts wait for pages that conversations hold");
+    MemoryReport traffic;
+    traffic.experts_loaded = true;
+    traffic.gpu(0).traffic = {{"hits", 7}, {"loads", 3}};
+    traffic.at("ram").traffic = {{"hits", 1}, {"ssd_reads", 2}};
+    check(format_memory_report(traffic, {}) == "MEMORY gpu0\nMEMORY ram\nEXPERT_FILL loaded=1 pending=0\n"
+                                               "EXPERT_TRAFFIC gpu0 hits=7 loads=3\n"
+                                               "EXPERT_TRAFFIC ram hits=1 ssd_reads=2\nSETTINGS\nEND_MEMORY\n",
+          "each expert pool's counters follow the MEMORY lines, which they leave as they were");
     MemoryReport pool;
     Memory& card = pool.gpu(1);
     card.add("experts", 9);

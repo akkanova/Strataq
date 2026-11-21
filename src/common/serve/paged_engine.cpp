@@ -32,7 +32,6 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <numeric>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -438,6 +437,14 @@ private:
     bool is_lent(int64_t layer, int64_t expert) const {
         const int32_t holder = holder_.empty() ? -1 : holder_[(size_t) layer];
         return holder >= 0 && cards_[(size_t) holder].lent[(size_t) (layer * facts_.n_expert + expert)] >= 0;
+    }
+    /// Gets the card whose pool holds expert `i` (layer * n_expert + expert) for decode steps: the one that runs its
+    /// layer or holds it lent; null when none does.
+    PagedCard* find_holder(size_t i, const std::vector<int32_t>& residency) {
+        const int64_t l = (int64_t) i / facts_.n_expert, e = (int64_t) i % facts_.n_expert;
+        return residency[i] >= 0 ? &get_card_of(l)
+             : is_lent(l, e)                  ? &cards_[(size_t) holder_[(size_t) l]]
+                                              : nullptr;
     }
     /// Describes the conversations for LIST_CONVERSATIONS and GET_CONTEXT_WINDOWS.
     std::vector<strata::core::HeldConversation> list_conversations() const;
@@ -1467,9 +1474,18 @@ bool PagedEngine::decode_step() {
         print_error_or_exit(err);
         return false;
     }
-    if (const int64_t routed = std::inner_product(usage.begin(), usage.end(), routed_before_.begin(), (int64_t) 0,
-                                                  std::plus<>(), std::greater<>());
-        routed > 0) {
+    const std::vector<int32_t>& residency = model_.get_residency();
+    int64_t routed = 0;
+    for (size_t i = 0; i < usage.size(); ++i) {
+        if (usage[i] <= routed_before_[i])
+            continue;
+        ++routed;
+        if (PagedCard* const holder = find_holder(i, residency))
+            ++holder->experts.traffic().hits;
+        else
+            ++get_card_of((int64_t) i / facts_.n_expert).experts.traffic().misses;
+    }
+    if (routed > 0) {
         routed_experts_ += routed;
         routed_rows_ += step_rows_;
         ++routed_steps_;
@@ -2153,13 +2169,8 @@ bool PagedEngine::adapt_experts() {
     const int64_t n_expert = facts_.n_expert;
     seen_.resize(usage.size(), 0.0f);
     for (size_t i = 0; i < usage.size(); ++i)
-        if (const int64_t l = (int64_t) i / n_expert, e = (int64_t) i % n_expert; usage[i] > seen_[i]) {
-            PagedCard* const holder = residency[i] >= 0 ? &get_card_of(l)
-                                 : is_lent(l, e)     ? &cards_[(size_t) holder_[(size_t) l]]
-                                                     : nullptr;
-            if (holder != nullptr)
-                holder->experts.note_use({(int32_t) l, (int32_t) e});
-        }
+        if (PagedCard* const holder = usage[i] > seen_[i] ? find_holder(i, residency) : nullptr)
+            holder->experts.note_use({(int32_t) (i / (size_t) n_expert), (int32_t) (i % (size_t) n_expert)});
     const std::vector<strata::core::ExpertSwap> swaps = strata::core::choose_expert_swaps(
         usage, residency, facts_.n_layers, n_expert, facts_.adapt_min_gain,
         [this](int64_t l, int32_t e) { return is_lent(l, e); }, true);
@@ -2318,6 +2329,7 @@ strata::serve::MemoryReport PagedEngine::describe_memory() const {
         gpu.setting = r.total.bytes;
         gpu.smallest = get_smallest_gpu(card, settings_.tokens_min);
         gpu.largest = get_largest_gpu(card);
+        gpu.traffic = card.experts.traffic().get_counts();
         report.experts_pending += filling_since_ ? card.experts.get_missing_count() : 0;
     }
     strata::serve::Memory& ram = report.at("ram");
@@ -2338,6 +2350,7 @@ strata::serve::MemoryReport PagedEngine::describe_memory() const {
     ram.fragmented_pages = rr.fragmented.pages;
     ram.setting = rr.total.bytes + ram_.ring_bytes();
     ram.mapped = strata::core::get_memory_manager().get_mapped_bytes();
+    ram.traffic = ram_.pages().traffic().get_counts();
     ram.smallest = get_smallest_ram();
     ram.largest = get_largest_ram();
     strata::serve::Memory& ssd = report.at("ssd");

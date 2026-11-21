@@ -12,6 +12,7 @@
 // expert's pages go to another use, the `leaving` hook may copy it elsewhere (a GPU's expert back to RAM).
 #pragma once
 
+#include "strata/common/experts/expert_traffic.hpp"
 #include "strata/common/state/page_pool.hpp"
 #include "strata/core/expert_cache.hpp"
 
@@ -117,6 +118,10 @@ public:
     /// Counts a use of an expert the pool holds, so that a conversation evicts it after the experts used less
     /// recently (nothing when the pool does not hold it).
     void note_use(ExpertKey key) { (void) pool_->use_expert(key); }
+    /// Gets what the pool has done since it opened (EXPERT_TRAFFIC): it counts its loads, evictions and swaps, its
+    /// users the hits and misses (RamExperts and the paged engine) and SSD reads (RamExperts).
+    ExpertTraffic& traffic() { return traffic_; }
+    const ExpertTraffic& traffic() const { return traffic_; }
     /// Gets the pool's clock now (the times admit takes).
     uint64_t get_time() const { return now_(); }
     /// Tells whether experts that conversations evicted wait for pages that may be free for them now or soon.
@@ -142,6 +147,7 @@ private:
     void on_evicted(ExpertKey key, PageId first);
     void on_relocated(ExpertKey key, PageId to);
     void want_missing();
+    bool load(ExpertKey key, int32_t first, std::string& err);
     int32_t admit_free(ExpertKey key);
     size_t index_of(ExpertKey key) const { return (size_t) key.layer * (size_t) n_expert_ + (size_t) key.expert; }
     /// Gets the clock time that stands for the last use of the expert of rank `rank`.
@@ -163,6 +169,7 @@ private:
     /// The pool's free pages when `refill` last found no room and no page about to open; refills wait until that
     /// changes.  UINT64_MAX: not waiting.
     uint64_t blocked_at_free_ = UINT64_MAX;
+    ExpertTraffic traffic_;
     /// While admit_free runs: `admit` takes free pages only (a GPU's pool reaches it through the cache's admitter)
     bool free_only_ = false;
 };
