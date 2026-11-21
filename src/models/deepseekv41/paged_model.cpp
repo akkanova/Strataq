@@ -310,7 +310,7 @@ public:
     uint64_t get_host_state_bytes(const PagedParts& parts) const override;
     bool rewind(const PagedParts& parts, int64_t tokens, std::string& err) override;
     void forget_drafts(int) override {}
-    int64_t get_prompt_chunk() const override { return m_.feed_unit(); }
+    int64_t get_prompt_chunk(int64_t, bool) const override { return m_.feed_unit(); }
     int64_t get_prompt_ceiling() const override { return prompt_ceiling_; }
     strata::serve::PromptBuffers get_prompt_buffers(const PagedCard& card, int64_t chunk,
                                                     int64_t tokens) const override {
@@ -324,7 +324,7 @@ public:
         return m_.lay_out_prompt((int) card.index, get_lent_rows(chunk), device, host, err);
     }
     bool read_prompt(const PagedParts& parts, const std::vector<int64_t>& ids, int64_t from, int64_t n, bool drafting,
-                     const ChunkDone& on_chunk, std::string& err) override;
+                     const PromptControl& control, int64_t& took, std::string& err) override;
     bool wait_state(std::string& err) override { return m_.wait_state(err); }
     int get_pipeline_stages() const override {
         // Speculative windows share rollback scratch until the step commits all participants.
@@ -834,12 +834,19 @@ strata::core::LayerSizes PagedDeepSeek::get_layer_sizes(uint64_t page) const {
 }
 
 bool PagedDeepSeek::read_prompt(const PagedParts& parts, const std::vector<int64_t>& ids, int64_t from, int64_t n,
-                                bool, const ChunkDone& on_chunk, std::string& err) {
-    /// Keeps another conversation's decode positions from selecting this prompt's image rows.
-    struct ClearPromptImages {
+                                bool, const PromptControl& control, int64_t& took, std::string& err) {
+    took = 0;
+    /// Keeps another conversation's decode positions from selecting this prompt's image rows, and the model from
+    /// calling `control` after the read.
+    struct EndPromptRead {
         Model& model;
-        ~ClearPromptImages() { model.set_images({}); }
-    } clear{m_};
+        ~EndPromptRead() {
+            model.set_images({});
+            model.set_progress(nullptr);
+            model.set_cancel(nullptr);
+            model.set_yield(nullptr);
+        }
+    } end_read{m_};
     m_.set_images(pending_images_);
     Part& p = get_part(*parts[0]);
     p.take_seat();
@@ -855,9 +862,29 @@ bool PagedDeepSeek::read_prompt(const PagedParts& parts, const std::vector<int64
             if (!part->reserve(end + 1, err))
                 return false;
     const std::vector<int> tokens(ids.begin() + from, ids.begin() + end + (last ? 1 : 0));
-    if (!(last ? m_.feed_mark(tokens.data(), (int) tokens.size(), 1, kBeforeLastCheck, err)
-               : m_.feed(tokens.data(), (int) tokens.size(), 0, err)))
+    bool moved = false;   // (a yield before the run's first chunk would read nothing)
+    m_.set_progress([&](int64_t done) {
+        moved = true;
+        control.progress(from + std::min(done, n));
+    });
+    m_.set_cancel(control.should_stop);
+    if (control.should_yield)
+        m_.set_yield([&] { return moved && control.should_yield(); });
+    bool ok = last ? m_.feed_mark(tokens.data(), (int) tokens.size(), 1, kBeforeLastCheck, err)
+                   : m_.feed(tokens.data(), (int) tokens.size(), 0, err);
+    took = std::min<int64_t>(m_.fed(), n);
+    // A yield can leave only the final token, outside the engine's prompt spans. Keep its checkpoint here.
+    if (ok && last && m_.fed() == n)
+        ok = m_.feed_mark(tokens.data() + n, 1, 1, kBeforeLastCheck, err);
+    else if (ok && m_.fed() < (int) tokens.size())
+        return control.on_chunk(from, took, err);
+    if (!ok) {
+        if (m_.cancelled()) {   // Model::set_cancel leaves partially computed layers past the restore point.
+            err = "cancelled";
+            took = -1;
+        }
         return false;
+    }
 
     if (last) {
         end_prompt(p);
@@ -866,7 +893,7 @@ bool PagedDeepSeek::read_prompt(const PagedParts& parts, const std::vector<int64
         p.primed_pick = sample(p, end);
         note_row_logprobs({(int) p.id() - 1, p.primed_token, end}, p.primed_pick, -1);
     }
-    return on_chunk(from, n, err);
+    return control.on_chunk(from, n, err);
 }
 
 bool PagedDeepSeek::prepare_group(int group, const std::vector<strata::spec::StepRow>& rows, std::string& err) {

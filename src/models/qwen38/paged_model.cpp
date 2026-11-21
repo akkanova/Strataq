@@ -222,14 +222,17 @@ public:
         return get_session_model_fingerprint(m_, &m_.src, id.model, err);
     }
     void forget_drafts(int session) override { drafter_->forget(session); }
-    int64_t get_prompt_chunk() const override { return conv_.sp.chunk(); }
+    int64_t get_prompt_chunk(int64_t tokens, bool alone) const override {
+        const int64_t chunk = conv_.sp.chunk();
+        return alone && tokens >= 2 * chunk && conv_.sp.is_layer_major_on() ? tokens : chunk;
+    }
     int64_t get_prompt_ceiling() const override { return m_.o.prefill_chunk; }
     strata::serve::PromptBuffers get_prompt_buffers(const PagedCard& card, int64_t chunk,
                                                     int64_t tokens) const override;
     bool lay_out_prompt(const PagedCard& card, int64_t chunk, uint8_t* device, uint8_t* host,
                         std::string& err) override;
     bool read_prompt(const PagedParts& parts, const std::vector<int64_t>& ids, int64_t from, int64_t n, bool drafting,
-                     const ChunkDone& on_chunk, std::string& err) override;
+                     const PromptControl& control, int64_t& took, std::string& err) override;
     void set_step_histories(const std::vector<const std::vector<int32_t>*>& histories) override {
         histories_ = histories;
     }
@@ -1072,8 +1075,10 @@ bool PagedQwen::keep_restore_point(const PagedParts& parts, const std::vector<in
 }
 
 bool PagedQwen::read_prompt(const PagedParts& parts, const std::vector<int64_t>& ids, int64_t from, int64_t n,
-                           bool drafting, const ChunkDone& on_chunk, std::string& err) {
+                           bool drafting, const PromptControl& control, int64_t& took, std::string& err) {
     get_part(*parts.front()).read_from = from;
+    took = n;
+    const auto& on_chunk = control.on_chunk;
     if (!activate_images((int) get_part(*parts.front()).id() - 1, err))
         return false;
     conv_.sp.embd_rows = image_row_ptrs_.empty() ? nullptr : image_row_ptrs_.data();
@@ -1125,8 +1130,13 @@ bool PagedQwen::read_prompt(const PagedParts& parts, const std::vector<int64_t>&
         }
         return on_chunk(pos0, T, e);
     };
+    // Single-chunk reads keep their completed chunk on STOP, through on_chunk alone.
+    conv_.sp.should_stop = n > conv_.sp.chunk() ? control.should_stop : std::function<bool()>{};
     const bool ok = conv_.read_prompt(ids.data() + from, n, from, err);
+    conv_.sp.should_stop = nullptr;
     last.on_chunk = nullptr;
+    if (!ok && n > conv_.sp.chunk())   // (layer by layer, the layers before the last ran past the last on_chunk)
+        took = -1;
     return ok;
 }
 

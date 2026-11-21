@@ -8061,15 +8061,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         return ok;
     }
 #endif
-#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
-    constexpr bool lm_hip = true;
-#else
-    constexpr bool lm_hip = false;
-#endif
-    // layer-major prefill: STRATA_PREFILL_LAYER_MAJOR=1 / 0 win; unset, it is off everywhere (sm120_series.hpp prefill_layer_major_default: a layer split
-    // reads 32K prompts 37-55% sooner chunk-major, owner's yes 2026-11-02; the single-card small-cache rule sets the variable itself)
-    if (hand_in_ == nullptr && impl_ &&
-        strata::prefill_layer_major_resolve(lm_env_text(), lm_hip, stage_count(), strata::defaults_026())) {
+    if (hand_in_ == nullptr && is_layer_major_on()) {
         const bool by_default = !lm_env_explicit();
         for (Prefill* p = this; p != nullptr; p = p->next_) p->lm_by_default_ = by_default;
         std::string why;
@@ -8125,6 +8117,17 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                          (long long) p->stats_.experts_resident, (long long) p->stats_.experts_streamed);
     }
     return true;
+}
+
+bool Prefill::is_layer_major_on() const {
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+    constexpr bool lm_hip = true;
+#else
+    constexpr bool lm_hip = false;
+#endif
+    // layer-major prefill: STRATA_PREFILL_LAYER_MAJOR=1 / 0 win; unset, it is off everywhere (sm120_series.hpp prefill_layer_major_default: a layer split
+    // reads 32K prompts 37-55% sooner chunk-major, owner's yes 2026-11-02; the single-card small-cache rule sets the variable itself)
+    return impl_ && strata::prefill_layer_major_resolve(lm_env_text(), lm_hip, stage_count(), strata::defaults_026());
 }
 
 }  // namespace strata::prefill

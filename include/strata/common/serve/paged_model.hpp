@@ -286,8 +286,10 @@ public:
 
     // ---- the prompt, the step and the drafter
 
-    /// Gets the maximum tokens per prompt piece between inspection and concurrent decode opportunities.
-    virtual int64_t get_prompt_chunk() const = 0;
+    /// Gets the most tokens the engine reads at a time of a prompt read of `tokens` tokens, `alone` when no other
+    /// conversation decodes meanwhile: a chunk, or more where the model reads faster in one run (Qwen3.8's
+    /// layer-major walk, DeepSeek V4.1's chunk pipeline), a stop in which goes back to a restore point.
+    virtual int64_t get_prompt_chunk(int64_t tokens, bool alone) const = 0;
     /// Gets the largest chunk a prompt is read in (--prefill: a ceiling), or 0 when the prompt path keeps buffers of
     /// its own.  The engine reads each prompt in the largest chunk up to it whose buffers its pools can lend then.
     virtual int64_t get_prompt_ceiling() const { return 0; }
@@ -303,13 +305,23 @@ public:
                                 std::string&) {
         return true;
     }
-    /// Called after each chunk of a prompt read, `n` tokens from `pos0`; false (and `err`) stops the read.
-    using ChunkDone = std::function<bool(int64_t pos0, int64_t n, std::string& err)>;
-    /// Reads `ids[from, from + n)` into the conversation of `parts`, calling `on_chunk` after each chunk; the drafter
-    /// reads it too when `drafting`.  `ids` is the whole prompt; the engine may read it in pieces of
-    /// get_prompt_chunk tokens with inspections and decode steps of other conversations between them.
+    /// Lets the engine steer a prompt read while the model runs it; the model asks where it can.
+    struct PromptControl {
+        /// Called after each chunk (or run of chunks) read, `n` tokens from `pos0`; false (and `err`) stops the read.
+        std::function<bool(int64_t pos0, int64_t n, std::string& err)> on_chunk;
+        /// Asked at the chunk ends after a run's first: true ends the run there, keeping the chunks read.  Null:
+        /// never (a run that may yield keeps fewer chunks in flight).
+        std::function<bool()> should_yield;
+        std::function<bool()> should_stop;       ///< True abandons the run (a STOP): the read fails with "cancelled".
+        std::function<void(int64_t)> progress;   ///< Gets the position a run reached between on_chunk calls.
+    };
+    /// Reads `ids[from, from + n)` into the conversation of `parts`, asking `control` on the way; the drafter reads it
+    /// too when `drafting`.  `took` gets the tokens read: fewer than `n` after a yield, when the engine runs other
+    /// conversations' decode steps before it reads on; -1 after a failure that left the state past the chunks
+    /// on_chunk reported (a stop inside a run), when the engine takes the conversation back to a restore point.
+    /// `ids` is the whole prompt; the engine reads it in spans that end at its restore points.
     virtual bool read_prompt(const PagedParts& parts, const std::vector<int64_t>& ids, int64_t from, int64_t n,
-                             bool drafting, const ChunkDone& on_chunk, std::string& err) = 0;
+                             bool drafting, const PromptControl& control, int64_t& took, std::string& err) = 0;
     /// Supplies the consumed tokens for each row's conversation, valid until run_rows returns.
     virtual void set_step_histories(const std::vector<const std::vector<int32_t>*>&) {}
     /// Runs a step's rows (spec::StepModel::run); picks[r] gets row r's next token, or -1 when its logits were not

@@ -271,13 +271,17 @@ private:
                                                           const std::vector<int64_t>& ids, int64_t from,
                                                           bool pictures, bool checkpoints, int64_t& tail);
     /// Reads `ids[from, to)` into `h` (the request began at `t0`), keeping a restore point at each of `cuts`
-    /// (plan_restore_points, whose `tail` the read's times measure for tail_cost_); `read_to` gets how far it got.
-    /// Conversations that decode meanwhile take steps between the prompt's turns (PagedSettings::decode_share_percent
-    /// and prompt_turn_ms).  False with `err` "cancelled" after a STOP, else on a failure that ends the engine
-    /// (`fatal`: a decode step failed, its ERR printed, or an expert fill failed, reported on stderr).
+    /// (plan_restore_points, whose `tail` the read's times measure for tail_cost_); `read_to` gets the tokens `h`
+    /// holds then.  Conversations that decode meanwhile take steps where the model yields between the prompt's turns
+    /// (PagedSettings::decode_share_percent and prompt_turn_ms).  False with `err` "cancelled" after a STOP, else on a
+    /// failure that ends the engine (`fatal`: a decode step failed, its ERR printed, or an expert fill failed,
+    /// reported on stderr).
     bool read_prompt(Held& h, const std::vector<int64_t>& ids, int64_t from, int64_t to,
                      const std::vector<strata::core::MarkAt>& cuts, int64_t tail, Clock::time_point t0,
                      int64_t& read_to, bool& fatal, std::string& err);
+    /// Makes `h` hold its tokens up to its latest restore point at or before `pos` (PagedModel::rewind), or none
+    /// when it has no such point or cannot go back; gets how many it holds.
+    int64_t go_back(Held& h, int64_t pos);
     /// Runs one step of the selected conversations and prints what it emitted; false (ERR printed) ends the engine.
     bool decode_step();
     /// Gets the unfinished requests selected by priority and request order for the next decode step.
@@ -1176,11 +1180,8 @@ bool PagedEngine::serve_request(const std::string& line, bool admit) {
         print_error_or_exit(err);
         return true;
     }
-    if (resume == 0) {
-        h.forget();
-        for (const std::unique_ptr<PagedPart>& part : h.parts)
-            part->clear_state();
-    }
+    if (resume == 0)
+        (void) go_back(h, 0);
     h.policy = policy;
     print_response("RESUME %lld\n", (long long) resume);
     h.images = std::move(images);
@@ -1250,7 +1251,7 @@ bool PagedEngine::serve_request(const std::string& line, bool admit) {
     }
     h.prompt_tokens = n;
     h.resumed = resume;
-    h.prompt_read = read_to - resume;
+    h.prompt_read = std::max<int64_t>(read_to - resume, 0);
     h.prompt_ms = prompt_ms;
     if (!h.decoding)
         finish_request(h, finish);
@@ -1336,14 +1337,18 @@ bool PagedEngine::read_prompt(Held& h, const std::vector<int64_t>& ids, int64_t 
                               int64_t& read_to, bool& fatal, std::string& err) {
     reading_ = &h;
     h.live.assign(ids.begin(), ids.begin() + from);
-    const PagedModel::ChunkDone on_chunk = [&](int64_t pos0, int64_t T, std::string& e) -> bool {
+    PagedModel::PromptControl control;
+    control.progress = [&](int64_t pos) {
+        const double ms = get_ms_since(t0);
+        print_response("PP %lld %lld %.0f %.1f\n", (long long) pos, (long long) ids.size(), ms,
+                       ms > 0 ? 1000.0 * (double) (pos - from) / ms : 0.0);
+        strata::core::progress_beat();
+    };
+    control.on_chunk = [&](int64_t pos0, int64_t T, std::string& e) -> bool {
         read_to = pos0 + T;
         h.live.insert(h.live.end(), ids.begin() + h.live.size(), ids.begin() + read_to);
         h.last_tokens_at = (uint64_t) std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-        const double ms = get_ms_since(t0);
-        print_response("PP %lld %lld %.0f %.1f\n", (long long) read_to, (long long) ids.size(), ms,
-                    ms > 0 ? 1000.0 * (double) (read_to - from) / ms : 0.0);
-        strata::core::progress_beat();
+        control.progress(read_to);
         if (command_loop_)
             command_loop_->poll_inspections();
         if (input_.is_stop_requested())
@@ -1354,8 +1359,8 @@ bool PagedEngine::read_prompt(Held& h, const std::vector<int64_t>& ids, int64_t 
             return true;
         return false;
     };
-    // beside conversations that decode, a chunk at a time, and they decode between two turns of whole chunks
-    const int64_t piece = std::max<int64_t>(model_.get_prompt_chunk(), 1);
+    control.should_stop = [&] { return input_.is_stop_requested(); };
+    const int64_t piece = std::max<int64_t>(model_.get_prompt_chunk(to - from, !is_decoding()), 1);
     size_t next_cut = 0;
     int64_t grid = from;   // where the read's chunks are counted from: only a point it was asked for restarts them
     const auto keep_next_cut = [&] {
@@ -1368,12 +1373,17 @@ bool PagedEngine::read_prompt(Held& h, const std::vector<int64_t>& ids, int64_t 
     if (!cuts.empty() && cuts[0].pos == from)   // (the state as it is)
         ok = keep_next_cut();
     Clock::time_point turn = Clock::now();
+    const auto should_yield = [&] {
+        return get_ms_since(turn) >= (double) settings_.prompt_turn_ms && is_decoding() && can_decode_while_reading();
+    };
     double read_ms[2] = {0, 0};   // the model's reads before `tail` and from it
     bool measure_tail = has_read_prompt_ && tail > from && tail < to;
-    for (int64_t q = from, n = 0; ok && q < to; q += n) {
+    for (int64_t q = from, n = 0, took = 0; ok && q < to; q += took) {
         n = std::min(piece - (q - grid) % piece, to - q);
         if (next_cut < cuts.size() && cuts[next_cut].pos < q + n)
             n = cuts[next_cut].pos - q;
+        control.should_yield = settings_.decode_share_percent > 0 && is_decoding()
+                                   ? should_yield : std::function<bool()>{};
         ok = model_.wait_state(err);
         if (ok && filling_since_ && q + n < to) {
             // Expert refills can change the prompt's cache between the two measured runs.
@@ -1382,14 +1392,17 @@ bool PagedEngine::read_prompt(Held& h, const std::vector<int64_t>& ids, int64_t 
             ok = !fatal;
         }
         const Clock::time_point r0 = Clock::now();
-        ok = ok && model_.read_prompt(h.parts, ids, q, n, is_model_drafting(), on_chunk, err);
+        ok = ok && model_.read_prompt(h.parts, ids, q, n, is_model_drafting(), control, took, err);
+        if (!ok && took < 0)
+            read_to = go_back(h, read_to);
+        measure_tail = measure_tail && took == n;   // (a yield splits the measured runs)
         if (ok && measure_tail)
             ok = model_.wait_state(err);
         read_ms[q >= tail] += get_ms_since(r0);
-        if (ok && next_cut < cuts.size() && cuts[next_cut].pos == q + n)
+        if (ok && next_cut < cuts.size() && cuts[next_cut].pos == q + took)
             ok = keep_next_cut();
         const double turn_ms = get_ms_since(turn);
-        if (q + n >= to || turn_ms < (double) settings_.prompt_turn_ms)
+        if (q + took >= to || turn_ms < (double) settings_.prompt_turn_ms)
             continue;
         const double budget_ms = (double) settings_.decode_share_percent / 100.0 * turn_ms;
         const Clock::time_point td = Clock::now();
@@ -1408,6 +1421,19 @@ bool PagedEngine::read_prompt(Held& h, const std::vector<int64_t>& ids, int64_t 
     has_read_prompt_ = has_read_prompt_ || ok;
     reading_ = nullptr;
     return ok;
+}
+
+int64_t PagedEngine::go_back(Held& h, int64_t pos) {
+    int64_t back = 0;
+    for (const int64_t point : model_.get_rewind_points(h.parts))
+        if (point <= pos)
+            back = std::max(back, point);
+    if (std::string err; back > 0 && model_.rewind(h.parts, back, err))
+        return back;
+    h.forget();
+    for (const std::unique_ptr<PagedPart>& part : h.parts)
+        part->clear_state();
+    return 0;
 }
 
 bool PagedEngine::decode_step() {
