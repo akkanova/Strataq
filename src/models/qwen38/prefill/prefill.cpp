@@ -1369,6 +1369,30 @@ struct Prefill::Impl {
         float* R2 = nullptr;
         cudaEvent_t ev_in[2] = {}, ev_done[2] = {}, ev_out[2] = {};
     } lm;
+
+    /// Queues one streamed expert's upload into ring slot `sl` on the copy stream, behind the release of the slot's
+    /// previous content, and records the slot's `copied` event. Returns true for a direct DMA (see upload_expert).
+    /// The caller must observe the consumer's release publication before reusing a slot; only the issuer writes
+    /// stage_live. This method does not synchronize host threads.
+    bool upload_to_slot(int sl, const uint8_t* blob, int job, size_t bytes) {
+        if (stage_live[sl])
+            cudaStreamWaitEvent(copy, used[used_of[sl]], 0);
+        const bool direct = upload_expert(sl, blob, job, bytes);
+        cudaEventRecord(copied[sl], copy);
+        stage_live[sl] = true;
+        return direct;
+    }
+    /// Queues the copy of an expert's `bytes` into ring slot `sl`: a DMA straight from the page-locked `blob` when
+    /// `job` < 0 (returns true), else from the stager's buffer once its host copy of `job` is done (waits for it).
+    /// The slot's release wait and copied event are the caller's (upload_to_slot, or the threaded issuer's own).
+    bool upload_expert(int sl, const uint8_t* blob, int job, size_t bytes) {
+        if (job >= 0)
+            blob = stager->wait(job);
+        cudaMemcpyAsync(stage_dev[sl], blob, bytes, cudaMemcpyHostToDevice, copy);
+        if (job >= 0)
+            stager->issued_one(job, copy);
+        return job < 0;
+    }
 };
 
 namespace {
@@ -3940,18 +3964,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 const StreamEntry& en = seq[issued];
                 const int sl = (int) (issued % (size_t) m.ring);
                 const auto th = Clock::now();
-                const size_t bytes = (size_t) lay0.blob_bytes(en.l);
-                if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
-                if (en.job < 0) {
-                    cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
+                if (m.upload_to_slot(sl, en.blob, en.job, (size_t) lay0.blob_bytes(en.l)))
                     ++stats_.experts_dma;
-                } else {
-                    const uint8_t* hb = m.stager->wait(en.job);
-                    cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
-                    m.stager->issued_one(en.job, m.copy);
-                }
-                cudaEventRecord(m.copied[sl], m.copy);
-                m.stage_live[sl] = true;
                 stats_.ms_experts_host += ms_since(th);
                 ++stats_.experts_streamed;
                 ++issued;
@@ -4045,21 +4059,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         [&] { return a_stop.load(std::memory_order_acquire); },
                         [&](int sl) { return cudaEventQuery(m.copied[sl]) != cudaErrorNotReady; },
                         [](const StreamEntry& en) { return en.job < 0; },
-                        [&](size_t idx, int sl) {   // the copy of the loop below, unchanged
+                        [&](size_t idx, int sl) {
                             const StreamEntry& en = seq[idx];
                             const auto th = Clock::now();
-                            const size_t bytes = (size_t) lay0.blob_bytes(en.l);
-                            if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
-                            if (en.job < 0) {
-                                cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
+                            if (m.upload_to_slot(sl, en.blob, en.job, (size_t) lay0.blob_bytes(en.l)))
                                 ++iss_dma;
-                            } else {
-                                const uint8_t* hb = m.stager->wait(en.job);
-                                cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
-                                m.stager->issued_one(en.job, m.copy);
-                            }
-                            cudaEventRecord(m.copied[sl], m.copy);
-                            m.stage_live[sl] = true;
                             iss_ms += ms_since(th);
                             ++iss_streamed;
                         },
@@ -4086,7 +4090,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const StreamEntry& en = seq[idx];
                     const int sl = (int) (idx % (size_t) m.ring);
                     const auto th = Clock::now();
-                    const size_t bytes = (size_t) lay0.blob_bytes(en.l);
                     if (m.stage_live[sl]) {
                         // Both this slot and the previous one must have been released in THIS walk (idx - 1 >= ring: the
                         // previous slot's event of an earlier walk could be re-recorded by this walk's first flush), and
@@ -4104,15 +4107,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     } else {
                         prev_rel = -1;
                     }
-                    if (en.job < 0) {
-                        cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
-                        ++iss_dma;
-                    } else {
+                    if (en.job >= 0)
                         cover(idx);   // the stager may make the issuer wait
-                        const uint8_t* hb = m.stager->wait(en.job);
-                        cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
-                        m.stager->issued_one(en.job, m.copy);
-                    }
+                    if (m.upload_expert(sl, en.blob, en.job, (size_t) lay0.blob_bytes(en.l)))
+                        ++iss_dma;
                     if (!sparse_copied) cudaEventRecord(m.copied[sl], m.copy);
                     else if (strata::prefill::copy_event_due(idx, seq.size(), copy_event_every)) record(idx);
                     m.stage_live[sl] = true;
@@ -5876,20 +5874,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const bool pinned = m.src->pinned(l, e);   // pinned: never transient
                             const uint8_t* b = pinned ? m.src->blob_stable(l, e) : nullptr;
                             if (pinned && !b) { err = "prefill: expert source has no blob"; return false; }
-                            if (pinned) {
-                                // DMA straight from the page-locked arena: the copy stream only waits for the slot
-                                if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
-                                cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
+                            if (m.upload_to_slot(sl, b, pinned ? -1 : job_of[j], (size_t) lay.blob_bytes(l)))
                                 ++stats_.experts_dma;
-                            } else {
-                                // copied to a pinned buffer by the stager (waits only if it is behind), then DMA
-                                const uint8_t* hb = m.stager->wait(job_of[j]);
-                                if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
-                                cudaMemcpyAsync(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
-                                m.stager->issued_one(job_of[j], m.copy);
-                            }
-                            cudaEventRecord(m.copied[sl], m.copy);
-                            m.stage_live[sl] = true;
                             stage_of[j] = sl;
                             stats_.ms_experts_host += ms_since(th);
                             ++stats_.experts_streamed;
@@ -7372,18 +7358,10 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
             const bool pinned = m.src->pinned(l, e);
             const uint8_t* b = pinned ? m.src->blob_stable(l, e) : nullptr;
             if (pinned && !b) { err = "prefill (layer-major): expert source has no blob"; return false; }
-            if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
-            if (pinned) {
-                cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
-                ++stats_.experts_dma;
-            } else {
+            if (!pinned)
                 m.stager->pass(job_of[u]);   // the prefetched jobs below it the routing skipped get no DMA
-                const uint8_t* hb = m.stager->wait(job_of[u]);
-                cudaMemcpyAsync(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
-                m.stager->issued_one(job_of[u], m.copy);
-            }
-            cudaEventRecord(m.copied[sl], m.copy);
-            m.stage_live[sl] = true;
+            if (m.upload_to_slot(sl, b, pinned ? -1 : job_of[u], (size_t) lay.blob_bytes(l)))
+                ++stats_.experts_dma;
             stage_of[u] = sl;
             stats_.ms_experts_host += ms_since(tq);
             ++stats_.experts_streamed;
