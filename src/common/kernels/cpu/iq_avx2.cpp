@@ -20,6 +20,7 @@
 //
 // This file is compiled for AVX2 and must not run anything before the engine's cpu_avx2_ok() check: no runtime
 // initializer at namespace scope (#391, 016ea2e), the switches are read on first use.
+#include "strata/base/platform/env.hpp"
 #include "strata/common/kernels/cpu/iq_avx2.hpp"
 #include "strata/common/kernels/cpu/expert_layout.hpp"
 
@@ -182,10 +183,7 @@ inline float hsum8(__m256 v) {
 // the gate/up phase, +1.0 GB/s over the rows, -1.3% ms/round end to end.  The non-temporal hint measured
 // worse than T0 at the same distance, so this keeps T0.
 int prefetch_distance() {
-    static const int d = [] {
-        const char* v = std::getenv("STRATA_IQ_PREFETCH");
-        return v ? std::atoi(v) : 2048;
-    }();
+    static const int d = strata::platform::env_int("STRATA_IQ_PREFETCH", 2048);
     return d;
 }
 

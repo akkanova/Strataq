@@ -1,3 +1,4 @@
+#include "strata/base/platform/env.hpp"
 #include "strata/common/serve/request_output.hpp"
 #include "ds4_images.hpp"
 // Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
@@ -711,10 +712,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // request.
     std::atomic<bool> settle_cancel{false};
     std::thread settle_th;
-    const bool settle_idle_on = [] {
-        const char* v = std::getenv("DS4_SETTLE_IDLE");
-        return v == nullptr || std::atoi(v) != 0;
-    }();
+    const bool settle_idle_on = strata::platform::env_tri("DS4_SETTLE_IDLE") != 0;
     const auto settle_stop = [&] {
         if (!settle_th.joinable()) return;
         settle_cancel.store(true, std::memory_order_release);

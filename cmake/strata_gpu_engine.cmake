@@ -1456,6 +1456,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(platform_memory_test src/base/platform/memory_test.cpp)
   target_link_libraries(platform_memory_test PRIVATE strata_core ${_strata_gpu_runtime_target})
   add_test(NAME platform_memory_test COMMAND platform_memory_test)
+  add_executable(platform_env_test src/base/platform/env_test.cpp)
+  target_include_directories(platform_env_test PRIVATE include)
+  add_test(NAME platform_env_test COMMAND platform_env_test)
 
   # read_pieces: merged unbuffered reads return the bytes a plain read gives (CPU only).
   add_executable(platform_piece_reads_test src/base/platform/piece_reads_test.cpp)

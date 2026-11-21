@@ -30,6 +30,7 @@
 #include "strata/base/gpu/gpu_set.hpp"
 #include "strata/base/gpu/memory_info.hpp"
 #include "strata/base/gpu/runtime.hpp"
+#include "strata/base/platform/env.hpp"
 #include "strata/base/gpu/on_device.hpp"
 #include "strata/base/platform/os.hpp"
 #include "strata/core/expert_source.hpp"
@@ -114,11 +115,7 @@ constexpr bool kHipBuild = true;
 constexpr bool kHipBuild = false;
 #endif
 
-// an environment variable as 0 / 1, or -1 when it is not set (the rules in ds4_experts_rule.hpp take this form)
-int env_tri(const char* name) {
-    const char* v = std::getenv(name);
-    return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1;
-}
+using strata::platform::env_tri;
 
 double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -1344,7 +1341,7 @@ struct Model::Impl {
     static constexpr int kMaxSwaps = 8;
     // the swap rule: a CPU-lane expert in when its heat passes the coldest VRAM one's x margin + bonus; heat x decay
     // every 256 tokens; at most `inflight` swaps under way (DS4_CACHE_MARGIN / _BONUS / _DECAY / _INFLIGHT)
-    static float env_f(const char* k, float d) { return std::getenv(k) ? (float) std::atof(std::getenv(k)) : d; }
+    static float env_f(const char* k, float d) { return (float) strata::platform::env_double(k, d); }
     const float c_margin = env_f("DS4_CACHE_MARGIN", 1.25f), c_bonus = env_f("DS4_CACHE_BONUS", 1.0f),
                 c_decay = env_f("DS4_CACHE_DECAY", 0.9f);
     const int c_inflight = std::max(1, (int) env_f("DS4_CACHE_INFLIGHT", (float) kMaxSwaps));
@@ -1401,10 +1398,7 @@ struct Model::Impl {
         const char* v = std::getenv("STRATA_DS4_RAM_SKIP_W");
         return v != nullptr ? std::max(0.0f, (float) std::atof(v)) : 0.0f;
     }();
-    const int disk_skip_from = [] {
-        const char* v = std::getenv("STRATA_DS4_DISK_SKIP_FROM");
-        return v != nullptr ? std::max(0, std::atoi(v)) : 0;
-    }();
+    const int disk_skip_from = std::max(0, strata::platform::env_int("STRATA_DS4_DISK_SKIP_FROM", 0));
     // the RAM store (--ssd-cache): the CPU lane's experts in slots a policy owns, read unbuffered (null: off)
     std::unique_ptr<ExpertStore> store;
     // (Options::expert_pages) the blobs of the experts the CPU lane computes now, by expert, from the RAM's pool
@@ -4126,7 +4120,7 @@ struct Model::Impl {
     // estimated), and with hand-offs between groups their pinned rows (two chunks a GPU) within an eighth of the RAM;
     // else c0
     int chunk_default(int c0) const {
-        const auto env_on = [](const char* k) { return std::getenv(k) == nullptr || std::atoi(std::getenv(k)) != 0; };
+        const auto env_on = [](const char* k) { return env_tri(k) != 0; };
         if (!pk.gguf || !file_experts || o.expert_pages != nullptr || !one_gpu_or("DS4_BORROW") || !env_on("DS4_FLOW"))
             return c0;
         for (const Group& G : groups)
@@ -6331,10 +6325,6 @@ struct Model::Impl {
     // helper GPU - the setup #476's path was measured on (Linux; Windows with pin by need, see pin_by_need).  AMD,
     // several GPUs or groups, an integrated GPU or a helper GPU: off, as in v1.1.27 (DS4_STREAM_WIN / DS4_LAND /
     // DS4_STREAM_ZC = 1 turn one on anyway, 0 off)
-    static int env_tri(const char* name) {   // -1: not set, else its value != 0
-        const char* v = std::getenv(name);
-        return v == nullptr || v[0] == '\0' ? -1 : std::atoi(v) != 0;
-    }
     // ... and only where the CPU lane's experts actually stream from RAM (#496): it costs VRAM and decode time where
     // nothing streams - a 48 GB L40S beside 28 Xeon threads (an expert 0.13 ms on the CPU lane against 0.77 streamed:
     // 0 of every pick count streamed) decoded 17-19% slower with it.  At the start it is off when the pack's times file
@@ -10608,10 +10598,7 @@ struct Model::Impl {
                                            // read by serve_lane's thread)
     double tok_ab_t0 = 0;
     bool tok_ab_active() const {
-        static const bool on = [] {
-            const char* v = std::getenv("DS4_STREAM_TOKEN_AB");
-            return v == nullptr || std::atoi(v) != 0;
-        }();
+        static const bool on = strata::platform::env_tri("DS4_STREAM_TOKEN_AB") != 0;
         if (!on || !ln_force.empty() || tok_ab.verdict > 0) return false;
         for (const LaneCls& C : ln_cls)
             if (C.stream) return true;

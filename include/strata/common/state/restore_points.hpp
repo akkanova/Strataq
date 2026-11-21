@@ -12,6 +12,7 @@
 // (restore_points_test.cpp).
 #pragma once
 
+#include "strata/base/platform/env.hpp"
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -178,10 +179,7 @@ private:
     // STRATA_DS4_RESTORE_TAIL_AUTO (1): the tail point is left out where its cost is measured higher than reading its
     // tokens again; 0: kept on every read that reaches it
     static bool is_weighed() {
-        static const bool on = [] {
-            const char* v = std::getenv("STRATA_DS4_RESTORE_TAIL_AUTO");
-            return v == nullptr || std::atoi(v) != 0;
-        }();
+        static const bool on = strata::platform::env_tri("STRATA_DS4_RESTORE_TAIL_AUTO") != 0;
         return on;
     }
 };

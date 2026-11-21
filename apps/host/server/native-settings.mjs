@@ -42,7 +42,10 @@ export const ENV_FLAG=/^(?:STRATA|DS4)_[A-Z0-9_]+$/;
  * same for the Terminal (tests/terminal/test_speed_switches.py compares the two).
  */
 /* The table (ids, words, defaults, environment entries) is generated from strata_control/speed_switches.py into policy-generated.mjs; this file only adds the group the screen lists them under and the rules for where a switch applies (below), which tests/speed-switches.test.mjs and tests/terminal/test_speed_switches.py run against the same cases. */
-export const SPEED_SWITCHES=SPEED_SWITCH_TABLE.map(s=>({id:s.id,label:s.label,group:'Speed',hint:s.hint,default:s.default,env:s.env,...(s.legacy?{legacy:s.legacy}:{})}));
+export const SPEED_SWITCHES=SPEED_SWITCH_TABLE.map(s=>({
+ id:s.id,label:s.label,group:'Speed',hint:s.hint,default:s.default,env:s.env,
+ ...(s.legacy?{legacy:s.legacy}:{}),...(s.cleanup_env?{cleanup_env:s.cleanup_env}:{})
+}));
 const GFX12=/^gfx120[01]$/i, RADEON_9000=/\b(?:RX\s*9\d{3}|AI\s*PRO\s*R97\d{2}|R97\d{2})\b/i;
 /**
  * Which switches make sense for this model on this PC: only those are shown. `backend` is the engine's (cuda, hip, sycl, metal, cpu). `arch` is the "arch"
@@ -72,7 +75,16 @@ export function speedSwitchIsOn(env,id){const sw=SPEED_SWITCHES.find(s=>s.id===i
 /** The environment with the feature on or off: its default removes the switch's entries, the other state writes them. Nothing else in it changes. */
 export function setSpeedSwitch(env,id,on){
  const sw=SPEED_SWITCHES.find(s=>s.id===id);if(!sw)throw new Error(`Unknown speed switch: ${id}`);
- const write=on!==(sw.default==='on'),next={...(env??{})};for(const [name,value] of Object.entries(sw.env)){if(write)next[name]=value;else delete next[name];}if(!write)for(const name of Object.keys(sw.legacy??{}))delete next[name];return next;
+ const write=on!==(sw.default==='on'),next={...(env??{})};
+ for(const [name,value] of Object.entries(sw.env)){
+  if(write)next[name]=value;
+  else delete next[name];
+ }
+ if(!write){
+  for(const name of [...Object.keys(sw.legacy??{}),...(sw.cleanup_env??[])])
+   delete next[name];
+ }
+ return next;
 }
 /** What the settings answer carries: each switch that applies, with its words, its default, the entries it writes outside the default, and whether the feature is on. */
 export function speedSwitchRows(env,context){return SPEED_SWITCHES.filter(s=>speedSwitchApplies(s.id,context)).map(s=>({...s,on:speedSwitchIsOn(env,s.id)}));}

@@ -1,5 +1,6 @@
 #include "strata/base/gpu/managed_memory.hpp"
 // src/models/qwen38/prefill/prefill.cpp - see include/strata/models/qwen38/prefill/prefill.hpp.
+#include "strata/base/platform/env.hpp"
 #include "strata/models/qwen38/kernels/fused_gr.hpp"
 #include "strata/models/qwen38/prefill/prefill.hpp"
 #include "strata/models/qwen38/prefill/copy_events.hpp"
@@ -231,10 +232,7 @@ constexpr int STAGE_GRP = 32;
 constexpr int kSplitHelpRing = 48;  // layer split help: the helper stage's ring slots it streams through (at most)
 // STRATA_PREFILL_STREAM_AHEAD=0 keeps the previous routed-only upload schedule (A/B).
 inline bool stream_ahead_enabled() {
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_PREFILL_STREAM_AHEAD");
-        return v == nullptr || std::atoi(v) != 0;
-    }();
+    static const bool on = strata::platform::env_tri("STRATA_PREFILL_STREAM_AHEAD") != 0;
     return on;
 }
 // Step 3: from this chunk size on, every non-resident expert of every layer streams in a fixed order through a
@@ -475,10 +473,7 @@ constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + do
 // `f16_io`: the stage's FP16 prompt path (Prefill::init decides it once per stage, on the stage's own device): FP16
 // activations carry 11 mantissa bits, so the BF16 low part does not apply there.
 inline int bf16x2_mode(bool f16_io) {
-    static const int v = [] {
-        const char* e = std::getenv("STRATA_PREFILL_BF16X2");
-        return e != nullptr ? std::atoi(e) : 0;
-    }();
+    static const int v = strata::platform::env_int("STRATA_PREFILL_BF16X2", 0);
     return f16_io ? 0 : v;
 }
 inline bool bf16x2(bool f16_io) { return bf16x2_mode(f16_io) != 0; }
@@ -3521,10 +3516,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
     strata::kernels::QsaShapes s = strata::kernels::qsa_shapes(g);
     // read once (STRATA_KV_PREFETCH=1/0: the next streamed layer's KV prefix is staged on its own stream)
-    static const bool kv_prefetch_on = [] {
-        const char* e = std::getenv("STRATA_KV_PREFETCH");
-        return e ? std::atoi(e) != 0 : false;
-    }();
+    static const bool kv_prefetch_on = strata::platform::env_tri("STRATA_KV_PREFETCH") == 1;
     const bool kv_prefetch = kv_prefetch_on;
     if (kv_prefetch) {
         if ((!m.kv_copy && cudaStreamCreateWithFlags(&m.kv_copy, cudaStreamNonBlocking) != cudaSuccess) ||
@@ -3985,18 +3977,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // behind a host copy of an unpinned blob (that wait left the GPU idle: the 'wait copy' / 'dequant' time of the
         // i-quant prompts).  The same copies in the same order into the same slots, and a slot is refilled only once
         // the compute stream has recorded that it is done with it: the same results.  STRATA_PREFILL_ISSUER=0: inline.
-        static const bool issuer_on = [] {
-            const char* v = std::getenv("STRATA_PREFILL_ISSUER");
-            return v == nullptr || std::atoi(v) != 0;
-        }();
+        static const bool issuer_on = strata::platform::env_tri("STRATA_PREFILL_ISSUER") != 0;
         static const int copy_event_every = [] {
             const char* v = std::getenv("STRATA_PREFILL_COPY_EVENT_EVERY");
             return strata::prefill::copy_event_every_from(v ? std::atoi(v) : 1);
         }();
-        static const bool copy_wait_dedupe = [] {
-            const char* v = std::getenv("STRATA_PREFILL_COPY_WAIT_DEDUPE");
-            return v != nullptr && std::atoi(v) != 0;
-        }();
+        static const bool copy_wait_dedupe = strata::platform::env_tri("STRATA_PREFILL_COPY_WAIT_DEDUPE") == 1;
         // STRATA_PREFILL_ROUTED_STREAM=1 (opt-in, routed_stream.hpp): the issuer keeps at most a few copies queued
         // ahead of the link (STRATA_PREFILL_ROUTED_STREAM_DEPTH, default 16), each layer's routing is published once
         // its router has run (host grouping below), and an entry not yet issued that no token of the chunk routes to
@@ -4372,10 +4358,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
                     // KVA: the gate projection feeds only the output normalization, which a state-only layer skips
                     // (STRATA_KVA_GDN_NORM=1 keeps the full recurrence as the A/B control for the state-only one)
-                    static const bool kva_gdn_norm = [] {
-                        const char* v = std::getenv("STRATA_KVA_GDN_NORM");
-                        return v != nullptr && std::atoi(v) != 0;
-                    }();
+                    static const bool kva_gdn_norm = strata::platform::env_tri("STRATA_KVA_GDN_NORM") == 1;
                     if ((!kva_state_only || kva_gdn_norm) &&
                         !native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
@@ -5820,10 +5803,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             cudaSetDevice(pd);
                         }
                         // STRATA_PREFILL_GROUP_GATHER=0: one gather, one wait and one record per expert.
-                        static const bool group_env = [] {
-                            const char* v = std::getenv("STRATA_PREFILL_GROUP_GATHER");
-                            return v == nullptr || std::atoi(v) != 0;
-                        }();
+                        static const bool group_env = strata::platform::env_tri("STRATA_PREFILL_GROUP_GATHER") != 0;
                         const bool group_gather = group_env && stream_all && use_mmq && lay.native &&
                                                   MMQ_GROUP <= mmq::kGatherGroupMax;
                         // The staged walk (a short prompt) groups too, resident and staged experts alike: its ring is
@@ -8089,7 +8069,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     // layer-major prefill: STRATA_PREFILL_LAYER_MAJOR=1 / 0 win; unset, it is off everywhere (sm120_series.hpp prefill_layer_major_default: a layer split
     // reads 32K prompts 37-55% sooner chunk-major, owner's yes 2026-11-02; the single-card small-cache rule sets the variable itself)
     if (hand_in_ == nullptr && impl_ &&
-        strata::prefill_layer_major_resolve(lm_env_text(), lm_hip, stage_count(), strata::qwen_defaults_026())) {
+        strata::prefill_layer_major_resolve(lm_env_text(), lm_hip, stage_count(), strata::defaults_026())) {
         const bool by_default = !lm_env_explicit();
         for (Prefill* p = this; p != nullptr; p = p->next_) p->lm_by_default_ = by_default;
         std::string why;

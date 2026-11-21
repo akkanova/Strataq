@@ -950,7 +950,7 @@ int Model::load() {
         // 0.2.7: gfx12 native packs start at 0.15 (see pcie_share_gfx12_default), in strata-q38 as well; other cards
         // and STRATA_PCIE_FRAC_DEFAULT=old keep the x16 share measured for them.
         const double base = strata::pcie_start_frac(nvfp4_pack, native_pack, pcie_share_gfx12_default(),
-                                                    pf_old, strata::qwen_defaults_026());
+                                                    pf_old, strata::defaults_026());
         std::string bursts;
 #if !defined(STRATA_USE_HIP) && defined(_WIN32)
         // Windows: opt-in (STRATA_PCIE_AUTO_CANON=1); an RTX 5070 decoded a short Q2_0 answer 3% slower with it, code 2.5% faster
@@ -1602,7 +1602,7 @@ int Model::load() {
         if (pio.mode == strata::kernels::PleIo::Direct && !o.ple_io_explicit) {
             const strata::kernels::PleIoOptions direct_pio = pio;
             const char* auto_ram = std::getenv("STRATA_PLE_AUTO_RAM");
-            bool allowed = strata::core::ple_auto_ram_allowed(auto_ram, strata::qwen_defaults_026());
+            bool allowed = strata::core::ple_auto_ram_allowed(auto_ram, strata::defaults_026());
 #if defined(__APPLE__)
             // Not on the Mac unless asked (STRATA_PLE_AUTO_RAM=1): unified memory with the experts mapped from the file cache.  M5 Max,
             // IQ3_S, 3 interleaved pairs: with the 26.8 GiB table locked, a cold 4K prompt after decode work is 10.6% slower (-10.7 -10.6
@@ -2233,7 +2233,7 @@ int Model::load() {
         const int64_t pf = search && split_own_auto && !place_with_reserve ? 0 : split_pf_mib;
         // what a later stage allocates after its cache and nothing prices (cuBLAS, the modules and the MMQ pool the prompt path warms up, ~250 MiB measured): the single card prices
         // it (kLateAllocMib, #4474); a stage did not, and two 16 GB cards ended a start with 131 MiB free and ran out of memory in the first long prompt.  Not under STRATA_DEFAULTS=026.
-        const int64_t late_alloc = later && !strata::qwen_defaults_026() ? strata::program::split_walk::kStageLateAllocMib : 0;
+        const int64_t late_alloc = later && !strata::defaults_026() ? strata::program::split_walk::kStageLateAllocMib : 0;
         const int64_t base_reserve =
             (later && o.vram_reserve_later_mib >= 0 ? o.vram_reserve_later_mib : o.vram_reserve_mib) + late_alloc;
         strata::program::stage_reserve::Inputs rin;
@@ -2650,7 +2650,7 @@ int Model::load() {
         // NVIDIA, 2 cards: the pipelined groups by default (0.2.7); one serial group, the 0.2.1-0.2.6 default, with
         // STRATA_BATCH_GROUPS_NV_SERIAL=1 or STRATA_DEFAULTS=026 (batch_groups.hpp nv_serial_wanted)
         bin.nv_serial_faster = strata::program::batch_groups::nv_serial_wanted(std::getenv("STRATA_BATCH_GROUPS_NV_SERIAL"),
-                                                                              strata::qwen_defaults_026());
+                                                                              strata::defaults_026());
 #endif
         { const char* mp = std::getenv("STRATA_PIPED_MTP"); bin.mtp_piped = mp != nullptr && mp[0] != '\0' && mp[0] != '0'; }
         return strata::program::batch_groups::resolve(bin);
@@ -3738,7 +3738,7 @@ int Model::load() {
         // keep (459 MiB free at --vram-reserve-mib 700: under the 512 MiB line the serve check warns about, #2065).  The cache now leaves it too.
         // Not on a card that could not keep min_slots after it, and not under STRATA_DEFAULTS=026 (the v0.2.6 sizing).
         strata::core::AutoCacheSlots auto_slots = strata::core::auto_cache_slots(
-            (int64_t) free_b, reserve, blob, min_slots, strata::qwen_defaults_026() ? 0 : strata::core::kLateAllocMib);
+            (int64_t) free_b, reserve, blob, min_slots, strata::defaults_026() ? 0 : strata::core::kLateAllocMib);
         int64_t slots = auto_slots.slots;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
 #if defined(STRATA_GPU_METAL)
@@ -3793,7 +3793,7 @@ int Model::load() {
                              o.expert_cache, (long long) min_slots, (long long) kTightKeep);
                 min_slots = tight_min;
                 g_lend_keep = kTightKeep;
-                auto_slots = strata::core::auto_cache_slots((int64_t) free_b, reserve, blob, min_slots, strata::qwen_defaults_026() ? 0 : strata::core::kLateAllocMib);
+                auto_slots = strata::core::auto_cache_slots((int64_t) free_b, reserve, blob, min_slots, strata::defaults_026() ? 0 : strata::core::kLateAllocMib);
                 int64_t s3 = auto_slots.slots;
                 if (!profile.empty()) s3 = std::min<int64_t>(s3, (int64_t) profile.size());
                 o.expert_cache = (int) std::max<int64_t>(s3, 0);
@@ -3836,7 +3836,7 @@ int Model::load() {
             int64_t pick_chunk = 0, pick_slots = 0, pick_own = 0, pick_late = 0;
             for (const int64_t c : {(int64_t) 1024, (int64_t) 512, (int64_t) 256}) {
                 const int64_t own = ((int64_t) strata::prefill::Prefill::bytes_needed_owned(g, ss, c, srcp != nullptr) >> 20) + 64;
-                const int64_t late = strata::qwen_defaults_026() ? 0 : (int64_t) strata::core::kLateAllocMib;
+                const int64_t late = strata::defaults_026() ? 0 : (int64_t) strata::core::kLateAllocMib;
                 const int64_t room = (int64_t) free_b - mtp_bind - pipe_first - ((own + late + kSpillFloorMib) << 20);
                 const int64_t s = room > 0 ? std::min<int64_t>(room / blob, (int64_t) profile.size()) : 0;
                 if (s >= 64 || (s >= 1 && pick_slots < 64)) { pick_chunk = c; pick_slots = s; pick_own = own; pick_late = late; }
@@ -3864,7 +3864,7 @@ int Model::load() {
             std::string herr;
             if (native_head.to_host(herr)) {
                 free_b = strata::core::device_free_bytes();
-                strata::core::AutoCacheSlots a2 = strata::core::auto_cache_slots((int64_t) free_b, reserve, blob, min_slots, strata::qwen_defaults_026() ? 0 : strata::core::kLateAllocMib);
+                strata::core::AutoCacheSlots a2 = strata::core::auto_cache_slots((int64_t) free_b, reserve, blob, min_slots, strata::defaults_026() ? 0 : strata::core::kLateAllocMib);
                 int64_t s4 = a2.slots;
                 if (!profile.empty()) s4 = std::min<int64_t>(s4, (int64_t) profile.size());
                 if (s4 < min_slots && o.vram_reserve_mib > kSmallReserveMib) {   // the reserve lowered for the smaller cache, as above
@@ -4326,7 +4326,7 @@ int Model::load() {
 #if defined(STRATA_HAVE_DFLASH2)
         // DFlash2's own draft head and logits (and, in serve, the prompt staging) are bound on its card AFTER the caches, as the single card prices them (mtp_bind above): without
         // this term the last stage ended its load with 130-400 MiB less than the plan kept (the serve check's LOW at 8 and 12 GB).  Not under STRATA_DEFAULTS=026.
-        if (use_df2 && &st == last_st && !df2_first && !strata::qwen_defaults_026()) {
+        if (use_df2 && &st == last_st && !df2_first && !strata::defaults_026()) {
             df2_after = get_df2_head_bytes() + (48 << 20) + (o.serve ? (112 << 20) : 0);
             room = std::max<int64_t>(room - df2_after, 0);
         }
@@ -4506,10 +4506,7 @@ int Model::load() {
     // predicates on the chosen split: every participant must lend a 512-token chunk, or afford its own buffers
     // with the 512 MiB headroom.  Serve's live checks stay as the guard; this is the pre-flight confirmation.
     // STRATA_LAYER_SPLIT_PROBE=0 skips it.
-    static const bool split_probe = [] {
-        const char* v = std::getenv("STRATA_LAYER_SPLIT_PROBE");
-        return v == nullptr || v[0] != '0';
-    }();
+    static const bool split_probe = !strata::platform::is_env_off("STRATA_LAYER_SPLIT_PROBE");
     if (multi_gpu && split_auto && split_probe && !split_at.empty()) {
         const int ns = (int) stages.size() + 1;
         const int64_t kPct = get_auto_lend_pct();
@@ -5534,7 +5531,7 @@ bool pcie_auto_split_ok() {
 #else
         const bool hip = false;
 #endif
-        return strata::pcie_auto_split_default(hip, spill_discrete_gpu(), strata::qwen_defaults_026(), std::getenv("STRATA_PCIE_AUTO_SPLIT"));
+        return strata::pcie_auto_split_default(hip, spill_discrete_gpu(), strata::defaults_026(), std::getenv("STRATA_PCIE_AUTO_SPLIT"));
     }();
     return on;
 }

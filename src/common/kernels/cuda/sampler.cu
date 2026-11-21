@@ -19,6 +19,7 @@
 //     block per token, `top_k` block-argmax rounds, each over the logits after the previous pick;
 //   - `sampler_kernel` (`STRATA_OLD_SAMPLER=1`), the kernel of engine 0.1.20, kept as the reference.
 // The two new ones share `sampled_tail_warp` (top_p / min_p / temperature / draw on one warp).
+#include "strata/base/platform/env.hpp"
 #include "strata/base/gpu/managed_memory.hpp"
 #include "strata/common/kernels/sampler.hpp"
 #include "strata/common/kernels/sampler_penalties.cuh"
@@ -1108,19 +1109,20 @@ spec_verify_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_voca
 // `STRATA_SAMPLER_ONE_BLOCK=1` the one-block kernel; by default the split top_k wherever it applies.
 enum class SampledPath { Split, OneBlock, Old };
 
-bool env_flag(const char* name) {
-    const char* e = std::getenv(name);
-    return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
+/// Reads the sampler switches, whose off tokens are exactly 0, 00 and 01.
+bool is_sampler_env_on(const char* name) {
+    const char* v = strata::platform::env_text(name);
+    return v != nullptr && std::strcmp(v, "0") != 0 && std::strcmp(v, "00") != 0 && std::strcmp(v, "01") != 0;
 }
 
 bool gumbel_env() {
-    static const bool on = env_flag("STRATA_SPEC_GUMBEL");
+    static const bool on = is_sampler_env_on("STRATA_SPEC_GUMBEL");
     return on;
 }
 
 SampledPath sampled_path() {
-    static const SampledPath path = env_flag("STRATA_OLD_SAMPLER")         ? SampledPath::Old
-                                    : env_flag("STRATA_SAMPLER_ONE_BLOCK") ? SampledPath::OneBlock
+    static const SampledPath path = is_sampler_env_on("STRATA_OLD_SAMPLER")         ? SampledPath::Old
+                                    : is_sampler_env_on("STRATA_SAMPLER_ONE_BLOCK") ? SampledPath::OneBlock
                                                                            : SampledPath::Split;
     return path;
 }
@@ -1259,10 +1261,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
     if (p.greedy || p.temperature <= 0.0f) {
         // Without penalties (shmem == 0: no window) on sm_90+, a cluster of CTAs per token - the same token; see
         // `sampler_greedy_cluster_kernel`.  STRATA_ARGMAX_MULTI=0: always the one-block kernel.
-        static const bool multi = [] {
-            const char* v = std::getenv("STRATA_ARGMAX_MULTI");
-            return !v || std::atoi(v) != 0;
-        }();
+        static const bool multi = strata::platform::env_tri("STRATA_ARGMAX_MULTI") != 0;
         // One block per token, 1,024 threads over the vocabulary.  See `sampler_greedy_kernel`.
         const int gthreads = 1024;
         if (!(multi && shmem == 0 && !p.logit_bias && sample_greedy_cluster(logits, n_tokens, n_vocab, out, stream)))

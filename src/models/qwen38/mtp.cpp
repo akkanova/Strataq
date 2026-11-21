@@ -1,5 +1,6 @@
 #include "strata/base/gpu/managed_memory.hpp"
 // src/models/qwen38/mtp.cpp - see include/strata/models/qwen38/mtp.hpp.
+#include "strata/base/platform/env.hpp"
 #include "strata/models/qwen38/mtp.hpp"
 #include "strata/common/spec/confidence.hpp"
 #include "strata/base/gpu/pin_budget.hpp"
@@ -71,10 +72,7 @@ constexpr float EPS = 1e-6f;
 
 // #783 PR-i: STRATA_MTP_CATCHUP_ALL=1 catches the drafter's K/V up for the whole verified window, rejected rows included
 bool mtp_catchup_all() {
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_MTP_CATCHUP_ALL");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
+    static const bool on = strata::platform::is_env_on("STRATA_MTP_CATCHUP_ALL");
     return on;
 }
 // STRATA_MTP_Q8_SM60=1 (opt-in, with STRATA_Q8_SM60=1): the drafter's own Q8_0 matrices (the draft head's subset,
@@ -1075,10 +1073,7 @@ bool mtp_head_mix_multi_on() {
     }();
     return on;
 #else
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_HEAD_MIX_MULTI");
-        return v == nullptr || std::atoi(v) != 0;
-    }();
+    static const bool on = strata::platform::env_tri("STRATA_HEAD_MIX_MULTI") != 0;
     return on;
 #endif
 }
@@ -1159,10 +1154,7 @@ bool MtpDrafter::record_front(int T, int row0, cudaStream_t cs, std::string& err
         native_mmvq(wt_v_proj, wp_v_proj, xq_, vcur_, (int) N, (int) (NKV * HD), T, cs);
         // #783 PR-d (stuchapin909): the T tokens' K norm, K/V rotation and K/V append each run once over all T rows
         // (every row is independent; the rope keeps its per-token positions). STRATA_NO_BATCH_KV_STEP=1 appends per token.
-        static const bool no_batch_kv = [] {
-            const char* v = std::getenv("STRATA_NO_BATCH_KV_STEP");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
-        }();
+        static const bool no_batch_kv = strata::platform::is_env_on("STRATA_NO_BATCH_KV_STEP");
         // #783 PR-f (stuchapin909): the per-head RMSNorm and the rope fused (bit-identical to the pair, rope_parity
         // check 6; STRATA_NO_NORM_ROPE=1 keeps the two; off on HIP until its parity check passes). K rows of one token
         // are consecutive in `pos`, tokens are NH apart, so a one-token window is the fusable case.
@@ -1293,10 +1285,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         if (q8_mlp && T == 1) nsw.x_q8_1 = xq_;
         const SForm none{};
         const bool need_bf16_x = !shared_expert_native_bf16_enabled();
-        static const bool fuse_head_gr = [] {
-            const char* v = std::getenv("STRATA_FUSE_HEAD_GR");
-            return v != nullptr && std::atoi(v) != 0;
-        }();
+        static const bool fuse_head_gr = strata::platform::env_tri("STRATA_FUSE_HEAD_GR") == 1;
         const bool head_mix_multi_on = mtp_head_mix_multi_on();
         // the shared expert only reads mixed_ / xq_ and writes shared_: a branch beside the router and the routed
         // experts, joined before the combine (CUDA; HIP keeps one stream: STRATA_MTP_SHARED_BRANCH=0 does too)

@@ -59,6 +59,14 @@ int main() {
         unset_env("STRATA_KVA_SUFFIX");
     }
 
+    for (const char* key : {"STRATA_KVA_SPLIT", "STRATA_KVA_SUFFIX", "STRATA_KVA_MIN_PROMPT"}) {
+        set_env(key, "4294967296");
+        const KvaConfig c = kva_config_from_env();
+        CHECK((key == std::string("STRATA_KVA_SPLIT") ? c.split :
+               key == std::string("STRATA_KVA_SUFFIX") ? c.suffix_env : c.min_prompt) == 4294967296LL);
+        unset_env(key);
+    }
+
     // ---- who is turned away, and why (the first reason that holds is the one named)
     {
         const KvaConfig c = kva_config_from_env();

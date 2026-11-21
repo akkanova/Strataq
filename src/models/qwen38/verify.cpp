@@ -10,6 +10,7 @@
 #include "strata/base/gpu/sm120_series.hpp"
 #include "strata/core/defaults_026.hpp"
 #include "strata/base/gpu/gfx_arch.hpp"
+#include "strata/base/platform/env.hpp"
 #include "strata/models/qwen38/verify.hpp"
 #include "strata/models/qwen38/window_evict.hpp"
 #include "strata/common/kernels/expert_nibble.hpp"
@@ -309,25 +310,22 @@ struct Bump {
 // #649 (HIP, opt-in A/Bs for the gfx1030 verify timeouts; CUDA never reads them)
 //   STRATA_VERIFY_COHERENT=1  the handshake words and rows in explicitly coherent (fine-grained) host memory
 //   STRATA_DOORBELL_STORE=1   the GPU stores each step's ring instead of read-modify-writing it over PCIe
-bool env_on(const char* name) {
-    const char* e = std::getenv(name);
-    return e != nullptr && e[0] != 0 && e[0] != '0';
-}
+using strata::platform::is_env_on;
 #if defined(STRATA_USE_HIP)
-const bool g_coherent = env_on("STRATA_VERIFY_COHERENT");
-const bool g_doorbell_store = env_on("STRATA_DOORBELL_STORE");
+const bool g_coherent = is_env_on("STRATA_VERIFY_COHERENT");
+const bool g_doorbell_store = is_env_on("STRATA_DOORBELL_STORE");
 #endif
-const bool g_trace = env_on("STRATA_VERIFY_TRACE");
+const bool g_trace = is_env_on("STRATA_VERIFY_TRACE");
 // STRATA_LAUNCH_PROBE (STRIX-TDR): process start, and the first windows' launch timing
 const Clock::time_point g_proc_t0 = Clock::now();
 Clock::time_point probe_proc_t0() { return g_proc_t0; }
-const bool g_no_multi_gr = env_on("STRATA_NO_MULTI_GR");   // #783 PR-g: per-token GR reads/writes and generic-T kernels again
-const bool g_no_batch_kv = env_on("STRATA_NO_BATCH_KV_STEP");   // #783 PR-d: per-token K/V and indexer appends again
+const bool g_no_multi_gr = is_env_on("STRATA_NO_MULTI_GR");   // #783 PR-g: per-token GR reads/writes and generic-T kernels again
+const bool g_no_batch_kv = is_env_on("STRATA_NO_BATCH_KV_STEP");   // #783 PR-d: per-token K/V and indexer appends again
 // STRATA_QSA_SLOTS=1 (opt-in): in a batch window, a QSA layer's block scores, top-k and attention run as one launch
 // each over the window's rows (up to 8 per launch, each row reading its own slot's indexer keys and K/V) instead of
 // one call per row; every row is computed by the same kernel with the same arithmetic as its own call.  Not with a
 // streamed KV cache (a row's block resolve could evict the blocks an earlier row of the same slot selected).
-bool qsa_slots_on() { static const bool v = env_on("STRATA_QSA_SLOTS"); return v; }
+bool qsa_slots_on() { static const bool v = is_env_on("STRATA_QSA_SLOTS"); return v; }
 #define g_qsa_slots (qsa_slots_on())
 
 // every row of a batch window is another slot's (no slot has proposal rows)
@@ -387,16 +385,10 @@ int early_ple_flag_mode() {
 // gfx12 table sets; =0 keeps gr_read per token): bitwise the same sums.
 bool head_mix_multi_enabled() {
 #if defined(STRATA_USE_HIP)
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_HEAD_MIX_MULTI");
-        return v != nullptr && std::atoi(v) != 0;
-    }();
+    static const bool on = strata::platform::env_tri("STRATA_HEAD_MIX_MULTI") == 1;
     return on;
 #else
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_HEAD_MIX_MULTI");
-        return v == nullptr || std::atoi(v) != 0;
-    }();
+    static const bool on = strata::platform::env_tri("STRATA_HEAD_MIX_MULTI") != 0;
     return on;
 #endif
 }
@@ -426,10 +418,7 @@ bool device_is_sm75() {
 
 bool fuse_wait_on() {
 #if defined(STRATA_USE_HIP)
-    static const int env = [] {
-        const char* v = std::getenv("STRATA_FUSE_WAIT");
-        return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1;
-    }();
+    static const int env = strata::platform::env_tri("STRATA_FUSE_WAIT");
     if (env >= 0) return env != 0;
     static int per_dev[64];   // 0 unknown, 1 no, 2 yes
     int dev = 0;
@@ -496,10 +485,7 @@ bool one_token_self_commit() {
     }();
     return on;
 #else
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_ONE_TOKEN_COMMIT");
-        return v == nullptr || std::atoi(v) != 0;
-    }();
+    static const bool on = strata::platform::env_tri("STRATA_ONE_TOKEN_COMMIT") != 0;
     return on;
 #endif
 }
@@ -1541,10 +1527,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
             }
             float* normalized = (float*) ((uint8_t*) ss.ple.scratch + ple_block_scratch_bytes());
-            static const bool ple_batch_env = [] {
-                const char* e = std::getenv("STRATA_PLE_BATCH");
-                return !e || e[0] != '0';
-            }();
+            static const bool ple_batch_env = !strata::platform::is_env_off("STRATA_PLE_BATCH");
             const bool ple_batch_kv = ple_batch_env && dec_batch && n > 1 && ss.ple.w.key_bf16 != nullptr &&
                                       ss.ple.w.value_bf16 != nullptr && ple_native_bf16_enabled() &&
                                       ple_native_postops_enabled();
@@ -1585,10 +1568,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             // below (the norms divide at run time as its norms do; the history advances token by token), which also
             // writes the commit's history snapshots.  Scratch: layer 0's expert rows, combined by now, and the
             // hyper-connection read's `lo_`, which the read below rewrites.
-            static const bool ple_post_env = [] {
-                const char* e = std::getenv("STRATA_DF_PLE");
-                return e != nullptr && std::atoi(e) != 0;
-            }();
+            static const bool ple_post_env = strata::platform::env_tri("STRATA_DF_PLE") == 1;
             const bool ple_post = ple_batch_kv && ple_post_env && !batch_rec_;
             // #783 PR-g (stuchapin909): the window's residual writes in one launch (STRATA_NO_MULTI_GR=1: per token)
             const bool multi_write = !ple_post && dec_batch && !g_no_multi_gr && n > 1;
@@ -1879,10 +1859,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // long prompts), and the 6-token verify graph is 1950 nodes instead of 2610 (#2403: an RX 6900 XT faulted in
                 // the first verify graph launch with --kv q4_0 + KV streaming + MTP; whether the graph size is the cause is
                 // not confirmed)
-                static const bool qb_q4 = [] {
-                    const char* e = std::getenv("STRATA_DF_QB_Q4");
-                    return e == nullptr || std::atoi(e) != 0;
-                }();
+                static const bool qb_q4 = strata::platform::env_tri("STRATA_DF_QB_Q4") != 0;
                 const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && (!st.kv_q4 || qb_q4);
                 if (!q8_attn) quant_in(xm, (int) N);
                 // STRATA_DF_BRANCH: the query side (q and its norm/RoPE/rotation on side 0, the indexer query on side 1)
@@ -2109,10 +2086,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // own indexer keys, the top-k over all rows (row-independent), attention with each row's own pools -
                 // instead of 3-4 one-row launches per row; the same per-row arithmetic.  Not with KV streaming
                 // (qsa_kv_resolve has work per slot then).
-                static const bool attn_rows = [] {
-                    const char* v = std::getenv("STRATA_BATCH_ATTN_ROWS");
-                    return v != nullptr && std::atoi(v) != 0;
-                }();
+                static const bool attn_rows = strata::platform::env_tri("STRATA_BATCH_ATTN_ROWS") == 1;
                 bool rows_ok = batch_rec_ && attn_rows && te - tb <= strata::kernels::kAttnRowsMax;
                 for (int t = tb; rows_ok && t < te; ++t) rows_ok = slot_ss(t).qsa_states[qi].kv_mode != 1;
                 if (rows_ok) {
@@ -2237,10 +2211,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         stamp(l, 32, grp);   // the profile only: the FFN-side read ends here, the router starts
         // with CPU experts in the window the shared expert forks off once the doorbell is published (it no longer
         // competes with it for the GPU's first microseconds); STRATA_SH_FORK_LATE=0 forks at the top as before
-        static const bool sh_fork_late_env = [] {
-            const char* e = std::getenv("STRATA_SH_FORK_LATE");
-            return !e || e[0] != '0';
-        }();
+        static const bool sh_fork_late_env = !strata::platform::is_env_off("STRATA_SH_FORK_LATE");
         const bool sh_fork_late = sh_fork && sh_fork_late_env && !ar_on();
         cudaStream_t sh_stream = sh_fork ? sh_cs_ : cs;
         if (sh_fork && !sh_fork_late) {
@@ -2942,7 +2913,7 @@ bool Verifier::capture(int T, std::string& err) {
     }
 #endif
 #if defined(STRATA_USE_HIP)
-    if (env_on("STRATA_LAUNCH_PROBE")) {   // STRIX-TDR: how many nodes (about one AQL packet each) the window graph holds
+    if (is_env_on("STRATA_LAUNCH_PROBE")) {   // STRIX-TDR: how many nodes (about one AQL packet each) the window graph holds
         size_t nn = 0, nk = 0;
         hipGraphGetNodes(graph, nullptr, &nn);
         std::vector<hipGraphNode_t> nodes(nn);
@@ -3344,7 +3315,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         *(volatile uint32_t*) h_flag_ = 1;
         flag_raised = true;
     }
-    static const bool probe_on = env_on("STRATA_LAUNCH_PROBE");
+    static const bool probe_on = is_env_on("STRATA_LAUNCH_PROBE");
     static std::atomic<int> probe_count{0};
     const int probe_idx = probe_on && !pre ? probe_count.fetch_add(1) : -1;
     const bool probe_this = probe_idx >= 0 && probe_idx < 12;
@@ -4109,10 +4080,7 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                 if (!wnm) { ok = false; break; }
                 // STRATA_BATCH_GDN_GROUPS=1: one-row groups (no --batch-mtp proposals) commit their recurrence
                 // in one launch for all slots; the conv commits stay per slot
-                static const bool gdn_groups_on = [] {
-                    const char* v = std::getenv("STRATA_BATCH_GDN_GROUPS");
-                    return v != nullptr && std::atoi(v) != 0;
-                }();
+                static const bool gdn_groups_on = strata::platform::env_tri("STRATA_BATCH_GDN_GROUPS") == 1;
                 bool one_row = S <= 8;
                 for (int t = 1; one_row && t < S; ++t) one_row = rows[t] != rows[t - 1];
                 strata::kernels::GdnGroups gg;
@@ -5374,10 +5342,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
 
 // #879: STRATA_NAN_GUARD=0 turns the guard off (no kernel is recorded; the graphs are captured once, so it is read once)
 bool Verifier::nan_guard_on() {
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_NAN_GUARD");
-        return v == nullptr || std::atoi(v) != 0;
-    }();
+    static const bool on = strata::platform::env_tri("STRATA_NAN_GUARD") != 0;
     return on;
 }
 
@@ -5814,10 +5779,7 @@ bool is_layer_commit_enabled() {
 #if defined(STRATA_GPU_METAL)
     return false;
 #else
-    static const bool on = [] {
-        const char* value = std::getenv("STRATA_COMMIT_BATCH");
-        return !value || value[0] != '0';
-    }();
+    static const bool on = !strata::platform::is_env_off("STRATA_COMMIT_BATCH");
     return on;
 #endif
 }

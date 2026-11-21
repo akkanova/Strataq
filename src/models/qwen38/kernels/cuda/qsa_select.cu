@@ -1,6 +1,7 @@
 // src/models/qwen38/kernels/cuda/qsa_select.cu - see include/strata/models/qwen38/kernels/qsa_select.hpp.
 #include "strata/base/gpu/emulate.hpp"
 #include "strata/base/gpu/sm75_series.hpp"
+#include "strata/base/platform/env.hpp"
 #include "strata/core/geometry.hpp"
 #include <cstdlib>
 #include <cstring>
@@ -2264,10 +2265,7 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
 #if defined(__HIPCC__)
     // AMD: the gfx12 (RDNA4) WMMA scorer, opt-in (STRATA_SELECT_WMMA=1): it selects slightly differently from the warp
     // kernel (254/256 queries the same), so the default keeps the warp kernel; every other target keeps it too (false)
-    static const bool wmma_on = [] {
-        const char* v = std::getenv("STRATA_SELECT_WMMA");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
+    static const bool wmma_on = strata::platform::is_env_on("STRATA_SELECT_WMMA");
     // any HIP card: the FP32 tiled scorer, opt-in as on CUDA (STRATA_SELECT_SIMT=1; another summation order than the
     // warp kernel, so the default keeps the warp kernel).  RX 6900 XT, 256 queries at 128K: 2.71 -> 0.587 ms
     // STRATA_SELECT_SIMT=2 (#2071): block_scores_simt2_kernel, 32 x 128 tiles with the next K chunk in registers (the same
@@ -2971,10 +2969,7 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
 #if !defined(__HIPCC__)
     // sm_90+: a cluster of CL_N CTAs per query for the calls of a few queries (decode windows); the same ids.
     // STRATA_QSA_CLUSTER=0: the one-CTA kernels below
-    static const bool cluster = [] {
-        const char* v = std::getenv("STRATA_QSA_CLUSTER");
-        return !v || std::atoi(v) != 0;
-    }();
+    static const bool cluster = strata::platform::env_tri("STRATA_QSA_CLUSTER") != 0;
     if (cluster && !old && nq <= CL_MAXQ && qsa_block_topk_cluster(scores, steps, nq, max_blocks, cap, s, ids, stream))
         return;
 #endif
@@ -3033,10 +3028,7 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     // same ids.  STRATA_TOPK_STREAM=0 restores the register kernel there.
     // campaign3: on HIP too (was CUDA-only; gfx11 has no sm_90 cluster path and fell to the ref radix past the
     // register kernel's reach - the deep-decode top-k cost).  Same ids as the ref kernel.
-    static const bool turing_wide = [] {
-        const char* v = std::getenv("STRATA_TOPK_STREAM");
-        return v == nullptr || v[0] != '0';
-    }();
+    static const bool turing_wide = !strata::platform::is_env_off("STRATA_TOPK_STREAM");
     if (reach > fit || (turing_wide && counted && reach > 22528)) {   // past the register kernel's reach, or Turing's band
 #if !defined(__HIPCC__)
         if (counted && nq <= TS_MAXQ && reach > 28672 && topk_sample_on()) {   // one read of the scores (below ~115K cells the wide kernel is as fast)
@@ -3058,10 +3050,7 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
 // STRATA_SCORES_DX: 0 off, 1 on for any CUDA card; unset: on for compute capability 6.x (block_scores_dx_kernel).
 // `sms`: the device's multiprocessors (the grid: as many CTAs as fit on each).
 static bool scores_dx_device(int& sms) {
-    static const int env = [] {
-        const char* v = std::getenv("STRATA_SCORES_DX");
-        return v == nullptr || *v == '\0' ? -1 : std::atoi(v);
-    }();
+    static const int env = strata::platform::env_int("STRATA_SCORES_DX", -1);
     if (env == 0) return false;
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) { cudaGetLastError(); return false; }
@@ -3123,10 +3112,7 @@ static bool qsa_block_scores_dx(const float* pooled, const float* dead, const fl
 // STRATA_TOPK_MULTI: 0 off, 1 on for any CUDA card and capacity; unset: on for compute capability 6.x past the register
 // kernel's reach (GP100: 0.39 -> 0.04 ms per call at 300K cells; see block_topk_multi_hist_kernel)
 static int topk_multi_mode() {
-    static const int env = [] {
-        const char* v = std::getenv("STRATA_TOPK_MULTI");
-        return v == nullptr || *v == '\0' ? -1 : std::atoi(v);
-    }();
+    static const int env = strata::platform::env_int("STRATA_TOPK_MULTI", -1);
     if (env >= 0) return env != 0 ? 1 : 0;
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) { cudaGetLastError(); return 0; }

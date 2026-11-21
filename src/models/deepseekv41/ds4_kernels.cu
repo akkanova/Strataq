@@ -13,6 +13,7 @@
 #include "ds4_attn_split.cuh"
 #include "ds4_wmma.cuh"
 #include "ds4_experts_rule.hpp"
+#include "strata/base/platform/env.hpp"
 
 #include <cuda_fp16.h>
 
@@ -2103,10 +2104,7 @@ bool device_is_gfx1151win() {
 #endif
 #endif
 bool fast_attn_enabled() {
-    static const int env = [] {
-        const char* e = std::getenv("DS4_FAST_ATTN");
-        return e == nullptr ? -1 : (std::atoi(e) != 0 ? 1 : 0);
-    }();
+    static const int env = strata::platform::env_tri("DS4_FAST_ATTN");
 #if defined(STRATA_USE_HIP)
 #if defined(_WIN32)
     return strata::ds4::fast_attn_default(env, device_is_gfx12(), device_is_gfx1151win(), strata::ds4::defaults_026());
@@ -2682,10 +2680,7 @@ void xfer_put(const Xfer& x, unsigned* flag, unsigned seq, unsigned* cnt, cudaSt
 }
 void win_submit(cudaStream_t s) {
 #if defined(_WIN32)
-    static const bool on = [] {
-        const char* v = std::getenv("DS4_WIN_SUBMIT");
-        return v == nullptr || std::atoi(v) != 0;
-    }();
+    static const bool on = strata::platform::env_tri("DS4_WIN_SUBMIT") != 0;
     if (on) {
         (void) cudaStreamQuery(s);
         (void) cudaGetLastError();
