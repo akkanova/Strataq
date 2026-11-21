@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -341,7 +342,12 @@ public:
     bool keep_group(int, const std::vector<strata::spec::StepRow>&, const std::vector<int>&,
                     bool, std::string&) override { return true; }
     bool run_rows(const std::vector<strata::spec::StepRow>& rows, std::vector<int32_t>& picks,
-                  std::string& err) override;
+                  std::string& err) override {
+        if (!run_rows_core(rows, picks, err))
+            return false;
+        drop_picks_if_router_bad(picks);
+        return true;
+    }
     bool keep_rows(const std::vector<strata::spec::StepRow>& rows, const std::vector<int>& kept, bool,
                    std::string& err) override;
     int propose(strata::serve::PagedPart& last, int session, int32_t token, int64_t pos, int n, int32_t* out,
@@ -361,6 +367,7 @@ public:
                     (long long) d.resumed);
     }
     void end_request() override { m_.save_profile(); }
+    void begin_step(int) override { router_bad_.reset(); }
 
 private:
     /// Gets the experts of trunk layers [lb, le) in the order the GPU's pool takes them (get_ranking), the drafter's
@@ -369,6 +376,18 @@ private:
     /// Gets 1 when a proposal can run, 0 when it should be skipped, or -1 on state failure.
     int prepare_draft(Part& part, int session, int64_t pos, int n, std::string& err);
     bool is_drafter_ready() const;
+    /// Runs and samples the rows of one step for run_rows, which then checks the router.
+    bool run_rows_core(const std::vector<strata::spec::StepRow>& rows, std::vector<int32_t>& picks,
+                       std::string& err);
+    /// Ends the step's requests through spec::Step's -1 contract; the device flag cannot identify a row.
+    /// Pipeline finishes run after every stage drains, so one read covers all groups without waiting on live stages.
+    void drop_picks_if_router_bad(std::vector<int32_t>& picks) {
+        // TODO: Latch a yielded prompt's failure on its conversation before another decode clears the device flag.
+        if (!router_bad_.has_value())
+            router_bad_ = m_.router_nonfinite();
+        if (*router_bad_)
+            std::fill(picks.begin(), picks.end(), -1);
+    }
     bool go_to(int64_t pos, std::string& err);
     void end_prompt(Part& p);
     int32_t sample(const Part& p, int64_t pos);
@@ -420,6 +439,8 @@ private:
     struct JointWindow { int session, first, count; };
     std::vector<JointWindow> joint_windows_;
     int verified_ = 0; ///< Counts sampled rows in a standalone verify window; joint_windows_ tracks joint passes.
+    /// Caches the take-and-clear device result for all groups; begin_step resets it during group preparation.
+    std::optional<bool> router_bad_;
 };
 
 /// Gets the Part a PagedPart of this model is.
@@ -924,11 +945,12 @@ bool PagedDeepSeek::finish_group(int group, std::vector<int32_t>& picks, std::st
         return false;
     sample_pending_rows(g);
     picks = g.picks;
+    drop_picks_if_router_bad(picks);
     return true;
 }
 
-bool PagedDeepSeek::run_rows(const std::vector<strata::spec::StepRow>& rows, std::vector<int32_t>& picks,
-                             std::string& err) {
+bool PagedDeepSeek::run_rows_core(const std::vector<strata::spec::StepRow>& rows, std::vector<int32_t>& picks,
+                                 std::string& err) {
     joint_windows_.clear();
     if (rows.front().session != rows.back().session) {
         verified_ = 0;
