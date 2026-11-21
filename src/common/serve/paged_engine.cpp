@@ -223,8 +223,11 @@ private:
     /// those each decoding conversation takes there at the end of its request, in whole chunks.
     uint64_t get_smallest_gpu(const PagedCard& card, int64_t tokens_min) const;
     /// Gets the most `card`'s pool may hold now: what it holds and what its GPU has free beyond what it keeps
-    /// (get_gpu_room, `past_dedicated` as there).
-    uint64_t get_largest_gpu(const PagedCard& card, bool past_dedicated = false) const;
+    /// (get_gpu_keep with `reserve_mib`; get_gpu_room, `past_dedicated` as there).
+    uint64_t get_largest_gpu(const PagedCard& card, int64_t reserve_mib, bool past_dedicated = false) const;
+    /// Gets what `card`'s pool leaves free on its GPU: `reserve_mib` (PagedSettings::vram_reserve_mib) and what the
+    /// model keeps there (PagedModel::get_gpu_keep).
+    uint64_t get_gpu_keep(const PagedCard& card, int64_t reserve_mib) const;
     /// Gets the least and the most the RAM's pool and its staging ring may hold now.
     uint64_t get_smallest_ram() const;
     uint64_t get_largest_ram() const;
@@ -2234,9 +2237,11 @@ strata::serve::MemoryReport PagedEngine::describe_memory() const {
         gpu.fragmented_pages = r.fragmented.pages;
         gpu.setting = r.total.bytes;
         gpu.smallest = get_smallest_gpu(card, settings_.tokens_min);
-        gpu.largest = get_largest_gpu(card);
+        gpu.largest = get_largest_gpu(card, settings_.vram_reserve_mib);
         gpu.pool_shared = r.outside.bytes;
         gpu.dedicated_full = card.index < dedicated_full_.size() && dedicated_full_[card.index];
+        gpu.kept_free = settings_.get_vram_reserve_bytes();
+        gpu.beyond_dedicated = get_unusable_share(card.dev);
         report.experts_pending += filling_since_ ? card.experts.get_missing_count() : 0;
     }
     strata::serve::Memory& ram = report.at("ram");
@@ -2291,7 +2296,8 @@ strata::serve::MemoryReport PagedEngine::describe_memory() const {
                        {"lookahead", settings_.step.lookahead},
                        {"tokens_min", settings_.tokens_min},
                        {"tokens_max", settings_.tokens_max},
-                       {"ssd_pause_mib", settings_.ssd_pause_mib}};
+                       {"ssd_pause_mib", settings_.ssd_pause_mib},
+                       {"vram_reserve_mib", settings_.vram_reserve_mib}};
     for (const PagedCard& card : cards_)
         report.settings.emplace_back("memory_mib." + card.id,
                                      (int64_t) (card.experts.pool().report().total.bytes >> 20));
@@ -2361,6 +2367,8 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
             s.tokens_max = v;
         else if (name == "ssd_pause_mib")
             s.ssd_pause_mib = v;
+        else if (name == "vram_reserve_mib")
+            s.vram_reserve_mib = v;
         else if (name == "concurrent")
             s.step.concurrent = (int) v;
         else if (name == "vram_conversations")
@@ -2410,8 +2418,9 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
             return "the biggest active conversation and the token minimum need " + gib(smallest) + "; the pool of " +
                    card.id + " would keep " + gib(asked);
         // (a growth itself finds where the GPU's dedicated memory ends, resize_gpu)
-        if (gpu_bytes[card.index] && asked > get_largest_gpu(card, true))
-            return card.id + " has room for " + gib(get_largest_gpu(card, true)) + " of pool, not " + gib(asked);
+        if (gpu_bytes[card.index] && asked > get_largest_gpu(card, s.vram_reserve_mib, true))
+            return card.id + " has room for " + gib(get_largest_gpu(card, s.vram_reserve_mib, true)) +
+                   " of pool, not " + gib(asked);
     }
     // (each range takes all of get_commit_room: on the Strix Halo, where the GPU's memory is commit too, one change
     // that grows both pools must share the remaining commit capacity)
@@ -2429,6 +2438,7 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
     settings_.decode_share_percent = s.decode_share_percent;
     settings_.prompt_turn_ms = s.prompt_turn_ms;
     settings_.save_on_shutdown = s.save_on_shutdown;
+    settings_.vram_reserve_mib = s.vram_reserve_mib;
     std::string err;
     if (!s.drafter && settings_.drafter)
         (void) switch_drafter(false, err);
@@ -2486,7 +2496,8 @@ std::string PagedEngine::resize_gpu(PagedCard& card, uint64_t bytes, bool shared
         pause_or_forget(*h);
     std::string shortfall;   // (a growth that stops early keeps the chunks it took)
     for (;;) {
-        const strata::core::PoolResize r = card.experts.resize(bytes, {shared_ok, model_.get_gpu_keep(card)});
+        const strata::core::PoolResize r =
+            card.experts.resize(bytes, {shared_ok, get_gpu_keep(card, settings_.vram_reserve_mib)});
         dedicated_full_.resize(cards_.size());
         dedicated_full_[card.index] = r.own_memory_full;
         if (r.refusal.empty() || r.own_memory_full) {
@@ -2867,11 +2878,15 @@ uint64_t PagedEngine::get_smallest_gpu(const PagedCard& card, int64_t tokens_min
     return std::max<uint64_t>((pages * pool.page_bytes() + chunk - 1) / chunk, 1) * chunk;
 }
 
-uint64_t PagedEngine::get_largest_gpu(const PagedCard& card, bool past_dedicated) const {
+uint64_t PagedEngine::get_largest_gpu(const PagedCard& card, int64_t reserve_mib, bool past_dedicated) const {
     const strata::core::PagePool& pool = card.experts.pool();
     const uint64_t chunk = pool.chunk_bytes();
-    return (pool.report().total.bytes + get_gpu_room(card.dev, model_.get_gpu_keep(card), past_dedicated)) / chunk *
-           chunk;
+    return (pool.report().total.bytes + get_gpu_room(card.dev, get_gpu_keep(card, reserve_mib), past_dedicated)) /
+           chunk * chunk;
+}
+
+uint64_t PagedEngine::get_gpu_keep(const PagedCard& card, int64_t reserve_mib) const {
+    return ((uint64_t) reserve_mib << 20) + model_.get_gpu_keep(card);
 }
 
 uint64_t PagedEngine::get_smallest_ram() const {

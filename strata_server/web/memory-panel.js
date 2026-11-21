@@ -17,7 +17,8 @@ const USES = {weights: "Weights", experts: "Experts", redundant_experts: "Expert
               paused: "Paused conversations", paused_unusable: "Unusable pause files", drafter: "Drafter",
               drafter_experts: "Drafter experts", prompt_buffers: "Prompt buffers",
               scratch: "Scratch", engram: "Engram",
-              borrowed: "GPU (borrowed from RAM)", other: "Other", other_apps: "Other apps", free: "Free"};
+              borrowed: "GPU (borrowed from RAM)", other: "Other", other_apps: "Other apps", free: "Free",
+              kept_free: "Kept free for other programs", beyond_dedicated: "Not usable as dedicated memory"};
 /** What each use of a bar is, in plain words: the tooltip of its segment and its legend entry. */
 const USE_HELP = {
   weights: "The parts of the model that must always be loaded here (attention, the shared layers, the output head), " +
@@ -42,6 +43,11 @@ const USE_HELP = {
   other: "Strata allocations outside the expert and conversation pools",
   other_apps: "Memory used outside Strata, including other programs and Windows",
   free: "Not in use by anything",
+  kept_free: "Memory Strata leaves free so that other programs, and Strata's own buffers outside its pools, have " +
+    "room. The setting \"VRAM kept free for other programs\" sizes it",
+  beyond_dedicated: "Free in the graphics chip's own memory, yet unusable: when Strata's pool last grew, Windows " +
+    "put the next piece in slower shared memory although this much was still free here. So the pool cannot grow " +
+    "further in dedicated memory",
 };
 /** Pool categories used by engines that do not report an explicit adjustable byte interval. */
 const POOL_USES = ["experts", "redundant_experts", "conversations", "paused", "paused_unusable", "prompt_buffers",
@@ -68,6 +74,7 @@ const SETTINGS = {context: "Per-conversation token limit", concurrent: "Conversa
                   lookahead: "Max lookahead", tokens_min: "Min conversation tokens",
                   tokens_max: "Max conversation tokens", ssd_pause_mib: "SSD for paused conversations (MiB)",
                   drafter: "Drafter", save_on_shutdown: "Save conversations on shutdown",
+                  vram_reserve_mib: "VRAM kept free for other programs (MiB)",
                   slots: "Maximum conversations at once"};
 /** The settings that are switches: the engine reports them as 1 or 0 and takes "on" or "off". */
 const SWITCHES = ["drafter", "save_on_shutdown"];
@@ -92,7 +99,8 @@ const CONTROLS = [["concurrent", () => 1, (s) => Math.min(s.slots ?? 8, s.rows ?
                   ["lookahead", () => 0, (s) => (s.rows ?? 1) - 1],
                   ["tokens_min", () => 0, (s) => s.tokens_max ?? Infinity],
                   ["tokens_max", (s) => s.tokens_min ?? 0, () => Infinity],
-                  ["context", () => 1, (s) => s.context_capacity ?? s.context ?? Infinity]];
+                  ["context", () => 1, (s) => s.context_capacity ?? s.context ?? Infinity],
+                  ["vram_reserve_mib", () => 0, () => Infinity]];
 /** HTML entities for the characters esc replaces. @type {Record<string, string>} */
 const ESCAPES = {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"};
 /** Names shown for where a conversation is held (its `place`). */
@@ -134,14 +142,16 @@ export function drawMemoryPanel(element, view, onChange) {
  * `setting`: the size of the engine's page pool there now, which `memory_mib.<id>` changes; `smallest`, `largest`:
  * the sizes it accepts now (a GPU's `largest`: what its dedicated memory holds, as last measured).  `pool_shared`: the
  * bytes of the pool in a GPU's shared memory; `dedicated_full`: its last growth stopped where the dedicated memory
- * ended.  Bytes.
+ * ended.  `kept_free`: what the engine's pools leave free there for other programs; `beyond_dedicated`: the part of
+ * a GPU's dedicated memory its pool's last growth found unusable.  Bytes.
  * @typedef {{id: string, name: string | null, total: number | null, free: number | null, unified: boolean,
  *   uses: Record<string, number>, paused_count: number | null, paused_budget: number | null,
  *   other?: number, other_apps?: number,
  *   blocks?: MemoryBlock[],
  *   in_share?: number, borrowed?: number | null, gpu_borrowed?: number, allocated_pct?: number | null,
  *   fragmented_pct?: number | null, setting?: number | null, pool_offset?: number | null, smallest?: number | null,
- *   largest?: number | null, pool_shared?: number | null, dedicated_full?: boolean}} MemoryUse
+ *   largest?: number | null, pool_shared?: number | null, dedicated_full?: boolean, kept_free?: number | null,
+ *   beyond_dedicated?: number | null}} MemoryUse
  * @typedef {{category: string, pool: string, label: string, bytes: number,
  *   identity_group?: string, ids?: number[]}} MemoryBlock
  * @typedef {{id: string, place: string, state: string, count: number, capacity: number, bytes: number,
@@ -499,6 +509,10 @@ function getControlHelp(key, settings, details = {}) {
   if (key === "prompt_turn_ms")
     return "The least time a prompt is read before the answering conversations get their turn. 0 means one chunk " +
       "of the prompt. Longer turns switch less often between reading and answering.";
+  if (key === "vram_reserve_mib")
+    return "Graphics memory, in MiB, that Strata leaves free on each GPU for other programs and for its own buffers " +
+      "outside the pools. A change applies when a pool next grows, and at the next start when it is saved as the " +
+      "default; it does not resize a pool by itself.";
   if (key === "vram_conversations")
     return "Limits active conversations and idle GPU caches together. " +
       (settings.conversation_bytes ? `Each takes ${size(settings.conversation_bytes)} of fixed state ` +
@@ -518,8 +532,12 @@ function layOut(x) {
   parts.sort((a, b) => getOrder(a) - getOrder(b) || a.use.localeCompare(b.use));
   if (x.gpu_borrowed)
     parts.push({use: "borrowed", bytes: x.gpu_borrowed});
-  if (x.free != null)
-    parts.push({use: "free", bytes: x.free});
+  if (x.free != null) {
+    // (the reserve at the start of the free memory, the dedicated memory found unusable at its end)
+    const kept = Math.min(x.kept_free ?? 0, x.free), beyond = Math.min(x.beyond_dedicated ?? 0, x.free - kept);
+    parts.push(...[{use: "kept_free", bytes: kept}, {use: "free", bytes: x.free - kept - beyond},
+                   {use: "beyond_dedicated", bytes: beyond}].filter((p) => p.use === "free" || p.bytes > 0));
+  }
   const outside = x.other_apps ?? x.other;
   if (outside)
     parts.push({use: "other_apps", bytes: outside});

@@ -37,7 +37,8 @@
 // `memory_mib.gpu<N>.<card>` for a later card on the GPU of an earlier one,
 // `memory_mib.ram`: a pool takes and gives back memory in chunks of 256 MiB; a shrink evicts the experts of the
 // chunks it gives back and moves or pauses the conversations there), `tokens_min`, `tokens_max`, `context`,
-// `ssd_pause_mib`, `drafter` (off gives its weights back), `concurrent`, `vram_conversations`, `rows` and `lookahead`.
+// `ssd_pause_mib`, `drafter` (off gives its weights back), `concurrent`, `vram_conversations`, `rows`, `lookahead` and
+// `vram_reserve_mib` (PagedSettings::vram_reserve_mib).
 // The GPU residency count includes idle caches and their fixed regions, and cannot fall below `concurrent`.
 // Pool shrinks must accommodate the biggest decoding conversation at the end of its request and the token minimum.
 // The combined GPU token budget is independent of page padding. The per-conversation limit cannot exceed it or the
@@ -70,6 +71,12 @@ constexpr double kRefillBudgetMs = 10.0;
 /// chunk's end, so each chunk ends in a run too short for any expert: 0.36% of the Strix Halo's GPU pool in chunks of
 /// this size (docs/MEMORY_MANAGER_PLAN.md, M2f).
 constexpr uint64_t kChunkBytes = 256ull << 20;
+/// The GPU memory in MiB that the pools leave unallocated on each GPU when --vram-reserve-mib is not given (the old
+/// engines keep 700, strata-dsv41 600).  A provisional choice, not measured: above the 323 MiB
+/// free at which Windows paged a 20 GB card's memory and slowed decode (the old engine, #1376; see kWddmAutoReserveMib
+/// in src/models/qwen38/model.cpp), and two of the pools' chunks.  These engines lend the prompt paths their buffers
+/// from the pools, so less is allocated outside the pools than in the old engines.
+constexpr int64_t kDefaultVramReserveMib = 512;
 /// The smallest prompt chunk the engine lends buffers for, and the step between the chunks it tries
 /// (lend_prompt_buffers in paged_engine.cpp).
 constexpr int64_t kPromptChunkStep = 256;
@@ -91,6 +98,11 @@ struct PagedSettings {
     /// --gpu-mib, per card of a layer split (one value: every card's); empty: what each GPU has free less what it keeps
     std::vector<int64_t> gpu_mib;
     int64_t ram_mib = -1;                          ///< --ram-mib; -1: get_ram_room
+    /// --vram-reserve-mib (also --reserve-mib, strata-dsv41's name for it): the memory each GPU's pool leaves
+    /// unallocated, for other programs and for the engine's own allocations outside the pools (PagedModel::get_gpu_keep
+    /// adds what the model knows of these).  A change applies to the next growth that reaches the end of an integrated
+    /// GPU's dedicated memory and to the largest pool a change may ask for; it resizes nothing by itself.
+    int64_t vram_reserve_mib = kDefaultVramReserveMib;
     int64_t ssd_pause_mib = kDefaultSsdPauseMib;   ///< --ssd-pause-mib
     std::string pause_dir;                         ///< --pause-dir; empty: the temporary folder's <program name>
     std::string copy_back = "auto";                ///< --copy-back
@@ -108,6 +120,9 @@ struct PagedSettings {
     bool save_on_shutdown = false;
     int64_t step_profile = 0; ///< --step-profile 1 reports host elapsed times for each decode step.
     strata::spec::StepSettings step;               ///< --rows, --lookahead and --concurrent (default --batch)
+
+    /// Gets vram_reserve_mib in bytes.
+    uint64_t get_vram_reserve_bytes() const { return (uint64_t) vram_reserve_mib << 20; }
 };
 
 /// Runs the engine over `model`, whose start made `cards` (the GPUs' pools) and `ram` (the RAM's pool: experts and
@@ -144,6 +159,10 @@ strata::core::ChunkMemory get_gpu_chunk_memory(int dev, uint64_t chunk_bytes, bo
 /// Strix Halo (a 63.8 GiB share) a test program filled it to 55.6 GiB in chunks of 256 MiB, 58.7 in 64 MiB and 61.0
 /// in 16 MiB.  No value for another GPU, or on Linux.
 std::optional<uint64_t> get_share_top(int dev);
+/// Gets the bytes of integrated GPU `dev`'s dedicated memory that no program used when one of get_gpu_chunk_memory's
+/// chunks last went to shared memory instead: the share's size less get_share_top.  0 before any chunk did, for another
+/// GPU and on Linux.
+uint64_t get_unusable_share(int dev);
 /// Gets the bytes a pool on GPU `dev` takes: `gpu_mib` (--gpu-mib), but no more than `room`; -1: `room` but no more
 /// than `most`.  `room` gets what the pool could take: get_gpu_room(dev, keep).
 uint64_t get_gpu_pool_bytes(int dev, uint64_t keep, int64_t gpu_mib, uint64_t most, uint64_t& room);

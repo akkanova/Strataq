@@ -499,9 +499,10 @@ trained with, not a hard token limit.
 
 All are optional. Setup rewrites the config when run again and keeps keys it does not manage. The About tab's Model settings
 card edits some of them (the sampling defaults, `reasoning_budget_tokens`, `fit_max_tokens`, `anthropic_thinking`,
-`effort_position`, `aliases`, `idle_unload_s`, `lazy_load`, `engine_silence_s`, `api_monitor`, `open_browser` and
-`--vram-reserve-mib`). An empty field removes the key, the earlier file is kept as `strata-<model>.json.bak`, and the change
-applies at the next start. Network, key, MCP and program keys are not editable there.
+`effort_position`, `aliases`, `idle_unload_s`, `lazy_load`, `engine_silence_s`, `api_monitor` and `open_browser`).
+An empty field removes the key, the earlier file is kept as `strata-<model>.json.bak`, and the change applies at the
+next start. Network, key, MCP and program keys are not editable there. `--vram-reserve-mib` is set in `"args"`, or
+in the Memory panel of the page-pool engines ([below](#the-memory-panel)).
 
 | Key | Default | Effect |
 | --- | --- | --- |
@@ -1029,9 +1030,11 @@ the GPU keeps the size the runtime reports.
 
 `GET /v1/memory` returns `{"available", "loaded", "machine": {"ram_total", "ram_free", "gpus"}, "busy", "error", "at",
 "memories": [{"id", "name", "total", "free", "unified", "uses": {<use>: bytes}, "paused_count", "paused_budget",
-"other"}], "settings": {<key>: number}}`. `machine` is the server's own reading of the RAM and of the GPUs (the
-hardware sampler of `GET /metrics`). The engine's `ram` gets the machine's size and free RAM; `other` is what is in use
-in a memory beyond the uses the engine names (other programs, buffers the engine does not count). A value the engine
+"other"}], "settings": {<key>: number}}`; the page-pool engines' GPUs also have `kept_free` (the reserve) and
+`beyond_dedicated` (the part of the share found unusable) in bytes, from their `MEMORY` lines' `kept_free=<B>` and
+`beyond_dedicated=<B>` (`null` when the line has none). `machine` is the server's own reading of the RAM and of the GPUs
+(the hardware sampler of `GET /metrics`). The engine's `ram` gets the machine's size and free RAM; `other` is what is in
+use in a memory beyond the uses the engine names (other programs, buffers the engine does not count). A value the engine
 does not know is `null` or left out of `uses`. `busy` and `available` mean what they mean for `GET /api/context`.
 For a GPU whose memory is the system RAM, where the division can be read: `total` and `free` are the BIOS share's,
 `runtime_total` and `runtime_free` are what the runtime reported, `in_share` is what the engine holds in the share
@@ -1058,6 +1061,19 @@ A shrink frees the top chunks first. If another program frees memory between gro
 shared ones; the pool does not reorder them. `dedicated_full` says
 that the last growth stopped where the dedicated memory ended. Linux and discrete GPUs have no such check: their pools
 grow until the runtime has no more.
+
+The new engines leave `--vram-reserve-mib` free on each GPU, for other programs and for what they allocate outside
+their pools. The default is 512 MiB, less than the old engines' 700 (strata-dsv41's 600, which it calls
+`--reserve-mib`; the new engines take both names). The 512 is a choice, not a measurement: it is above the 323 MiB free at
+which Windows paged a 20 GB card's memory and slowed decode (the old engine, #1376), and the new engines lend the
+prompt buffers from their pools. At start, strata-q38's pools also leave room for what it allocates after them: 256 MiB
+a card (352 on a later card of a layer split), what the old engine measured after its expert cache (#4474), and the
+drafter's head. The Memory panel changes the reserve while the engine runs ("VRAM kept free for other programs",
+`vram_reserve_mib`). A change counts from the next growth: in the largest size the panel offers, and in what a growth
+that reaches the end of dedicated memory gives back. Saved as the default, it counts from the next start. It does not
+resize a pool by itself. The GPU's bar shows the reserve as "Kept free for other programs", at the start of the free
+memory (no more than is free). After a growth found where the dedicated memory ends, the part of the share that was
+still free then but could not be used shows as "Not usable as dedicated memory", at the end of the free memory.
 
 The engine's command (include/strata/common/serve/memory_report.hpp; the engine's `READY` line says `memory`):
 

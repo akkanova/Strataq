@@ -307,7 +307,6 @@ public:
     uint64_t get_drafter_weight_bytes(const PagedCard& card) const override {
         return m_.get_drafter_weight_bytes((int) card.index);
     }
-    uint64_t get_gpu_keep(const PagedCard&) const override { return (uint64_t) o_.reserve_mib << 20; }
     std::vector<strata::core::ExpertKey> get_card_ranking(int64_t lb, int64_t le, int64_t& max_experts) const override;
     bool load_expert(const PagedCard& card, strata::core::ExpertKey key, int32_t first, std::string& err) override;
     std::vector<int32_t>& get_residency() override { return residency_; }
@@ -494,7 +493,7 @@ strata::core::LayerSizes get_split_sizes(const Geometry& g, const std::vector<ui
 int read_model_options(int argc, char** argv, Options& o, ProgramOptions& x, std::string& eos);
 std::vector<strata::core::ExpertKey> get_ranking(const Model& m, int64_t lb, int64_t le, bool drafter);
 void add_ranks(const Model& m, int64_t lb, int64_t le, std::vector<strata::core::ExpertKey>& ranking);
-bool open_card_pool(const Model& m, const PagedSettings& s, const strata::core::StateLayout& layout, uint64_t keep,
+bool open_card_pool(const Model& m, const PagedSettings& s, const strata::core::StateLayout& layout,
                     int64_t max_experts, const std::vector<strata::core::ExpertKey>& ranking, PagedCard& card,
                     std::string& err);
 
@@ -511,6 +510,7 @@ int run_paged_engine(int argc, char** argv) {
     std::string eos = "1";
     if (const int status = read_model_options(argc, argv, o, x, eos); status >= 0)
         return status;
+    o.reserve_mib = settings.vram_reserve_mib;   // (the load's own sizing keeps the engine's reserve free too)
     if (x.layer_split.empty() && o.gpus.size() > 1)
         x.layer_split = "auto";
     if (settings.step.lookahead == 0)   // (no guesses: the drafter is not loaded, as --dspark none)
@@ -568,7 +568,7 @@ int run_paged_engine(int argc, char** argv) {
                     const int64_t mib = settings.gpu_mib.empty() ? -1 :
                         settings.gpu_mib[std::min(i, settings.gpu_mib.size() - 1)];
                     pools.push_back(mib < 0 ?
-                        strata::serve::get_gpu_room(stage_devices[i], (uint64_t) o.reserve_mib << 20) / copies :
+                        strata::serve::get_gpu_room(stage_devices[i], settings.get_vram_reserve_bytes()) / copies :
                         (uint64_t) mib << 20);
                 }
                 auto problem = strata::core::make_paged_split_problem(sizes, pools, 1, settings.tokens_min);
@@ -662,7 +662,7 @@ int run_paged_engine(int argc, char** argv) {
         int64_t most = x.gpu_experts;
         const auto ranking = model.get_card_ranking(card.lb, card.le, most);
         if (!model.get_card_layout(card, card.lb, card.le, stage_layout, err) ||
-            !open_card_pool(m, settings, stage_layout, (uint64_t) o.reserve_mib << 20, most, ranking, card, err)) {
+            !open_card_pool(m, settings, stage_layout, most, ranking, card, err)) {
             std::fprintf(stderr, "%s: %s\n", kProgram.c_str(), err.c_str());
             return 1;
         }
@@ -1371,10 +1371,12 @@ void add_ranks(const Model& m, int64_t lb, int64_t le, std::vector<strata::core:
 
 /// Opens `card`'s page pool for conversations of `layout` and the first `max_experts` experts of `ranking` (-1: every
 /// one) in the GPU memory the model left: --gpu-mib, by default what they and one conversation of the whole context
-/// take, leaving `keep` free.  Its page is the trunk's experts' (the drafter's take whole pages, a few bytes unused).
-bool open_card_pool(const Model& m, const PagedSettings& s, const strata::core::StateLayout& layout, uint64_t keep,
+/// take, leaving `s`'s reserve free.  Its page is the trunk's experts' (the drafter's take whole pages, a few bytes
+/// unused).
+bool open_card_pool(const Model& m, const PagedSettings& s, const strata::core::StateLayout& layout,
                     int64_t max_experts, const std::vector<strata::core::ExpertKey>& ranking, PagedCard& card,
                     std::string& err) {
+    const uint64_t keep = s.get_vram_reserve_bytes();
     const std::vector<uint64_t> blobs = m.get_expert_bytes();
     const uint64_t page =
         strata::core::choose_expert_page_bytes({blobs.begin(), blobs.begin() + m.geometry().nl});

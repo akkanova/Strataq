@@ -7,12 +7,14 @@
 #include "strata/base/gpu/on_device.hpp"
 #include "strata/base/gpu/gfx_arch.hpp"
 #include "strata/common/artifact/gguf_reader.hpp"
+#include "strata/common/experts/auto_cache.hpp"
 #include "strata/base/gpu/runtime.hpp"
 #include "strata/models/qwen38/prompt_images.hpp"
 #include "strata/common/experts/card_rules.hpp"
 #include "strata/common/experts/expert_pages.hpp"
 #include "strata/common/experts/expert_swaps.hpp"
 #include "strata/common/experts/ram_experts.hpp"
+#include "strata/common/experts/split_walk.hpp"
 #include "strata/common/kernels/cpu/expert_layout.hpp"
 #include "strata/common/kernels/mrope.hpp"
 #include "strata/common/serve/paged_engine.hpp"
@@ -31,6 +33,7 @@
 #include "strata/models/qwen38/model.hpp"
 #include "strata/models/qwen38/options.hpp"
 #include "strata/models/qwen38/session_identity.hpp"
+#include "strata/models/qwen38/stage_reserve.hpp"
 
 #include <cuda_runtime.h>
 
@@ -324,8 +327,8 @@ private:
 std::string get_split_hop_refusal(const Options& o);
 std::vector<uint64_t> get_blob_bytes(const Model& m);
 PagedCard& add_card(Model& m, Conversation& conv, PagedCards& cards, ModelCards& model_cards, GpuStage* stage);
-bool open_pages(Model& m, PagedCard& card, ModelCard& mc, int64_t tokens_min, int64_t gpu_mib, int64_t max_experts,
-                std::string& err);
+bool open_pages(Model& m, PagedCard& card, ModelCard& mc, const PagedSettings& s, int64_t gpu_mib,
+                int64_t max_experts, std::string& err);
 bool open_ram(Model& m, const PagedCards& cards, const ModelCards& model_cards, const PagedSettings& s,
               strata::core::RamExperts& ram, double& copy_back_gain, std::string& err);
 bool init_card_paths(Model& m, Conversation& conv, PagedCards& cards, ModelCards& model_cards, SplitDrive& split,
@@ -378,6 +381,10 @@ int run_paged_engine(int argc, char** argv) {
         std::fprintf(stderr, "strata-q38: --lookahead needs --mtp or --suffix-draft above 0\n");
         return 2;
     }
+    // The paged engine owns the reserve, including its default. This also bypasses model.cpp's automatic
+    // 2560 MiB floor on Windows discrete HIP GPUs >= 15 GiB; that floor has not been measured for this engine.
+    o.vram_reserve_mib = (int) settings.vram_reserve_mib;
+    o.vram_reserve_given = true;
     // The MTP's weights are loaded only with a lookahead; no K/V streaming or elastic K/V (the pool
     // replaces them); the batch slots are the engine's own conversations, not the old engine's sessions of the whole
     // context; the experts from the model's files, the RAM's pool in place of the RAM copy or the arena
@@ -425,12 +432,11 @@ int run_paged_engine(int argc, char** argv) {
             std::fprintf(stderr, "strata-q38: WARNING: the experts are read through the file cache (%s)\n",
                          why.c_str());
         PagedCard& card = add_card(m, conv, cards, model_cards, nullptr);
-        return open_pages(m, card, model_cards[card.index], settings.tokens_min, get_gpu_mib(0), max_experts, err);
+        return open_pages(m, card, model_cards[card.index], settings, get_gpu_mib(0), max_experts, err);
     };
     m.open_stage_pages = [&](GpuStage& st, std::string& err) {
         PagedCard& card = add_card(m, conv, cards, model_cards, &st);
-        return open_pages(m, card, model_cards[card.index], settings.tokens_min, get_gpu_mib(card.index),
-                          o.expert_cache, err);
+        return open_pages(m, card, model_cards[card.index], settings, get_gpu_mib(card.index), o.expert_cache, err);
     };
     if (const int status = m.load(); status != 0) return status;
     if (const int status = m.build_hit_tables(false); status != 0) return status;
@@ -622,12 +628,17 @@ bool get_card_layout(const Model& m, const PagedCard& card, const ModelCard& mc,
     return true;
 }
 
-/// Gets the GPU memory `card`'s pool leaves free besides what is allocated there: --vram-reserve-mib, and the drafter's
-/// head when the card runs it (has_drafter) and has not bound it.  Before the start binds the head (`started` false),
-/// also the head, which the GPU's free memory still holds.  (The prompt path's buffers are lent from the pool.)
+/// Gets the GPU memory `card`'s pool leaves free for the model besides the engine's reserve and what is allocated
+/// there: the drafter's head when the card runs it (has_drafter) and has not bound it.  Before the start (`started`
+/// false), also what the start allocates on the card after its pool: the head, and what the old engine measured after
+/// its expert cache (kLateAllocMib: the BLAS libraries' handles and workspaces, the modules loaded on first use and
+/// the verify windows; on a later stage of a layer split, kStageLateAllocMib and kWindowMib).  (The prompt path's
+/// buffers are lent from the pool.)
 uint64_t get_gpu_keep(const Model& m, const ModelCard& card, bool started) {
     const uint64_t head = (card.stage != nullptr ? card.stage->head : m.native_head).row_bytes();
-    return ((uint64_t) m.o.vram_reserve_mib << 20) +
+    const int64_t late_mib = started ? 0 : card.stage == nullptr ? strata::core::kLateAllocMib :
+        strata::program::split_walk::kStageLateAllocMib + strata::program::stage_reserve::kWindowMib;
+    return ((uint64_t) late_mib << 20) +
            (has_drafter(m, card) && (!started || m.mtp.vram_bytes() == 0) ? m.mtp.bind_bytes(head, m.n_vocab) : 0);
 }
 
@@ -1487,12 +1498,12 @@ PagedCard& add_card(Model& m, Conversation& conv, PagedCards& cards, ModelCards&
 /// Opens `card`'s expert cache (in `mc`) in the pages of its page pool, for at most `max_experts` experts
 /// (Model::open_expert_pages, open_stage_pages); with a layer split, for those of the expert profile's first
 /// `max_experts` that are of the card's layers, so that the cards hold the experts one GPU would.  The pool takes
-/// `gpu_mib` (-1: what get_gpu_room gives, but no more than those experts (the profile's first) and a conversation at
-/// --max-context take), in chunks of kChunkBytes; experts leave the pages of `tokens_min` tokens free.  With the
-/// drafter (--mtp), the pool of the card that runs it (has_drafter) also keeps each conversation's drafter K/V, and
-/// the drafter's head stays out of it.
-bool open_pages(Model& m, PagedCard& card, ModelCard& mc, int64_t tokens_min, int64_t gpu_mib, int64_t max_experts,
-                std::string& err) {
+/// `gpu_mib` (-1: what get_gpu_room gives beyond `s`'s reserve and get_gpu_keep, but no more than those experts (the
+/// profile's first) and a conversation at --max-context take), in chunks of kChunkBytes; experts leave the pages of
+/// `s.tokens_min` tokens free.  With the drafter (--mtp), the pool of the card that runs it (has_drafter) also keeps
+/// each conversation's drafter K/V, and the drafter's head stays out of it.
+bool open_pages(Model& m, PagedCard& card, ModelCard& mc, const PagedSettings& s, int64_t gpu_mib,
+                int64_t max_experts, std::string& err) {
     const strata::core::OnDevice on(card.dev);
     const std::vector<strata::core::ExpertKey> ranking = get_card_ranking(m, card.lb, card.le, max_experts);
     const bool drafting = has_drafter(m, mc);
@@ -1505,12 +1516,12 @@ bool open_pages(Model& m, PagedCard& card, ModelCard& mc, int64_t tokens_min, in
     for (size_t i = 0; i < ranking.size() && (int64_t) i < max_experts; ++i)
         most += (blobs[(size_t) ranking[i].layer] + page - 1) / page * page;
     uint64_t room = 0;
-    const uint64_t keep = get_gpu_keep(m, mc, false);
+    const uint64_t keep = s.get_vram_reserve_bytes() + get_gpu_keep(m, mc, false);
     const uint64_t pool_b = strata::serve::get_gpu_pool_bytes(card.dev, keep, gpu_mib, most, room);
     const uint64_t chunk = strata::serve::get_chunk_bytes(pool_b, page);
     mc.cache->set_expert_bytes((int64_t) strata::kernels::cpu::expert_layout().max_blob);
     strata::core::PagePoolConfig config;
-    config.tokens_min = std::clamp<int64_t>(tokens_min, 0, m.o.max_context);
+    config.tokens_min = std::clamp<int64_t>(s.tokens_min, 0, m.o.max_context);
     strata::core::ChunkMemory memory = strata::serve::get_gpu_chunk_memory(card.dev, chunk, false);
     // with virtual memory the cache's arena is the range's first chunk, so that the pool's other chunks follow it
     uint8_t* arena = memory.contiguous ? memory.alloc(chunk) : nullptr;

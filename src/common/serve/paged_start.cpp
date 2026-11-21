@@ -54,6 +54,7 @@ int take_paged_options(int& argc, char** argv, const std::string& program, Paged
                        {"--decode-share-percent", &s.decode_share_percent},
                        {"--prompt-turn-ms", &s.prompt_turn_ms},
                        {"--gpu-mib", nullptr, &gpu_mib},      {"--ram-mib", &s.ram_mib},
+                       {"--vram-reserve-mib", &s.vram_reserve_mib}, {"--reserve-mib", &s.vram_reserve_mib},
                        {"--ssd-pause-mib", &s.ssd_pause_mib}, {"--rows", &rows},
                        {"--mtp-max-t", &mtp_rows},            {"--lookup-chain", &s.lookup_chain},
                        {"--lookup-chain-min", &s.lookup_chain_min},
@@ -85,6 +86,10 @@ int take_paged_options(int& argc, char** argv, const std::string& program, Paged
     argc = out;
     if (s.step_profile != 0 && s.step_profile != 1) {
         std::fprintf(stderr, "%s: --step-profile takes 0 or 1\n", name);
+        return 2;
+    }
+    if (s.vram_reserve_mib < 0 || s.vram_reserve_mib > INT32_MAX) {
+        std::fprintf(stderr, "%s: --vram-reserve-mib takes MiB from 0 to %d\n", name, INT32_MAX);
         return 2;
     }
     s.step.rows = (int) std::clamp<int64_t>(rows, 0, INT32_MAX);
@@ -213,6 +218,12 @@ std::optional<uint64_t> get_share_top(int dev) {
     const std::lock_guard<std::mutex> lock(share_tops_mutex);
     const auto it = share_tops.find(dev);
     return it != share_tops.end() ? it->second : share.size;
+}
+
+uint64_t get_unusable_share(int dev) {
+    strata::platform::GpuLocalMemory share;
+    const std::optional<uint64_t> top = get_share_top(dev);
+    return top && strata::core::read_share_use(dev, share) ? share.size - std::min(*top, share.size) : 0;
 }
 
 uint64_t get_gpu_pool_bytes(int dev, uint64_t keep, int64_t gpu_mib, uint64_t most, uint64_t& room) {

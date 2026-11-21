@@ -24,6 +24,14 @@
 .mem-bars [data-use="borrowed"] {   /* the RAM a GPU whose memory is system RAM holds beyond its BIOS share */
   background-image: repeating-linear-gradient(135deg, transparent 0 3px, rgba(0, 0, 0, .35) 3px 5px);
 }
+/* free memory no pool takes: the reserve for other programs, and dedicated memory a pool's growth found unusable */
+.mem-bars [data-use="kept_free"], .mem-bars [data-use="beyond_dedicated"] { background-color: transparent; }
+.mem-bars [data-use="kept_free"] {
+  background-image: repeating-linear-gradient(45deg, transparent 0 3px, var(--st-line) 3px 5px);
+}
+.mem-bars [data-use="beyond_dedicated"] {
+  background-image: repeating-linear-gradient(90deg, transparent 0 2px, var(--st-ink-soft) 2px 3px);
+}
 .mem-conversations { width: 100%; margin-top: var(--st-s-4); border-collapse: collapse; font-size: var(--st-fs-sm); }
 .mem-conversations th { text-align: left; font-weight: var(--st-fw-medium); color: var(--st-ink-muted); }
 .mem-conversations th, .mem-conversations td { padding: 3px var(--st-s-2) 3px 0;
