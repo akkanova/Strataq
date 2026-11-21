@@ -22,6 +22,7 @@
 #include "strata/base/gpu/dma_batch.hpp"
 #include "strata/common/kernels/spec_prob.hpp"
 #include "strata/common/kernels/spec_proposal.hpp"
+#include "strata/common/sample/row_runs.hpp"
 #include "strata/common/spec/step.hpp"
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -4882,7 +4883,7 @@ int Verifier::slot_row_draw(int S, int t, strata::kernels::SamplerParams& sp, co
     hist = nullptr;
     hlen = 0;
     if ((sp.greedy || sp.temperature <= 0.0f) && !pen && !bias) return 0;   // a plain greedy slot keeps the window's argmax token untouched
-    sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position): the solo window's draw for this position
+    sp.counter = strata::sample::get_row_counter(last_pos_b_[t]);
     if (!pen) { sp.penalty_last_n = 0; return 1; }
     std::vector<const int32_t*> tails(slots_.size(), nullptr);
     std::vector<int64_t> n_tails(slots_.size(), 0);
@@ -4963,26 +4964,20 @@ bool Verifier::sample_rows(int S, std::string& err) {
                 return false;
             }
         }
-        for (int t = 0; t < S;) {
+        strata::sample::for_each_row_run(S, last_rows_, last_pos_b_, lengths.data(),
+                                         [&](int t, int end, uint64_t counter) {
             strata::kernels::SamplerParams sp = slot_sp_[(size_t) last_rows_[t]];
             const int h = lengths[(size_t) t];
-            int end = t + 1;
-            while (end < S && last_rows_[end] == last_rows_[t] && last_pos_b_[end] == last_pos_b_[end - 1] + 1 &&
-                   lengths[(size_t) end] == h)
-                ++end;
-            if ((sp.greedy || sp.temperature <= 0.0f) && h == 0 && sp.logit_bias == nullptr) {
-                t = end;
-                continue;
-            }
-            sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position): the solo window's draw for this position
+            if ((sp.greedy || sp.temperature <= 0.0f) && h == 0 && sp.logit_bias == nullptr)
+                return;
+            sp.counter = counter;
             if (h == 0)
                 sp.penalty_last_n = 0;
             strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, end - t, (int) n_vocab_,
                                            h ? batch_history_device_ + offsets[(size_t) t] : nullptr, h, sp,
                                            m_out_ + t, cs_);
             any = true;
-            t = end;
-        }
+        });
     }
     const cudaError_t e = any ? cudaStreamSynchronize(cs_) : cudaSuccess;
     if (e != cudaSuccess) {

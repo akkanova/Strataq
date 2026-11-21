@@ -11,6 +11,7 @@
 #include "strata/base/platform/os.hpp"
 #include "strata/common/experts/ram_experts.hpp"
 #include "strata/common/experts/card_rules.hpp"
+#include "strata/common/sample/row_runs.hpp"
 #include "strata/common/serve/option_names.hpp"
 #include "strata/common/serve/paged_engine.hpp"
 #include "strata/common/serve/paged_model.hpp"
@@ -33,6 +34,7 @@ using strata::serve::print_response;
 namespace strata::ds4 {
 namespace {
 
+using strata::sample::get_row_counter;
 using strata::serve::PagedCard;
 using strata::serve::PagedCards;
 using strata::serve::PagedParts;
@@ -369,7 +371,7 @@ private:
     bool is_drafter_ready() const;
     bool go_to(int64_t pos, std::string& err);
     void end_prompt(Part& p);
-    int32_t sample(const Part& p);
+    int32_t sample(const Part& p, int64_t pos);
     /// Notes the LP line of `pick`, the token after `row`, from the head's logit row `logit_row`
     /// (Model::copy_logits_row; note_logprobs).
     void note_row_logprobs(const strata::spec::StepRow& row, int32_t pick, int logit_row) {
@@ -408,7 +410,6 @@ private:
     std::vector<PagedCard*> cards_;           ///< Stages in execution order.
     PagedCard* drafter_card_ = nullptr; ///< The last stage, which owns DSpark and its experts.
     Part* seated_ = nullptr;           ///< the conversation the model computes (Part::take_seat), or null
-    uint64_t counter_ = 0;             ///< the sampler's draw count, which the old engine keeps across requests
     uint64_t drafter_epoch_ = 0; ///< Increases when DSpark dense weights return.
     /// The largest chunk a prompt is read in: the load's (--prefill-chunk, else the old engine's rule; 0: windows).
     int64_t prompt_ceiling_ = 0;
@@ -862,7 +863,7 @@ bool PagedDeepSeek::read_prompt(const PagedParts& parts, const std::vector<int64
         end_prompt(p);
         p.primed_pos = end;
         p.primed_token = tokens.back();
-        p.primed_pick = sample(p);
+        p.primed_pick = sample(p, end);
         note_row_logprobs({(int) p.id() - 1, p.primed_token, end}, p.primed_pick, -1);
     }
     return on_chunk(from, n, err);
@@ -929,18 +930,18 @@ bool PagedDeepSeek::run_rows(const std::vector<strata::spec::StepRow>& rows, std
             if (p.prompt_open)
                 end_prompt(p);
             const auto& s = p.smp;
+            const uint64_t counter = get_row_counter(rows[pending[(size_t) window.first]].pos);
             if (window.count == 1) {
                 picks[pending[(size_t) window.first]] = m_.sample_row(window.first, s.temperature, s.top_p,
-                    s.top_k, s.min_p, s.seed, counter_++);
+                    s.top_k, s.min_p, s.seed, counter);
                 continue;
             }
             std::vector<int> drafts, got;
             for (int i = 1; i < window.count; ++i)
                 drafts.push_back(tokens[(size_t) window.first + i]);
             if (!m_.pick_joint_rows(window.session, window.first, drafts, s.temperature, s.top_p, s.top_k,
-                                    s.min_p, s.seed, counter_, got, err))
+                                    s.min_p, s.seed, counter, got, err))
                 return false;
-            counter_ += got.size();
             for (size_t i = 0; i < got.size(); ++i)
                 picks[pending[(size_t) window.first + i]] = got[i];
         }
@@ -958,7 +959,7 @@ bool PagedDeepSeek::run_rows(const std::vector<strata::spec::StepRow>& rows, std
         p.take_seat();
         const strata::serve::Sampling& s = p.smp;
         if (!go_to(row.pos, err) || !m_.verify_rows(row.token, drafts, s.temperature, s.top_p, s.top_k, s.min_p,
-                                                    s.seed, counter_, got, err))
+                                                    s.seed, get_row_counter(row.pos), got, err))
             return false;
         std::copy(got.begin(), got.end(), picks.begin());
         verified_ = (int) got.size();
@@ -984,7 +985,7 @@ bool PagedDeepSeek::run_rows(const std::vector<strata::spec::StepRow>& rows, std
         return false;
     if (closes)
         end_prompt(p);
-    picks[0] = sample(p);
+    picks[0] = sample(p, row.pos);
     note_row_logprobs(row, picks[0], -1);
     return true;
 }
@@ -1025,13 +1026,13 @@ void PagedDeepSeek::sample_pending_rows(GroupRows& g) {
         if (p.prompt_open)
             end_prompt(p);
         const auto& s = p.smp;
-        g.picks[g.pending[r]] = m_.sample_row((int) r, s.temperature, s.top_p, s.top_k, s.min_p, s.seed, counter_++);
+        g.picks[g.pending[r]] = m_.sample_row((int) r, s.temperature, s.top_p, s.top_k, s.min_p, s.seed,
+                                              get_row_counter(g.rows[g.pending[r]].pos));
         note_row_logprobs(g.rows[g.pending[r]], g.picks[g.pending[r]], (int) r);
     }
 }
 
-// A verify window keeps the rows the step accepted; the sampler's draw count moves past every row with a pick, as the
-// old engine's does.
+// A verify window keeps the rows the step accepted.
 bool PagedDeepSeek::keep_rows(const std::vector<strata::spec::StepRow>& rows, const std::vector<int>& kept, bool,
                               std::string& err) {
     if (!joint_windows_.empty()) {
@@ -1047,7 +1048,6 @@ bool PagedDeepSeek::keep_rows(const std::vector<strata::spec::StepRow>& rows, co
     }
     if (verified_ == 0)
         return true;
-    counter_ += (uint64_t) verified_;
     return m_.keep_verified(kept[0], err);
 }
 
@@ -1061,7 +1061,7 @@ int PagedDeepSeek::propose(strata::serve::PagedPart& last, int session, int32_t 
     std::vector<int> drafts;
     std::vector<float> conf;
     const strata::serve::Sampling& s = p.smp;
-    if (!m_.draft(token, drafts, conf, err, s.temperature, s.top_p, s.top_k, s.min_p, s.seed, counter_))
+    if (!m_.draft(token, drafts, conf, err, s.temperature, s.top_p, s.top_k, s.min_p, s.seed, get_row_counter(pos)))
         return -1;
     const int keep = std::min({n, (int) drafts.size(), (int) conf.size()});
     if (!m_.save_joint_draft(session, keep, err))
@@ -1087,7 +1087,7 @@ bool PagedDeepSeek::propose_batch(std::vector<strata::spec::DraftRequest>& reque
             continue;
         const auto& sampling = p.smp;
         batch.push_back({r.session, r.token, r.limit, r.pos, sampling.temperature, sampling.top_p,
-                         sampling.min_p, sampling.top_k, sampling.seed, counter_, {}, {}});
+                         sampling.min_p, sampling.top_k, sampling.seed, get_row_counter(r.pos), {}, {}});
         pending.push_back(i);
     }
     if (!m_.draft_conversations(batch, [&](int i) {
@@ -1171,10 +1171,10 @@ void PagedDeepSeek::end_prompt(Part& p) {
     p.pin_next = p.prompt_open = false;
 }
 
-/// Gets the token after the model's last logits by `p`'s request's sampling.
-int32_t PagedDeepSeek::sample(const Part& p) {
+/// Draws the token after the model's last logits, which read the token at `pos`, by `p`'s request's sampling.
+int32_t PagedDeepSeek::sample(const Part& p, int64_t pos) {
     const strata::serve::Sampling& s = p.smp;
-    return m_.sample(s.temperature, s.top_p, s.top_k, s.min_p, s.seed, counter_++);
+    return m_.sample(s.temperature, s.top_p, s.top_k, s.min_p, s.seed, get_row_counter(pos));
 }
 
 /// Makes the model's state the seated conversation's at `pos` tokens: it is there, or one past it when the prompt's
