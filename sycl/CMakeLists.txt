@@ -143,7 +143,7 @@ target_include_directories(strata_includes INTERFACE
 target_compile_options(strata_includes INTERFACE -Wall -Wextra)
 
 # --- CPU-side pieces, identical to the top-level build ------------------------------------------------------------
-strata_resolve(_spec src/common/spec/suffix_drafter.cpp src/common/spec/controller.cpp
+strata_resolve(_spec src/common/spec/suffix_drafter.cpp
                     src/common/spec/draft_policy.cpp src/common/spec/draft_source.cpp)
 add_library(strata_spec STATIC ${_spec})
 target_link_libraries(strata_spec PUBLIC strata_includes)

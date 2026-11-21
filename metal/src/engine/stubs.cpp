@@ -109,7 +109,6 @@
 #include "strata/base/platform/host_limits.hpp"
 #include "strata/base/platform/memory.hpp"
 #include "strata/models/qwen38/ngram/ple_reader.hpp"
-#include "strata/common/spec/controller.hpp"
 #include "strata/common/spec/draft_policy.hpp"
 #include "strata/common/spec/draft_source.hpp"
 #include "strata/common/spec/suffix_drafter.hpp"
