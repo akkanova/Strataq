@@ -45,12 +45,8 @@ std::vector<int32_t> get_ranked_layers() {
 
 /// Gets the problem of a 3060 (12 GB, x4 link) then a 3080 (20 GB, x16) whose engine takes `mem_3060` and `mem_3080`.
 SplitProblem get_3060_3080(uint64_t mem_3060, uint64_t mem_3080) {
-    SplitProblem p = make_paged_split_problem(get_sizes(), {mem_3060, mem_3080}, 1, 8192);
-    p.cards[0] = {get_layer_ms(28, 1.78), 1.0};
-    p.cards[1] = {get_layer_ms(68, 1.71), 1.0};
-    const std::vector<double> scale = strata::program::split_rules::link_miss_scale({3.2, 24.0});
-    p.cards[0].miss_scale = scale[0];
-    p.cards[1].miss_scale = scale[1];
+    SplitProblem p = make_paged_split_problem(get_sizes(), {mem_3060, mem_3080},
+                                              {get_layer_ms(28, 1.78), get_layer_ms(68, 1.71)}, {3.2, 24.0}, 1, 8192);
     p.ranked_layers = get_ranked_layers();
     return p;
 }
@@ -75,8 +71,7 @@ void check_fills(const SplitPlan& plan, int64_t n_layers) {
 int main() {
     const char* log = "layer_split_test: ";
     {   // two equal cards with room for everything: every cut holds the whole profile, so the balanced one wins
-        SplitProblem p = make_paged_split_problem(get_sizes(), {80 * kGiB, 80 * kGiB}, 1, 8192);
-        p.cards = {{1.0, 1.0}, {1.0, 1.0}};
+        SplitProblem p = make_paged_split_problem(get_sizes(), {80 * kGiB, 80 * kGiB}, {1.0, 1.0}, {0, 0}, 1, 8192);
         p.ranked_layers = get_ranked_layers();
         const SplitPlan plan = plan_layer_split(p, log);
         CHECK(plan.cuts == std::vector<int64_t>{24});
@@ -117,15 +112,14 @@ int main() {
     }
     {   // a pick with a tiny card is searched again with at least three layers per card (#1616): a card so fast that
         // one layer on the other is best
-        SplitProblem p = make_paged_split_problem(get_sizes(), {80 * kGiB, 80 * kGiB}, 1, 8192);
-        p.cards = {{5.0, 1.0}, {1.0, 1.0}};
+        SplitProblem p = make_paged_split_problem(get_sizes(), {80 * kGiB, 80 * kGiB}, {5.0, 1.0}, {0, 0}, 1, 8192);
         p.ranked_layers = get_ranked_layers();
         const SplitPlan plan = plan_layer_split(p, log);
         CHECK(plan.cuts.size() == 1 && plan.cuts[0] >= strata::program::split_rules::kMinStageLayers);
     }
     {   // four equal cards (the memoised search): the balanced placement
-        SplitProblem p = make_paged_split_problem(get_sizes(), {40 * kGiB, 40 * kGiB, 40 * kGiB, 40 * kGiB}, 1, 8192);
-        p.cards.assign(4, {1.0, 1.0});
+        SplitProblem p = make_paged_split_problem(get_sizes(), std::vector<uint64_t>(4, 40 * kGiB),
+                                                  std::vector<double>(4, 1.0), std::vector<double>(4, 0), 1, 8192);
         p.ranked_layers = get_ranked_layers();
         p.coverage_curve = true;
         const SplitPlan plan = plan_layer_split(p, log);
@@ -137,8 +131,17 @@ int main() {
         CHECK(s.get_range_bytes(0, 4, 0, 0) == 4 * (56ull << 20));
         CHECK(s.get_range_bytes(0, 4, 2, 10) == 4 * (56ull << 20) + 2 * (3 * (3ull << 20) + 10 * 1184));
     }
+    {   // Preserve stage order when one host link is slower and another could not be measured.
+        const SplitProblem p = make_paged_split_problem(get_sizes(), {kGiB, 2 * kGiB, 3 * kGiB},
+                                                        {3.0, 1.0, 2.0}, {1.6, 24.0, 0}, 1, 8192);
+        CHECK(p.cards.size() == 3);
+        CHECK(p.cards[0].layer_ms == 3.0 && p.cards[1].layer_ms == 1.0 && p.cards[2].layer_ms == 2.0);
+        CHECK(p.cards[0].miss_scale > p.cards[1].miss_scale);
+        CHECK(p.cards[1].miss_scale == 1.0 && p.cards[2].miss_scale == 1.0);
+        CHECK(p.room(2, 0, 4) - p.room(0, 0, 4) == 2 * (int64_t) kGiB);
+    }
     {   // one card: nothing to plan
-        SplitProblem p = make_paged_split_problem(get_sizes(), {80 * kGiB}, 1, 8192);
+        const SplitProblem p = make_paged_split_problem(get_sizes(), {80 * kGiB}, {1.0}, {0}, 1, 8192);
         CHECK(plan_layer_split(p, log).cuts.empty());
     }
     if (failed == 0) std::printf("layer_split_test: all passed\n");

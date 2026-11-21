@@ -322,7 +322,7 @@ private:
 std::string get_split_hop_refusal(const Options& o);
 std::vector<uint64_t> get_blob_bytes(const Model& m);
 PagedCard& add_card(Model& m, Conversation& conv, PagedCards& cards, ModelCards& model_cards, GpuStage* stage);
-bool open_pages(Model& m, PagedCard& card, ModelCard& mc, int64_t tokens_min, int64_t gpu_mib, int64_t max_experts,
+bool open_pages(Model& m, PagedCard& card, ModelCard& mc, const PagedSettings& s, int64_t max_experts,
                 std::string& err);
 bool open_ram(Model& m, const PagedCards& cards, const ModelCards& model_cards, const PagedSettings& s,
               strata::core::RamExperts& ram, double& copy_back_gain, std::string& err);
@@ -413,21 +413,17 @@ int run_paged_engine(int argc, char** argv) {
     Conversation conv;
     PagedCards cards;
     ModelCards model_cards;
-    const auto get_gpu_mib = [&](size_t card) {
-        return settings.gpu_mib.empty() ? -1 : settings.gpu_mib[std::min(card, settings.gpu_mib.size() - 1)];
-    };
     m.open_expert_pages = [&](int64_t max_experts, std::string& err) {
         // from here on the experts are read from the files without the file cache
         if (std::string why; !m.src.read_unbuffered(why))
             std::fprintf(stderr, "strata-q38: WARNING: the experts are read through the file cache (%s)\n",
                          why.c_str());
         PagedCard& card = add_card(m, conv, cards, model_cards, nullptr);
-        return open_pages(m, card, model_cards[card.index], settings.tokens_min, get_gpu_mib(0), max_experts, err);
+        return open_pages(m, card, model_cards[card.index], settings, max_experts, err);
     };
     m.open_stage_pages = [&](GpuStage& st, std::string& err) {
         PagedCard& card = add_card(m, conv, cards, model_cards, &st);
-        return open_pages(m, card, model_cards[card.index], settings.tokens_min, get_gpu_mib(card.index),
-                          o.expert_cache, err);
+        return open_pages(m, card, model_cards[card.index], settings, o.expert_cache, err);
     };
     if (const int status = m.load(); status != 0) return status;
     if (const int status = m.build_hit_tables(false); status != 0) return status;
@@ -1403,40 +1399,29 @@ std::string get_split_hop_refusal(const Options& o) {
     return strata::core::get_hop_refusal(devices);
 }
 
-/// Adds the card that runs layers [lb, le) of `m` to `cards` and its model side to `model_cards`: CUDA0's (card 0,
-/// over the Model's own cache and session and `conv`'s windows) or the layer split's stage `stage`.  Its link to RAM
-/// is measured before its pool takes the memory the measuring copies need, and its speed is predicted from its
-/// multiprocessors and clock.
+/// Pairs a paged card with the Model's cache and session, or those of a layer-split stage, and conv's windows.
 PagedCard& add_card(Model& m, Conversation& conv, PagedCards& cards, ModelCards& model_cards, GpuStage* stage) {
-    PagedCard& card = cards.emplace_back();
+    PagedCard& card = strata::serve::add_paged_card(
+        cards, stage != nullptr ? stage->dev : m.primary_device, stage != nullptr ? stage->lb : 0,
+        stage != nullptr ? stage->le : m.split_at.empty() ? m.g.n_layers : m.split_at[0], m.g.n_layers,
+        m.stage_weights_trimmed, kProgram, strata::kernels::cpu::expert_layout().max_blob);
     ModelCard& mc = model_cards.emplace_back();
-    card.index = cards.size() - 1;
-    card.dev = stage != nullptr ? stage->dev : m.primary_device;
-    card.lb = stage != nullptr ? stage->lb : 0;
-    card.le = stage != nullptr ? stage->le : m.split_at.empty() ? m.g.n_layers : m.split_at[0];
-    const bool shared =
-        std::any_of(cards.begin(), cards.end() - 1, [&](const PagedCard& c) { return c.dev == card.dev; });
-    card.id = "gpu" + std::to_string(card.dev) + (shared ? "." + std::to_string(card.index) : "");
     mc.stage = stage;
     mc.cache = stage != nullptr ? &stage->cache : &m.xcache;
     mc.own = stage != nullptr ? &stage->ss : &m.ss;
     mc.cs = stage != nullptr ? (void*) stage->stream : m.main_cs;
     mc.ver = stage != nullptr ? &stage->ver : &conv.ver;
     mc.sp = stage != nullptr ? &stage->sp : &conv.sp;
-    card.weights_lb = m.stage_weights_trimmed ? card.lb : 0;
-    card.weights_le = m.stage_weights_trimmed ? card.le : m.g.n_layers;
-    strata::serve::measure_card(card, kProgram, strata::kernels::cpu::expert_layout().max_blob);
     return card;
 }
 
 /// Opens `card`'s expert cache (in `mc`) in the pages of its page pool, for at most `max_experts` experts
 /// (Model::open_expert_pages, open_stage_pages); with a layer split, for those of the expert profile's first
-/// `max_experts` that are of the card's layers, so that the cards hold the experts one GPU would.  The pool takes
-/// `gpu_mib` (-1: what get_gpu_room gives, but no more than those experts (the profile's first) and a conversation at
-/// --max-context take), in chunks of kChunkBytes; experts leave the pages of `tokens_min` tokens free.  With the
+/// `max_experts` that are of the card's layers, so that the cards hold the experts one GPU would.  The pool's size,
+/// chunks and conversation reserve come from plan_card_pool for those experts and --max-context. With the
 /// drafter (--mtp), the pool of the card that runs it (has_drafter) also keeps each conversation's drafter K/V, and
 /// the drafter's head stays out of it.
-bool open_pages(Model& m, PagedCard& card, ModelCard& mc, int64_t tokens_min, int64_t gpu_mib, int64_t max_experts,
+bool open_pages(Model& m, PagedCard& card, ModelCard& mc, const PagedSettings& s, int64_t max_experts,
                 std::string& err) {
     const strata::core::OnDevice on(card.dev);
     const std::vector<strata::core::ExpertKey> ranking = get_card_ranking(m, card.lb, card.le, max_experts);
@@ -1446,16 +1431,10 @@ bool open_pages(Model& m, PagedCard& card, ModelCard& mc, int64_t tokens_min, in
     strata::core::StateLayout layout;
     if (!ConversationPages::get_layout(m.g, *mc.own, drafting ? &m.mtp.kv_state() : nullptr, layout, err))
         return false;
-    uint64_t most = strata::serve::get_conversation_bytes(layout, m.o.max_context, page);
-    for (size_t i = 0; i < ranking.size() && (int64_t) i < max_experts; ++i)
-        most += (blobs[(size_t) ranking[i].layer] + page - 1) / page * page;
-    uint64_t room = 0;
-    const uint64_t keep = get_gpu_keep(m, mc, false);
-    const uint64_t pool_b = strata::serve::get_gpu_pool_bytes(card.dev, keep, gpu_mib, most, room);
-    const uint64_t chunk = strata::serve::get_chunk_bytes(pool_b, page);
+    const strata::serve::CardPoolPlan plan = strata::serve::plan_card_pool(
+        card, s, layout, m.o.max_context, page, blobs, ranking, max_experts, get_gpu_keep(m, mc, false));
+    const uint64_t chunk = plan.config.chunk_bytes;
     mc.cache->set_expert_bytes((int64_t) strata::kernels::cpu::expert_layout().max_blob);
-    strata::core::PagePoolConfig config;
-    config.tokens_min = std::clamp<int64_t>(tokens_min, 0, m.o.max_context);
     strata::core::ChunkMemory memory = strata::serve::get_gpu_chunk_memory(card.dev, chunk, false);
     // with virtual memory the cache's arena is the range's first chunk, so that the pool's other chunks follow it
     uint8_t* arena = memory.contiguous ? memory.alloc(chunk) : nullptr;
@@ -1464,10 +1443,10 @@ bool open_pages(Model& m, PagedCard& card, ModelCard& mc, int64_t tokens_min, in
         return false;
     }
     if (!mc.cache->open((int64_t) (chunk / page), m.g.n_layers, m.g.n_expert, (int64_t) page, err, arena) ||
-        !card.experts.open(*mc.cache, std::move(memory), pool_b, layout, config, blobs, m.g.n_expert, max_experts,
-                           ranking, err))
+        !card.experts.open(*mc.cache, std::move(memory), plan.bytes, layout, plan.config, blobs, m.g.n_expert,
+                           max_experts, ranking, err))
         return false;
-    strata::serve::say_gpu_pool(kProgram, card, room, chunk, gpu_mib);
+    strata::serve::say_gpu_pool(kProgram, card, plan);
     return true;
 }
 

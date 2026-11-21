@@ -14,7 +14,7 @@
 #include "strata/common/serve/option_names.hpp"
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/nv_defaults.hpp"
-#include "strata/models/qwen38/adapt_decay.hpp"
+#include "strata/models/common/adapt_decay.hpp"
 #include "strata/models/qwen38/logits_selection.hpp"
 #include "strata/core/defaults_026.hpp"
 #include "strata/core/gfx12_chunk.hpp"

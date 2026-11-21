@@ -77,7 +77,7 @@ namespace strata::prefill { void set_nonresident_share(double share); }   // SYC
 #include "strata/common/kernels/mrope.hpp"
 #include "strata/models/qwen38/kernels/kv_q4.hpp"
 #include "strata/common/experts/split_rules.hpp"
-#include "strata/models/qwen38/adapt_decay.hpp"
+#include "strata/models/common/adapt_decay.hpp"
 #include "strata/models/qwen38/kernels/qsa.hpp"
 #include "strata/models/qwen38/native_head.hpp"
 #include "strata/models/qwen38/verify.hpp"

@@ -8,7 +8,6 @@
 #include "strata/common/experts/card_rules.hpp"
 #include "strata/common/experts/expert_swaps.hpp"
 #include "strata/common/experts/ram_tier.hpp"
-#include "strata/common/experts/split_rules.hpp"
 #include "strata/common/kernels/window_limits.hpp"
 #include "strata/common/serve/decode_selection.hpp"
 #include "strata/common/serve/conversation_residency.hpp"
@@ -2614,16 +2613,14 @@ std::vector<int64_t> PagedEngine::plan_cut() const {
             tokens = std::max(tokens, h->dec.pos + h->dec.max_new - h->dec.produced + settings_.step.lookahead + 1);
         }
     std::vector<uint64_t> pools;
-    std::vector<double> links;
+    std::vector<double> layer_ms, links;
     for (const PagedCard& card : cards_) {
         pools.push_back(card.experts.pool().report().total.bytes);
+        layer_ms.push_back(card.layer_ms);
         links.push_back(card.link.to_gbps);
     }
-    SplitProblem problem = make_paged_split_problem(sizes, pools, std::max<int64_t>(decoding, 1),
+    SplitProblem problem = make_paged_split_problem(sizes, pools, layer_ms, links, std::max<int64_t>(decoding, 1),
                                                     std::min(tokens, facts_.context));
-    const std::vector<double> miss_scale = strata::program::split_rules::link_miss_scale(links);
-    for (size_t k = 0; k < cards_.size(); ++k)
-        problem.cards[k] = {cards_[k].layer_ms, miss_scale[k]};
     for (const ExpertKey& key : facts_.split_ranking)
         problem.ranked_layers.push_back(key.layer);
     problem.can_start = [&](const std::vector<SplitFill>& fills) {

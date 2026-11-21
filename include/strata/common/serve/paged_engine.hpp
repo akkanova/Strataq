@@ -45,10 +45,12 @@
 // change nothing.
 #pragma once
 
+#include "strata/common/experts/layer_split.hpp"
 #include "strata/common/experts/ram_experts.hpp"
 #include "strata/common/serve/paged_model.hpp"
 #include "strata/common/spec/step.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -107,6 +109,11 @@ struct PagedSettings {
     bool save_on_shutdown = false;
     int64_t step_profile = 0; ///< --step-profile 1 reports host elapsed times for each decode step.
     strata::spec::StepSettings step;               ///< --rows, --lookahead and --concurrent (default --batch)
+
+    /// Gets card `card`'s --gpu-mib (the last value serves the cards beyond it), -1 when not given.
+    int64_t get_gpu_mib(size_t card) const {
+        return gpu_mib.empty() ? -1 : gpu_mib[std::min(card, gpu_mib.size() - 1)];
+    }
 };
 
 /// Runs the engine over `model`, whose start made `cards` (the GPUs' pools) and `ram` (the RAM's pool: experts and
@@ -127,29 +134,42 @@ int take_paged_options(int& argc, char** argv, const std::string& program, Paged
 /// Windows, no resource cache, so that the pools can shrink; when `hops_possible` (stages on separate GPUs) and
 /// `s.remote_experts` is not off, more hardware queues.
 void set_paged_runtime_env(const PagedSettings& s, bool hops_possible);
-/// Measures `card`'s link to RAM (PagedCard::link, and refill_batch for experts of up to `expert_bytes`) and predicts
-/// its speed from its multiprocessors and clock (layer_ms); says the link on stderr after `program`.  Call before the
-/// card's pool takes the memory the measuring copies need.
-void measure_card(PagedCard& card, const std::string& program, uint64_t expert_bytes);
+/// Adds a stage running [lb, le), named gpu<dev> with .<index> for repeated GPUs. With `trim_weights`, only its
+/// layers' weights stay loaded. Measures the link before pool allocation, reports it after `program`, and sets speed
+/// and refill_batch for `expert_bytes`-sized experts. Successful link measurements are reused per GPU.
+PagedCard& add_paged_card(PagedCards& cards, int dev, int64_t lb, int64_t le, int64_t n_layers, bool trim_weights,
+                          const std::string& program, uint64_t expert_bytes);
+/// Holds allocation limits and diagnostics for a GPU page pool.
+struct CardPoolPlan {
+    strata::core::PagePoolConfig config;   ///< page and chunk sizes, tokens_min; other fields keep their defaults
+    uint64_t bytes = 0;                    ///< what the pool takes
+    uint64_t room = 0;                     ///< what the pool could take (get_gpu_room)
+    int64_t gpu_mib = -1;                  ///< the card's --gpu-mib, -1 when not given
+};
+/// Sizes a pool using --gpu-mib, capped by get_gpu_room(dev, keep). The default also caps it at one max_context
+/// conversation plus ranking's first max_experts experts, rounded to pages; blob_bytes is indexed by layer.
+CardPoolPlan plan_card_pool(const PagedCard& card, const PagedSettings& s, const strata::core::StateLayout& layout,
+                            int64_t max_context, uint64_t page_bytes, const std::vector<uint64_t>& blob_bytes,
+                            const std::vector<strata::core::ExpertKey>& ranking, int64_t max_experts, uint64_t keep);
+/// Plans and reports DeepSeek's initial cuts using PagedEngine's planner, one tokens_min conversation, and experts
+/// in hottest-first ranked_layers order. Repeated GPUs share free memory unless --gpu-mib sets each stage's pool.
+/// Returns no cuts if planning fails.
+std::vector<int64_t> plan_start_split(const std::vector<int>& devices, const PagedSettings& s, uint64_t keep,
+                                      const strata::core::LayerSizes& sizes, std::vector<int32_t> ranked_layers,
+                                      const std::string& program);
 /// Gets GPU `dev`'s allocator of chunks of `chunk_bytes` (get_chunk_bytes).  On a GPU with virtual memory (vmm.hpp)
 /// the chunks are mapped back to back in one address range as large as the GPU's memory (ChunkMemory::contiguous), so
 /// that a pool's runs may cross them; else each is an allocation of its own.  Disable `zeroed` only when the adapter
 /// initializes every page before use.
 strata::core::ChunkMemory get_gpu_chunk_memory(int dev, uint64_t chunk_bytes, bool zeroed = true);
-/// Gets the bytes a pool on GPU `dev` takes: `gpu_mib` (--gpu-mib), but no more than `room`; -1: `room` but no more
-/// than `most`.  `room` gets what the pool could take: get_gpu_room(dev, keep).
-uint64_t get_gpu_pool_bytes(int dev, uint64_t keep, int64_t gpu_mib, uint64_t most, uint64_t& room);
 /// Gets the most bytes one conversation of `tokens` tokens in `layout` takes in pages of `page_bytes`: its regions'
 /// bytes and each region's last block, which it may fill only in part.
 uint64_t get_conversation_bytes(const strata::core::StateLayout& layout, int64_t tokens, uint64_t page_bytes);
 /// Gets the chunks' size of a pool of `pool_bytes` in pages of `page_bytes`: kChunkBytes, or the pool when smaller, in
 /// whole pages and, with virtual memory, whole units of its granularity.
 uint64_t get_chunk_bytes(uint64_t pool_bytes, uint64_t page_bytes);
-/// Says on stderr after `program` what `card`'s open pool took: of `room` it could take, its chunks of `chunk_bytes`
-/// (in one virtual range or not), its pages and the conversation tokens kept for the conversations; and that
-/// `gpu_mib` (--gpu-mib, -1 when not given) asked for more than `room`, when it did.
-void say_gpu_pool(const std::string& program, const PagedCard& card, uint64_t room, uint64_t chunk_bytes,
-                  int64_t gpu_mib);
+/// Reports the open pool's allocation and conversation reserve after `program`, warning if --gpu-mib exceeds room.
+void say_gpu_pool(const std::string& program, const PagedCard& card, const CardPoolPlan& plan);
 /// Gets the bytes the RAM's pool and its staging ring take: --ram-mib (`s`), by default get_ram_room(`headroom`) but
 /// no more than `most`.
 uint64_t get_ram_pool_bytes(const PagedSettings& s, uint64_t headroom, uint64_t most);

@@ -11,12 +11,12 @@
 #include "strata/base/platform/os.hpp"
 #include "strata/common/experts/ram_experts.hpp"
 #include "strata/common/experts/card_rules.hpp"
-#include "strata/common/experts/split_rules.hpp"
 #include "strata/common/serve/option_names.hpp"
 #include "strata/common/serve/paged_engine.hpp"
 #include "strata/common/serve/paged_model.hpp"
 #include "strata/common/state/restore_points.hpp"
 #include "strata/common/state/state_bytes.hpp"
+#include "strata/models/common/adapt_decay.hpp"
 
 #include <cuda_runtime.h>
 
@@ -561,27 +561,14 @@ int run_paged_engine(int argc, char** argv) {
                                   std::vector<int64_t>& chosen, std::string& why) {
             chosen = cuts;
             if (x.layer_split == "auto") {
-                const uint64_t page = strata::core::choose_expert_page_bytes(blobs);
-                const auto sizes = get_split_sizes(g, blobs, page);
-                std::vector<uint64_t> pools;
-                for (size_t i = 0; i < stage_devices.size(); ++i) {
-                    const auto copies = std::count(stage_devices.begin(), stage_devices.end(), stage_devices[i]);
-                    const int64_t mib = settings.gpu_mib.empty() ? -1 :
-                        settings.gpu_mib[std::min(i, settings.gpu_mib.size() - 1)];
-                    pools.push_back(mib < 0 ?
-                        strata::serve::get_gpu_room(stage_devices[i], (uint64_t) o.reserve_mib << 20) / copies :
-                        (uint64_t) mib << 20);
-                }
-                auto problem = strata::core::make_paged_split_problem(sizes, pools, 1, settings.tokens_min);
-                for (size_t i = 0; i < stage_devices.size(); ++i)
-                    problem.cards[i].layer_ms = strata::program::split_rules::get_layer_ms(
-                        strata::core::get_card_speed(stage_devices[i]));
+                std::vector<int32_t> ranked_layers;
                 const int64_t n = x.gpu_experts < 0 ? (int64_t) g.nl * g.n_exp : x.gpu_experts;
                 for (int64_t i = 0; i < n; ++i)
-                    problem.ranked_layers.push_back((int32_t) (i % g.nl));
-                const auto plan = strata::core::plan_layer_split(problem, "strata-ds41: layer split auto: ");
-                strata::core::print_layer_split(plan, problem.ranked_layers.size(), "strata-ds41: layer split auto: ");
-                chosen = plan.cuts;
+                    ranked_layers.push_back((int32_t) (i % g.nl));
+                chosen = strata::serve::plan_start_split(
+                    stage_devices, settings, (uint64_t) o.reserve_mib << 20,
+                    get_split_sizes(g, blobs, strata::core::choose_expert_page_bytes(blobs)), std::move(ranked_layers),
+                    kProgram);
             }
             int64_t previous = 0;
             for (int64_t cut : chosen) {
@@ -640,19 +627,10 @@ int run_paged_engine(int argc, char** argv) {
         std::fprintf(stderr, "%s: %s\n", kProgram.c_str(), err.c_str());
         return 1;
     }
-    for (size_t i = 0; i < devices.size(); ++i) {
-        PagedCard& card = cards.emplace_back();
-        card.index = i;
-        card.dev = devices[i];
-        card.lb = i == 0 ? 0 : cuts[i - 1];
-        card.le = i == cuts.size() ? g.nl : cuts[i];
-        card.weights_lb = !x.trim_stage_weights ? 0 : card.lb;
-        card.weights_le = !x.trim_stage_weights ? g.nl : card.le;
-        card.id = "gpu" + std::to_string(card.dev);
-        if (std::find(devices.begin(), devices.begin() + i, card.dev) != devices.begin() + i)
-            card.id += "." + std::to_string(i);
-        strata::serve::measure_card(card, kProgram, *std::max_element(blobs.begin(), blobs.end()));
-    }
+    for (size_t i = 0; i < devices.size(); ++i)
+        strata::serve::add_paged_card(cards, devices[i], i == 0 ? 0 : cuts[i - 1], i == cuts.size() ? g.nl : cuts[i],
+                                      g.nl, x.trim_stage_weights, kProgram,
+                                      *std::max_element(blobs.begin(), blobs.end()));
     if (has_drafter && !settings.drafter && !m.switch_drafter_weights(false, err)) {
         std::fprintf(stderr, "%s: %s\n", kProgram.c_str(), err.c_str());
         return 1;
@@ -1319,7 +1297,7 @@ int read_model_options(int argc, char** argv, Options& o, ProgramOptions& x, std
         else if (a == "--adapt-min-gain")
             x.adapt_min_gain = (float) std::atof(val("--adapt-min-gain").c_str());
         else if (a == "--adapt-decay")
-            x.adapt_decay = (float) std::atof(val("--adapt-decay").c_str());
+            x.adapt_decay = strata::program::adapt_decay_checked(std::atof(val("--adapt-decay").c_str()));
         else if (a == "--layer-split")
             x.layer_split = val("--layer-split");
         else if (a == "--split-device")
@@ -1377,31 +1355,22 @@ bool open_card_pool(const Model& m, const PagedSettings& s, const strata::core::
                     int64_t max_experts, const std::vector<strata::core::ExpertKey>& ranking, PagedCard& card,
                     std::string& err) {
     const std::vector<uint64_t> blobs = m.get_expert_bytes();
-    const uint64_t page =
-        strata::core::choose_expert_page_bytes({blobs.begin(), blobs.begin() + m.geometry().nl});
     if (max_experts < 0)
         max_experts = (int64_t) ranking.size();
-    uint64_t most = strata::serve::get_conversation_bytes(layout, m.max_context(), page), room = 0;
-    for (size_t i = 0; i < ranking.size() && (int64_t) i < max_experts; ++i)
-        most += (blobs[(size_t) ranking[i].layer] + page - 1) / page * page;
-    const int64_t mib = s.gpu_mib.empty() ? -1 : s.gpu_mib[std::min(card.index, s.gpu_mib.size() - 1)];
-    const uint64_t bytes = strata::serve::get_gpu_pool_bytes(card.dev, keep, mib, most, room);
-    strata::core::PagePoolConfig config;
-    config.page_bytes = page;
-    config.chunk_bytes = strata::serve::get_chunk_bytes(bytes, page);
-    config.tokens_min = std::clamp<int64_t>(s.tokens_min, 0, m.max_context());
-    config.label = "Expert and conversation pool";
-    config.label_expert = [layers = m.geometry().nl](strata::core::ExpertKey key, uint64_t bytes) {
+    strata::serve::CardPoolPlan plan = strata::serve::plan_card_pool(
+        card, s, layout, m.max_context(),
+        strata::core::choose_expert_page_bytes({blobs.begin(), blobs.begin() + m.geometry().nl}), blobs, ranking,
+        max_experts, keep);
+    plan.config.label_expert = [layers = m.geometry().nl](strata::core::ExpertKey key, uint64_t bytes) {
         return strata::core::MemoryLabel{"experts", "", (key.layer >= layers ? "Drafter / " : "") +
             strata::core::get_expert_memory_label(key.layer, bytes)};
     };
     const strata::core::OnDevice on(card.dev);
-    if (!card.experts.open(strata::serve::get_gpu_chunk_memory(card.dev, config.chunk_bytes), bytes, layout, config,
-                           blobs,
-                           m.geometry().n_exp, max_experts, ranking, err))
+    if (!card.experts.open(strata::serve::get_gpu_chunk_memory(card.dev, plan.config.chunk_bytes), plan.bytes,
+                           layout, plan.config, blobs, m.geometry().n_exp, max_experts, ranking, err))
         return false;
     card.experts.set_ranking(ranking, max_experts);   // (opened without a cache, it wants none of them until then)
-    strata::serve::say_gpu_pool(kProgram, card, room, config.chunk_bytes, mib);
+    strata::serve::say_gpu_pool(kProgram, card, plan);
     return true;
 }
 
