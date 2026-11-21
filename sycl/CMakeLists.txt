@@ -221,7 +221,7 @@ if(STRATA_NATIVE_EXPERTS)
 endif()
 
 # --- the GPU engine ------------------------------------------------------------------------------------------------
-strata_resolve(_core src/base/gpu/device.cu src/base/gpu/pinned.cu src/base/gpu/graph.cpp src/base/platform/memory.cpp
+strata_resolve(_core src/base/gpu/device.cu src/base/gpu/pinned.cu src/base/platform/memory.cpp
                      src/core/weights.cpp src/core/layout.cpp)
 add_library(strata_core STATIC ${_core})
 target_link_libraries(strata_core PUBLIC strata_includes)

@@ -6,7 +6,7 @@
 # the GPU engine of the CUDA and HIP builds (strata_core, strata_kernels, strata_prefill, strata_engine, strata, the DeepSeek and Qwen3.6 engines and their tests): shared by both backends
 macro(strata_gpu_engine)
 if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
-  add_library(strata_core STATIC src/base/gpu/device.cu src/base/gpu/pinned.cu src/base/gpu/graph.cpp
+  add_library(strata_core STATIC src/base/gpu/device.cu src/base/gpu/pinned.cu
                                src/base/platform/memory.cpp src/base/platform/io_priority.cpp src/core/weights.cpp
                                src/core/layout.cpp src/base/gpu/runtime.cu src/base/gpu/links.cu)
   target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -309,6 +309,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_tests_properties(host_graph_launch_test PROPERTIES TIMEOUT 30)
   endif()
   if(STRATA_BUILD_TESTS)
+    add_executable(shape_graph_cache_test tests/core/shape_graph_cache_test.cu)
+    target_include_directories(shape_graph_cache_test PRIVATE include)
+    target_link_libraries(shape_graph_cache_test PRIVATE ${_strata_gpu_runtime_target})
+    add_test(NAME shape_graph_cache_test COMMAND shape_graph_cache_test)
+    set_tests_properties(shape_graph_cache_test PROPERTIES TIMEOUT 30)
     # the memory manager's RAM tier (docs/MEMORY_MANAGER_PLAN.md M5): on host memory, through the runtime's copies;
     # the conversations' block tables on a GPU
     foreach(_t common/state/pool_copy common/state/pause_file common/experts/ram_experts
@@ -1540,16 +1545,6 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME cuda_device_selftest COMMAND strata-device --selftest)
   else()
     add_test(NAME hip_device_selftest COMMAND strata-device --selftest)
-  endif()
-
-  # ---- P2.S5: the GraphRegistry --------------------------------------------------
-  # A .cu because the test needs real kernels to capture; it links `strata_core` and not `strata_kernels`,
-  # because what it exercises is the capture machinery and not any kernel in it.
-  if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench/micro/graph_registry_test.cu")
-    add_executable(graph_registry_test bench/micro/graph_registry_test.cu)
-    target_include_directories(graph_registry_test PRIVATE ${_strata_gpu_include_directories})
-    target_link_libraries(graph_registry_test PRIVATE strata_core ${_strata_gpu_runtime_target})
-    add_test(NAME graph_registry_test COMMAND graph_registry_test)
   endif()
 
   # ---- P2.S5's GATE: is a device<->pinned-memory handoff graph-capturable? --------------------

@@ -19,6 +19,7 @@
 // [--force IDS] [--dump-full-logits F] (tools/qwen35/kl.py's reference interface), --bench-pp N / --bench-tg N.
 #include "strata/base/platform/env.hpp"
 #include "strata/base/gpu/memory_info.hpp"
+#include "strata/base/gpu/shape_graph_cache.hpp"
 #include "strata/common/artifact/gguf_reader.hpp"
 #include "strata/models/common/family_layout.hpp"
 #include "strata/common/serve/loop.hpp"
@@ -1185,13 +1186,11 @@ struct Engine {
     // the MTP block (when loaded)
     float *mtp_cat = nullptr, *hmtp = nullptr, *logits_m = nullptr;
     int32_t *tok_m = nullptr, *pos0_m = nullptr, *pick_m = nullptr;
-    // graphs: [0] the decode step, [T] a verify window of T rows, mtp1 the MTP draft step
-    // (the graphs hold the current session's state pointers as kernel arguments: one set per session)
-    struct GSet {
-        cudaGraphExec_t g1 = nullptr, gv[kVerify + 1] = {}, gm1 = nullptr;
-    };
-    std::vector<GSet> gsets;
-    GSet& gs() { return gsets[(size_t) cur]; }
+    /// The captured graphs by (session, kind): a session's graphs hold its state pointers as kernel arguments, so
+    /// each session has its own (kind 0: the decode step, T: a verify window of T rows, kMtpGraph: the MTP draft
+    /// step); session kRowsGraph holds the batch windows by (rows, groups, kind).
+    strata::core::ShapeGraphCache<std::pair<int, int>> graphs;
+    static constexpr int kMtpGraph = kVerify + 1, kRowsGraph = -1;
     strata::prefill::Gemm gemm;
     cublasHandle_t blas = nullptr;
     float* att_s = nullptr;            // the prompt attention's scores / probabilities, kAttScoreFloats floats
@@ -1480,7 +1479,6 @@ struct Engine {
             pick_m = dalloc_t<int32_t>(1);
         }
         sess.resize((size_t) n_sess);
-        gsets.resize((size_t) n_sess);
         describe_session();
         {   // the sessions' memory, said before it fails
             const size_t per = (size_t) layout.bytes_for(ctx);
@@ -2377,29 +2375,14 @@ struct Engine {
         att_p16 = dalloc_t<__half>(kAttScoreFloats);
         CK(cudaDeviceSynchronize());
     }
-    void reset_graphs() {
-        for (GSet& gset : gsets) {
-            for (cudaGraphExec_t* g : {&gset.g1, &gset.gm1})
-                if (*g) { CK(cudaGraphExecDestroy(*g)); *g = nullptr; }
-            for (auto& g : gset.gv)
-                if (g) { CK(cudaGraphExecDestroy(g)); g = nullptr; }
-        }
-        for (auto& kv : row_graphs)
-            if (kv.second) CK(cudaGraphExecDestroy(kv.second));
-        row_graphs.clear();
-    }
-
-    template <class F> void graph_run(cudaGraphExec_t& gx, F body) {
+    /// Runs `body`'s launches, through the graph captured for `kind` of session `sess_id` when graphs are on.
+    template <class F> void graph_run(int sess_id, int kind, F&& body) {
         if (!use_graph) { body(); return; }
-        if (!gx) {
-            cudaGraph_t graph = nullptr;
-            CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
-            body();
-            CK(cudaStreamEndCapture(st, &graph));
-            CK(cudaGraphInstantiate(&gx, graph, 0));
-            CK(cudaGraphDestroy(graph));
+        std::string err;
+        if (!graphs.run({sess_id, kind}, st, body, err)) {
+            std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
+            std::exit(1);
         }
-        CK(cudaGraphLaunch(gx, st));
     }
 
     // ---- pictures (--vision).  A request with pictures hands the engine its rows (the encoder's, in prompt order), the
@@ -2474,7 +2457,7 @@ struct Engine {
             rows_deferred = true;
             // a prompt cell of a picture request (its rotary position is in the table, its row a picture's) runs eagerly
             if (mtab_now || map_on) forward(1, pos, 1, false, false);
-            else graph_run(gs().g1, [&] { forward(1, pos, 1, use_graph, false); });
+            else graph_run(cur, 0, [&] { forward(1, pos, 1, use_graph, false); });
             mtab_now = nullptr;
             map_on = false;
             rows_deferred = false;
@@ -2518,17 +2501,11 @@ struct Engine {
     // ---- batch rows: one decode window for the next token of several sessions
     struct Row { int slot; int32_t tok; };
     long long win_count = 0;
-    std::map<int, cudaGraphExec_t> row_graphs;   // by (rows, groups, kind): graphs of the batch windows
     /// A slot's rows of one window: `n` consecutive cells from the session's position (1: the next token; 2: also an MTP
     /// proposal the window verifies).
     struct Group { int slot; int n; int32_t tok[2]; };
     int32_t rows_pick[kVerify] = {};
     int rows_G_last = 0;   // groups of the window run last (commit_rows takes their keep counts)
-
-    void run_graph_key(int key, const std::function<void()>& body) {
-        if (!use_graph) { body(); return; }
-        graph_run(row_graphs[key], body);
-    }
 
     /// One window over the groups' rows.  `verify`: a verify window - the GDN state is read, not written (commit_rows writes
     /// it for the kept rows) and the sessions' positions stay.  The greedy picks end up in rows_pick (one per row), every
@@ -2564,7 +2541,7 @@ struct Engine {
         rows_mode = true;
         rows_G = G;
         rows_deferred = true;
-        run_graph_key((verify ? 1000 : 0) + G * 10 + (T - G), [&] { forward(T, pmax, T, use_graph, verify); });
+        graph_run(kRowsGraph, (verify ? 1000 : 0) + G * 10 + (T - G), [&] { forward(T, pmax, T, use_graph, verify); });
         rows_deferred = false;
         rows_mode = false;
         CK(cudaMemcpyAsync(hrow + 32, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
@@ -2595,7 +2572,7 @@ struct Engine {
         CK(cudaMemcpyAsync(d_gcnt, hrow + 56, (size_t) G * 4, cudaMemcpyHostToDevice, st));
         rows_mode = true;
         rows_G = G;
-        run_graph_key(2000 + G, [&] {
+        graph_run(kRowsGraph, 2000 + G, [&] {
             for (size_t l = 0; l < m->layers.size(); ++l) {
                 const Layer& L = m->layers[l];
                 if (L.attn) continue;
@@ -2646,7 +2623,7 @@ struct Engine {
         rows_mode = true;
         rows_G = T;
         rows_deferred = true;
-        run_graph_key(3000 + T, [&] {
+        graph_run(kRowsGraph, 3000 + T, [&] {
             K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok_m, T, N, y, st);
             k_rms_ld<<<T, kThreads, 0, st>>>(y, N, m->mtp_enorm, mtp_cat, 2 * N, N, m->eps);                 // [e | ...]
             k_rms_ld<<<T, kThreads, 0, st>>>(mtp_seed(), N, m->mtp_hnorm, mtp_cat + N, 2 * N, N, m->eps);   // [... | h]
@@ -2728,7 +2705,7 @@ struct Engine {
             CK(cudaMemcpyAsync(pos0_m, hpin + 1, 4, cudaMemcpyHostToDevice, st));
             CK(cudaMemcpyAsync(seeds, hmtp + (size_t) last_row * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
             last_row = 0;
-            if (mtp_graph) graph_run(gs().gm1, [&] { forward_mtp(1, pos + d, seeds, true, use_graph); });
+            if (mtp_graph) graph_run(cur, kMtpGraph, [&] { forward_mtp(1, pos + d, seeds, true, use_graph); });
             else forward_mtp(1, pos + d, seeds, true, false);
             CK(cudaMemcpyAsync(hpin + 2, pick_m, 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
@@ -2742,7 +2719,7 @@ struct Engine {
         CK(cudaMemcpyAsync(tok, hpin + 16, (size_t) T * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
         rows_deferred = true;
-        graph_run(gs().gv[T], [&] { forward(T, pos, T, use_graph, true); });
+        graph_run(cur, T, [&] { forward(T, pos, T, use_graph, true); });
         rows_deferred = false;
         CK(cudaMemcpyAsync(hpin + 2, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
@@ -2841,7 +2818,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             CK(cudaFree(std::get<1>(pk)));
         }
         m.packed.clear();
-        E.reset_graphs();
+        E.graphs.clear();
         CK(cudaMemGetInfo(&fr, &tot));
         std::fprintf(stderr, "strata-q36: the packed Q8_0 decode copies (%.2f GiB) given back so that every routed "
                      "expert fits in VRAM (STRATA_Q36_KEEP_PACKED=1 keeps them and runs the hybrid mode)\n",

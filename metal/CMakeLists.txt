@@ -62,10 +62,8 @@ target_include_directories(strata_gpu_metal SYSTEM PUBLIC ${METAL_CPP_DIR})
 target_compile_definitions(strata_gpu_metal PUBLIC STRATA_GPU_METAL=1)
 target_link_libraries(strata_gpu_metal PUBLIC "-framework Metal" "-framework Foundation" "-framework QuartzCore")
 
-add_library(strata_core_metal STATIC ${STRATA_ROOT}/src/base/gpu/graph.cpp)
-target_link_libraries(strata_core_metal PUBLIC strata_gpu_metal)
 add_executable(runtime_hello tests/runtime_hello.cpp)
-target_link_libraries(runtime_hello PRIVATE strata_core_metal)
+target_link_libraries(runtime_hello PRIVATE strata_gpu_metal)
 enable_testing()
 add_test(NAME runtime_hello COMMAND runtime_hello)
 
@@ -90,7 +88,7 @@ target_link_libraries(dsu_ref_vs_ggml PRIVATE mtl_rt ggml-base ggml-cpu)
 
 set(S ${STRATA_ROOT}/src)
 set(STRATA_METAL_HOST_SOURCES
-  ${S}/base/gpu/device.cu ${S}/base/gpu/pinned.cu ${S}/base/gpu/runtime.cu ${S}/base/gpu/graph.cpp ${S}/base/gpu/vmm.cpp
+  ${S}/base/gpu/device.cu ${S}/base/gpu/pinned.cu ${S}/base/gpu/runtime.cu ${S}/base/gpu/vmm.cpp
   ${S}/base/platform/memory.cpp ${S}/base/platform/io_priority.cpp ${S}/base/platform/piece_reads.cpp
   ${S}/common/state/conversation_memory.cpp ${S}/common/state/conversation_file.cpp
   ${S}/common/experts/expert_profile.cpp ${S}/common/experts/ram_tier.cpp

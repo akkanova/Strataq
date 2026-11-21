@@ -83,7 +83,6 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/foresight_swap.hpp"
-#include "strata/base/gpu/graph.hpp"
 #include "strata/common/experts/hit_hook.hpp"
 #include "strata/models/qwen38/layer.hpp"
 #include "strata/core/layout.hpp"
