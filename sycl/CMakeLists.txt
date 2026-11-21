@@ -266,6 +266,7 @@ strata_resolve(_engine src/models/qwen38/layer.cpp src/models/qwen38/session.cpp
                        src/models/qwen38/conversation_snapshot.cpp src/models/qwen38/conversation_state.cpp
                        src/common/state/conversation_memory.cpp   # 0.1.31: the conversation snapshots (#216)
                        src/core/arch_defaults.cpp
+                       src/base/platform/piece_reads.cpp
                        src/base/gpu/vmm.cpp   # the port's stub: no driver VMM on Level Zero
                        src/common/state/conversation_file.cpp
                        src/common/experts/expert_profile.cpp src/common/experts/ram_tier.cpp

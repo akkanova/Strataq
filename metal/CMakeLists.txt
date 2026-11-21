@@ -91,7 +91,7 @@ target_link_libraries(dsu_ref_vs_ggml PRIVATE mtl_rt ggml-base ggml-cpu)
 set(S ${STRATA_ROOT}/src)
 set(STRATA_METAL_HOST_SOURCES
   ${S}/base/gpu/device.cu ${S}/base/gpu/pinned.cu ${S}/base/gpu/runtime.cu ${S}/base/gpu/graph.cpp ${S}/base/gpu/vmm.cpp
-  ${S}/base/platform/memory.cpp ${S}/base/platform/io_priority.cpp
+  ${S}/base/platform/memory.cpp ${S}/base/platform/io_priority.cpp ${S}/base/platform/piece_reads.cpp
   ${S}/common/state/conversation_memory.cpp ${S}/common/state/conversation_file.cpp
   ${S}/common/experts/expert_profile.cpp ${S}/common/experts/ram_tier.cpp
   ${S}/core/weights.cpp ${S}/core/layout.cpp ${S}/core/expert_source.cpp ${S}/core/remote_experts.cpp

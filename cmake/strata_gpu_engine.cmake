@@ -291,6 +291,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/common/state/conversation_memory.cpp src/common/state/conversation_file.cpp
     src/common/experts/expert_profile.cpp src/common/experts/expert_pages.cpp
     src/common/experts/ram_experts.cpp src/common/state/pool_copy.cpp src/common/state/pause_file.cpp
+    src/base/platform/piece_reads.cpp
     src/core/expert_source.cpp src/core/remote_experts.cpp src/core/remote_expert_opt.cu src/core/expert_cache.cpp
     src/core/peer_experts.cpp src/core/arch_defaults.cpp src/core/nv_defaults.cpp
     src/models/qwen38/layer.cpp src/models/qwen38/session.cpp src/models/qwen38/native_head.cpp
@@ -1455,6 +1456,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(platform_memory_test src/base/platform/memory_test.cpp)
   target_link_libraries(platform_memory_test PRIVATE strata_core ${_strata_gpu_runtime_target})
   add_test(NAME platform_memory_test COMMAND platform_memory_test)
+
+  # read_pieces: merged unbuffered reads return the bytes a plain read gives (CPU only).
+  add_executable(platform_piece_reads_test src/base/platform/piece_reads_test.cpp)
+  target_link_libraries(platform_piece_reads_test PRIVATE strata_engine)
+  add_test(NAME platform_piece_reads_test COMMAND platform_piece_reads_test)
 
   # The pinned-memory headroom (pin_budget.hpp) against a simulated ceiling; skips without a GPU.
   add_executable(pin_budget_test src/base/gpu/pin_budget_test.cpp)

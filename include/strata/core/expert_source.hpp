@@ -965,8 +965,7 @@ private:
     std::atomic<int64_t> async_end_ns_{0};
     std::chrono::steady_clock::time_point async_t0_{};
     double async_fill_us_ = 0;
-    /// #286: the blobs from the drive, unbuffered: every role's 4 KiB-aligned window is read at once (overlapped on
-    /// Windows, io_submit on Linux) into this thread's aligned buffer, then copied into place.  False when a read fails.
+    /// #286: the blobs from the drive, unbuffered, as one platform::read_pieces batch.  False when a read fails.
     bool read_direct(const Fill* fills, size_t n) const;
     bool open_direct(std::string& why);
     /// Windows: experts.bin mapped again as `open` maps it (begin/end_startup_unbuffered).

@@ -8,15 +8,14 @@
 #include "strata/core/expert_source.hpp"
 
 #include <cstdint>
-#include <memory>
-#include <mutex>
 #include <string>
 #include <vector>
 
 namespace strata::ds4 {
 
 /// The routed experts of a GGUF or EXL3 pack as an ExpertSource that copies each into the blob layout the model reads
-/// (ExpertFileLayout): its pieces read without the file cache into sector-aligned staging buffers and moved into place.  Copies only: blob() has no memory to give.
+/// (ExpertFileLayout): a batch's pieces read without the file cache as one queue (platform::read_pieces), or buffered
+/// when that fails.  Copies only: blob() has no memory to give.
 class ExpertFiles final : public strata::core::ExpertSource {
 public:
     ExpertFiles() = default;
@@ -30,16 +29,13 @@ public:
 
     const uint8_t* blob(int64_t, int64_t) override { return nullptr; }
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
-    /// Safe from several threads: one batch is read at a time.
+    /// Safe from several threads.
     bool copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) override;
 
 private:
     std::vector<platform::fd_t> direct_, buffered_;   ///< per file: unbuffered, and buffered (when unbuffered fails)
     std::vector<ExpertFileLayout> layers_;
-    std::unique_ptr<IoQueue> io_;
-    std::mutex mu_;
-    uint8_t* staging_ = nullptr;                      ///< kBatch experts' pieces, each in a span of span_ bytes
-    size_t span_ = 0;
+    bool is_direct_ = false;                          ///< every file has an unbuffered descriptor
 };
 
 }  // namespace strata::ds4
