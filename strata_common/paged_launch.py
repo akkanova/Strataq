@@ -21,14 +21,14 @@ def translate_args(cfg: dict, args: list[str]) -> list[str]:
         adapt-every adapt-swaps adapt-min-gain adapt-decay expert-popularity-decay
         tokens-min tokens-max conversation-tokens vram-conversations gpu-mib ram-mib ssd-pause-mib
         rows lookahead concurrent pause-dir copy-back conversation-idle-seconds decode-share-percent prompt-turn-ms
-        drafter remote-experts save-on-shutdown
+        drafter remote-experts save-on-shutdown step-profile
         suffix-draft mtp-max-t
         lookup-chain lookup-chain-min""".split())
     model = set(("""vision eos gpus reserve-mib cpu-threads dspark dspark-conf experts dspark-block prefill-chunk threads"""
                  if deepseek else """eos-ids native native-dense-gguf embd-gguf ple-gguf kv prefill mtp spec-min-p
                  gpu pcie-frac pool-cores aux-cpus pool-affinity vram-reserve-mib vram-reserve-later-mib""").split())
     switches = {"serve", "trim-stage-weights"} | ({"no-expert-cache"} if deepseek else
-                 {"vision", "no-ple", "no-prefill-borrow", "no-host-worker", "no-ple-prefetch", "stop-eos"})
+                 {"vision", "no-ple", "no-prefill-borrow", "no-host-worker", "no-ple-prefetch", "stop-eos", "stats"})
     aliases = {"--slots": "--batch"}
     aliases["--gpu" if deepseek else "--gpus"] = "--gpus" if deepseek else "--gpu"
     if deepseek:

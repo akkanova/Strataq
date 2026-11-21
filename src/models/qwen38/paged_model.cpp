@@ -233,7 +233,11 @@ public:
     }
     bool run_rows(const std::vector<strata::spec::StepRow>& rows, std::vector<int32_t>& picks,
                   std::string& err) override {
-        return run_rows(rows, histories_, picks, err);
+        strata::core::set_tail_skip_rank(is_one_conversation(rows) ? tail_rank_ : 0);
+        if (!run_rows(rows, histories_, picks, err))
+            return false;
+        refine_pcie_shares();
+        return true;
     }
     int get_pipeline_stages() const override { return (int) cards_.size(); }
     bool prepare_group(int group, const std::vector<strata::spec::StepRow>& rows, std::string& err) override;
@@ -319,6 +323,14 @@ private:
     std::vector<const std::vector<int32_t>*> histories_; ///< consumed tokens for the current step
     std::vector<int> history_lengths_; ///< each session's penalty window
     std::vector<uint8_t> staging_;     ///< an expert read from the SSD on its way to a GPU (load_expert)
+    int tail_rank_ = 0;   ///< the route tail skip's rank for a window of one conversation (choose_tail_skip_rank)
+    strata::qwen38::PcieAuto pcie_auto_;   ///< refines the cards' PCIe shares in the first decode windows
+    /// Tells whether every row of a verify window is one conversation's.  The route tail skip is off otherwise, as
+    /// in the older engine, because one conversation's skips would then depend on another's tokens.
+    static bool is_one_conversation(const std::vector<strata::spec::StepRow>& rows);
+    /// Feeds a finished decode window to pcie_auto_ and, when it picks a new share, gives every card its own share
+    /// for its link against the CPU pool's measured rate (as the older engine's layer split does).
+    void refine_pcie_shares();
 };
 
 std::string get_split_hop_refusal(const Options& o);
@@ -523,6 +535,47 @@ PagedQwen::PagedQwen(Model& m, Conversation& conv, const PagedCards& cards, Mode
     facts.adapt_decay = o.adapt_decay;
     facts.row_bytes = (uint64_t) strata::kernels::cpu::H * sizeof(float);
     facts.cpu_expert_ms = kCpuExpertMs;
+    // (before the pools fill, host_res holds no expert yet, so the older engine's "nearly every expert is in VRAM"
+    // exception cannot apply here; the skip only acts on misses, so it does nothing while every expert hits)
+    tail_rank_ = choose_tail_skip_rank(m.host_res, (int) model_cards.size(), m.native_pack, false, o.peer_device >= 0);
+    const bool cards_refined = model_cards.size() == 1 || pcie_auto_split_ok();
+    if (o.pcie_frac_auto && o.pcie_probe_gbps > 0.0 && o.peer_device < 0 && cards_refined) {
+        pcie_auto_.on = true;
+        pcie_auto_.link_gbps = o.pcie_probe_gbps;
+        double sum = 0.0;
+        for (const uint64_t b : facts.expert_bytes)
+            sum += (double) b;
+        pcie_auto_.blob_bytes = sum / (double) facts.expert_bytes.size();
+    }
+}
+
+bool PagedQwen::is_one_conversation(const std::vector<strata::spec::StepRow>& rows) {
+    return std::all_of(rows.begin(), rows.end(), [&](const auto& r) { return r.session == rows[0].session; });
+}
+
+void PagedQwen::refine_pcie_shares() {
+    Options& o = m_.o;
+    double tc_us = 0.0, rate = 0.0;
+    const double nf = pcie_auto_.window(m_.drive.d.ms_run, m_.drive.d.multi_misses, o.pcie_frac, &tc_us, &rate);
+    if (nf < 0.0)
+        return;
+    std::fprintf(stderr, "%s: PCIe share: the CPU pool takes %.0f us per missed expert (%.1f GB/s of expert bytes), "
+                         "the link %.1f GB/s -> pcie_frac %.2f (was %.2f; --pcie-frac N fixes it)\n",
+                 kProgram.c_str(), tc_us, rate, pcie_auto_.link_gbps, nf, o.pcie_frac);
+    o.pcie_frac = nf;
+    m_.drive.d.pcie_num = get_pcie_num(nf);
+    if (cards_.size() < 2)
+        return;
+    split_.pcie_num[0] = m_.drive.d.pcie_num;
+    for (size_t k = 1; k < cards_.size(); ++k) {
+        GpuStage* stage = cards_[k].stage;
+        if (stage == nullptr || !(stage->link_gbps > 0.0))
+            continue;
+        stage->pcie_frac = get_pcie_share(stage->link_gbps, rate);
+        split_.pcie_num[k] = get_pcie_num(stage->pcie_frac);
+        std::fprintf(stderr, "%s: PCIe share: %s (link %.1f GB/s) -> pcie_frac %.2f\n", kProgram.c_str(),
+                     pcards_[k].id.c_str(), stage->link_gbps, stage->pcie_frac);
+    }
 }
 
 PagedParts PagedQwen::make_parts(PagedCard& card, size_t first, size_t count, std::string& err) {
@@ -1144,7 +1197,9 @@ bool PagedQwen::read_prompt(const PagedParts& parts, const std::vector<int64_t>&
             return false;
         at = point;
     }
-    return at == end || read_prompt_segment(parts, ids, at, end - at, drafting, on_chunk, err);
+    const bool ok = at == end || read_prompt_segment(parts, ids, at, end - at, drafting, on_chunk, err);
+    pcie_auto_.mark(m_.drive.d.ms_run, m_.drive.d.multi_misses);   // the prompt's windows are not the decode's
+    return ok;
 }
 
 bool PagedQwen::read_prompt_segment(const PagedParts& parts, const std::vector<int64_t>& ids, int64_t from, int64_t n,
@@ -1237,6 +1292,10 @@ bool PagedQwen::run_rows(const std::vector<strata::spec::StepRow>& rows,
 }
 
 bool PagedQwen::prepare_group(int group, const std::vector<strata::spec::StepRow>& rows, std::string& err) {
+    // the rank is global and run_stage_groups prepares every group of a wave before it launches one, so a mixed
+    // group turns the skip off for the whole wave (finish_group turns it back on)
+    if (!is_one_conversation(rows))
+        strata::core::set_tail_skip_rank(0);
     if (groups_.size() <= (size_t) group)
         groups_.resize((size_t) group + 1);
     if (!groups_[(size_t) group])
@@ -1305,6 +1364,8 @@ bool PagedQwen::finish_group(int group, std::vector<int32_t>& picks, std::string
         return false;
     g.picks = picks;
     note_row_logprobs(verifier, g, picks);
+    strata::core::set_tail_skip_rank(tail_rank_);
+    refine_pcie_shares();
     return true;
 }
 
