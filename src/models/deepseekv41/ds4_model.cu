@@ -34,6 +34,7 @@
 #include "strata/base/platform/env.hpp"
 #include "strata/base/gpu/on_device.hpp"
 #include "strata/base/platform/os.hpp"
+#include "strata/common/experts/expert_profile.hpp"
 #include "strata/core/expert_source.hpp"
 #include "ds4_pcie.cuh"
 #include "ds4_pcie.hpp"
@@ -3475,21 +3476,22 @@ struct Model::Impl {
                              nth, (unsigned long long) mb, eg_cache.capacity());
         }
         prof.assign((size_t) (g.nl + g.n_mtp) * g.n_exp, 0u);
-        if (!o.profile.empty()) {
-            std::FILE* f = std::fopen(o.profile.c_str(), "rb");
-            if (f != nullptr) {
-                std::fseek(f, 0, SEEK_END);
-                const long long bytes = (long long) std::ftell(f);
-                std::rewind(f);
-                if (bytes >= 0 && !profile_size_fits((uint64_t) bytes, g.nl, g.n_exp)) {   // another model's counts (see ds4_experts_rule.hpp)
-                    std::fprintf(stderr, "ds4: %s is %lld bytes and this model's profile is %d layers of %d experts (%d bytes and a few drafter rows): "
-                                         "not read, the experts start unranked\n", o.profile.c_str(), bytes, g.nl, g.n_exp, g.nl * g.n_exp * 4);
-                } else {
-                    std::vector<uint32_t> p(prof.size());
-                    const size_t n = std::fread(p.data(), 4, p.size(), f);
-                    if (n == p.size() || n == (size_t) g.nl * g.n_exp) std::copy(p.begin(), p.begin() + (long) n, prof.begin());
-                }
-                std::fclose(f);
+        std::error_code profile_ec;
+        if (!o.profile.empty() && (std::filesystem::exists(o.profile, profile_ec) || profile_ec)) {
+            std::vector<uint32_t> p;
+            std::string perr;
+            if (!strata::core::read_expert_counts(o.profile, g.n_exp, g.nl + kProfileExtraRows, p, perr)) {
+                std::fprintf(stderr, "ds4: %s - the experts start unranked\n", perr.c_str());
+            } else if (!profile_size_fits((uint64_t) p.size() * 4, g.nl, g.n_exp)) {
+                std::fprintf(stderr, "ds4: %s holds %zu rows and this model's profile is %d layers of %d experts "
+                                     "(and a few drafter rows): "
+                                     "not read, the experts start unranked\n",
+                             o.profile.c_str(), p.size() / g.n_exp, g.nl, g.n_exp);
+            } else if (p.size() >= prof.size() || p.size() == (size_t) g.nl * g.n_exp) {
+                std::copy_n(p.begin(), std::min(p.size(), prof.size()), prof.begin());
+            } else {
+                std::fprintf(stderr, "ds4: %s has incomplete drafter rows - the experts start unranked\n",
+                             o.profile.c_str());
             }
         }
         prof_load = prof;
@@ -15795,14 +15797,9 @@ struct Model::Impl {
 
     void save_profile() const {
         if (o.profile.empty() || o.profile_readonly) return;   // (--profile-readonly: a test keeps the file it read)
-        const std::string tmp = o.profile + ".tmp";
-        std::FILE* f = std::fopen(tmp.c_str(), "wb");
-        if (f == nullptr) return;
-        const bool ok = std::fwrite(prof.data(), 4, prof.size(), f) == prof.size();
-        std::fclose(f);
-        // (the old profile replaced: std::rename does not replace an existing file on Windows, so there the profile
-        // never moved on and only .tmp files were left)
-        if (!ok || !platform::replace_file(tmp, o.profile)) std::remove(tmp.c_str());
+        std::string err;
+        if (!strata::core::write_expert_counts(o.profile, (int64_t) prof.size() / g.n_exp, g.n_exp, prof, err))
+            std::fprintf(stderr, "ds4: %s\n", err.c_str());
     }
 
     std::vector<std::string> info_lines() const {
