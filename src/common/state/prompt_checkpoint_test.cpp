@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <cstdlib>
 
+using strata::core::CheckpointPlacement;
+using strata::core::find_prompt_checkpoints;
 using strata::core::find_prompt_root_boundary;
 using strata::core::find_prompt_turn_boundary;
 
@@ -33,7 +35,21 @@ int main() {
     check(find_prompt_root_boundary(ordinary, 8, -1, 1) == -1, "disabled turn token adds no root");
     check(find_prompt_root_boundary(ordinary, 4, turn, 1) == -1,
           "a root is not added at the answer history boundary");
-    std::puts("prompt_checkpoint_test: 14 checks passed");
+    const CheckpointPlacement every3{turn, -1, 4, 3};
+    check(find_prompt_checkpoints(every3, ordinary, 0) == std::vector<int64_t>{3, 4, 6, 8},
+          "the root, the turn and the periodic points before the turn are kept in order");
+    check(find_prompt_checkpoints(every3, ordinary, 4) == std::vector<int64_t>{6, 8},
+          "points at or before `from` are left out");
+    check(find_prompt_checkpoints(every3, {turn, system, 1, end, turn}, 0) == std::vector<int64_t>{3},
+          "a turn at the prompt's last token, read with the answer, is left out");
+    check(find_prompt_checkpoints({-1, -1, 0, 3}, ordinary, 4) == std::vector<int64_t>{6, 9},
+          "periodic points include the end of prefill when no turn boundary limits them");
+    check(find_prompt_checkpoints({turn, system, 4, 3}, effort, 7) == std::vector<int64_t>{8},
+          "a temporary effort header ends both history and periodic placement");
+    check(find_prompt_checkpoints(every3, ordinary, 8).empty(),
+          "resuming at the history boundary adds no checkpoint at the resume position");
+    check(find_prompt_checkpoints({}, ordinary, 0).empty(), "the default placement keeps none");
+    std::puts("prompt_checkpoint_test: 21 checks passed");
 }
 
 namespace {

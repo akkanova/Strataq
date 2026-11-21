@@ -15,6 +15,7 @@
 #include "strata/common/spec/step.hpp"
 #include "strata/common/state/conversation_file.hpp"
 #include "strata/common/state/pool_copy.hpp"
+#include "strata/common/state/prompt_checkpoint.hpp"
 
 #include <cstdint>
 #include <deque>
@@ -111,6 +112,9 @@ struct PagedModelFacts {
     int max_concurrent = 0;
     /// the most restore points a request's prompt read keeps (marks=, tail=, shared=; keep_restore_point); 0: none
     int restore_points = 0;
+    /// where every prompt read also keeps the model's own checkpoints (keep_restore_point, whatever restore_points
+    /// is); the default keeps none
+    strata::core::CheckpointPlacement checkpoints;
     bool serial_conversations = false;     ///< the model switches shared inputs between conversations
     uint64_t extra_resident_vram = UINT64_MAX; ///< Smallest card VRAM allowing an extra cached conversation by default.
     std::vector<uint64_t> expert_bytes;     ///< per layer: one expert's bytes
@@ -259,10 +263,13 @@ public:
     virtual bool keeps_rewind_branch(const PagedParts&, int64_t) const { return true; }
     /// Keeps the state of the conversation of `parts` at its end, `tokens` of `ids`, as a restore point its request
     /// asked for (strata/common/state/restore_points.hpp; `shared`: the end of a start other conversations share,
-    /// given up last), making room by the model's own cap; false (and `err`) when it cannot.  The engine calls it where
-    /// its prompt read stops for one, only when PagedModelFacts::restore_points is above 0.
+    /// given up last) or as one of PagedModelFacts::checkpoints, making room by the model's own cap; false (and `err`)
+    /// when it cannot.  The engine calls it where its prompt read stops for one: a point the request asked for (when
+    /// PagedModelFacts::restore_points is above 0) or one of the checkpoints (when keeps_checkpoints).
     virtual bool keep_restore_point(const PagedParts& parts, const std::vector<int64_t>& ids, int64_t tokens,
                                     bool shared, std::string& err) = 0;
+    /// Tells whether the current request of `parts` lets its read stop at PagedModelFacts::checkpoints.
+    virtual bool keeps_checkpoints(const PagedParts&) const { return true; }
     /// Gets the positions short of its end that the conversation of `parts` can go back to (rewind), so that a prompt
     /// that leaves it there continues it (strata/common/state/resume_point.hpp); none by default.
     virtual std::vector<int64_t> get_rewind_points(const PagedParts&) const { return {}; }

@@ -7501,28 +7501,10 @@ struct Model::Impl {
     }
     // the restore point at position `at` to fill (nullptr: none kept, or one there already - in use again)
     Check* mark_room(int64_t at, bool shared) {
-        if (marks_cap() <= 0 || at <= 0) return nullptr;
-        for (Check& x : mk)
-            if (x.pos == at) {
-                x.shared = x.shared || shared;
-                x.used = ++mark_clock;
-                return nullptr;
-            }
-        size_t k = mk.size();
-        if ((int) k >= marks_cap()) {
-            std::vector<MarkUse> u;
-            for (const Check& x : mk) u.push_back({x.pos, x.shared, x.used});
-            u.push_back({at, shared, mark_clock + 1});
-            k = (size_t) mark_victim(u);
-            if (k == mk.size())
-                return nullptr;
-        } else
-            mk.emplace_back();
-        Check& c = mk[k];   // (one given up: its buffers taken over)
-        c.shared = shared;
-        c.used = ++mark_clock;
-        slot_held = false;   // (a slot taken before holds no such point)
-        return &c;
+        Check* c = strata::core::make_restore_point_room(mk, mark_clock, at, shared, marks_cap(), mark_victim);
+        if (c != nullptr)
+            slot_held = false;   // (a slot taken before holds no such point)
+        return c;
     }
     // checkpoint i of best_check()'s: ck, then the marks
     const Check& check_at(int i) const { return i < kChecks ? ck[i] : mk[(size_t) (i - kChecks)]; }
@@ -7606,8 +7588,7 @@ struct Model::Impl {
         for (Check& o2 : ck)   // a later checkpoint saw tokens the state no longer has
             if (o2.pos > pos) o2.pos = -1;
         mk.erase(std::remove_if(mk.begin(), mk.end(), [this](const Check& x) { return x.pos > pos; }), mk.end());
-        for (Check& x : mk)   // (a mark gone back to: in use)
-            if (x.pos == pos) x.used = ++mark_clock;
+        strata::core::touch_restore_point(mk, mark_clock, pos);
         return true;
     }
 
@@ -8014,8 +7995,6 @@ struct Model::Impl {
         for (int k = 0; k < kChecks; ++k)
             std::swap(ck[k], s.checks[(size_t) k]);
         mk.swap(s.marks);
-        for (const Check& c : mk)   // (the clock orders one conversation's marks: it goes on past all of theirs)
-            mark_clock = std::max(mark_clock, c.used);
         set_position();
     }
 

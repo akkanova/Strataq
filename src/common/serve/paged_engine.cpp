@@ -265,12 +265,12 @@ private:
     /// get_session_identity) and the layout of the pages.  False (and `err`) when the model files cannot be read.
     bool find_identity(std::string& err);
     /// Gets where the read of `ids` from `from` stops to keep the restore points its request asked for (`asked`),
-    /// by the shared policy (strata/common/state/restore_points.hpp); none in a prompt with pictures (`pictures`),
-    /// whose spans the model reads whole.  `tail` gets the asked tail point when the read stops there (tail_cost_
-    /// decides whether it may), else -1.
+    /// by the shared policy (strata/common/state/restore_points.hpp), none in a prompt with pictures (`pictures`),
+    /// whose spans the model reads whole; and, when `checkpoints`, the model's own (PagedModelFacts::checkpoints).
+    /// `tail` gets the asked tail point when the read stops there (tail_cost_ decides whether it may), else -1.
     std::vector<strata::core::MarkAt> plan_restore_points(const strata::serve::RestorePointRequest& asked,
                                                           const std::vector<int64_t>& ids, int64_t from,
-                                                          bool pictures, int64_t& tail);
+                                                          bool pictures, bool checkpoints, int64_t& tail);
     /// Reads `ids[from, to)` into `h` (the request began at `t0`), keeping a restore point at each of `cuts`
     /// (plan_restore_points, whose `tail` the read's times measure for tail_cost_); `read_to` gets how far it got.
     /// Conversations that decode meanwhile take steps between the prompt's turns (PagedSettings::decode_share_percent
@@ -1203,7 +1203,7 @@ bool PagedEngine::serve_request(const std::string& line, bool admit) {
         bool fatal = false;
         int64_t tail = -1;
         const std::vector<strata::core::MarkAt> cuts =
-            plan_restore_points(restore, ids, resume, !h.images.empty(), tail);
+            plan_restore_points(restore, ids, resume, !h.images.empty(), model_.keeps_checkpoints(h.parts), tail);
         const bool ok = read_prompt(h, ids, resume, n - 1, cuts, tail, t0, read_to, fatal, err);
         if (fatal)
             return false;
@@ -1307,20 +1307,28 @@ void PagedEngine::finish_request(Held& h, const char* finish) {
 
 std::vector<strata::core::MarkAt> PagedEngine::plan_restore_points(const strata::serve::RestorePointRequest& asked,
                                                                    const std::vector<int64_t>& ids, int64_t from,
-                                                                   bool pictures, int64_t& tail) {
+                                                                   bool pictures, bool checkpoints, int64_t& tail) {
     tail = -1;
-    if (pictures)
-        return {};
-    std::vector<int64_t> at = asked.marks;
-    // (a tail the read goes past: kept while stopping there costs no more than reading its tokens again)
-    const bool past = asked.tail > from && asked.tail < (int64_t) ids.size() - 1;
-    if (asked.tail > 0 && (!past || tail_cost_.keep_tail(facts_.name.c_str())))
-        at.push_back(tail = asked.tail);
-    std::vector<strata::core::MarkAt> cuts = strata::core::mark_plan(
-        at, asked.get_shared(), from, (int64_t) ids.size(), facts_.restore_points, strata::core::kMarkGap);
-    std::erase_if(cuts, [](const strata::core::MarkAt& m) { return m.pos <= 0; });   // (no state before a token)
-    if (std::none_of(cuts.begin(), cuts.end(), [&](const strata::core::MarkAt& m) { return m.pos == tail; }))
-        tail = -1;
+    std::vector<strata::core::MarkAt> cuts;
+    if (!pictures) {
+        std::vector<int64_t> at = asked.marks;
+        // (a tail the read goes past: kept while stopping there costs no more than reading its tokens again)
+        const bool past = asked.tail > from && asked.tail < (int64_t) ids.size() - 1;
+        if (asked.tail > 0 && (!past || tail_cost_.keep_tail(facts_.name.c_str())))
+            at.push_back(tail = asked.tail);
+        cuts = strata::core::mark_plan(at, asked.get_shared(), from, (int64_t) ids.size(), facts_.restore_points,
+                                       strata::core::kMarkGap);
+        std::erase_if(cuts, [](const strata::core::MarkAt& m) { return m.pos <= 0; });   // (no state before a token)
+        if (std::none_of(cuts.begin(), cuts.end(), [&](const strata::core::MarkAt& m) { return m.pos == tail; }))
+            tail = -1;
+    }
+    if (checkpoints)
+        for (const int64_t at : strata::core::find_prompt_checkpoints(facts_.checkpoints, ids, from))
+            if (std::none_of(cuts.begin(), cuts.end(), [at](const strata::core::MarkAt& m) { return m.pos == at; }))
+                cuts.push_back({at, false, false});
+    std::sort(cuts.begin(), cuts.end(), [](const strata::core::MarkAt& a, const strata::core::MarkAt& b) {
+        return a.pos < b.pos;
+    });
     return cuts;
 }
 
@@ -1350,14 +1358,21 @@ bool PagedEngine::read_prompt(Held& h, const std::vector<int64_t>& ids, int64_t 
     // beside conversations that decode, a chunk at a time, and they decode between two turns of whole chunks
     const int64_t piece = std::max<int64_t>(model_.get_prompt_chunk(), 1);
     size_t next_cut = 0;
+    int64_t grid = from;   // where the read's chunks are counted from: only a point it was asked for restarts them
+    const auto keep_next_cut = [&] {
+        const strata::core::MarkAt& m = cuts[next_cut++];
+        if (m.asked)
+            grid = m.pos;
+        return model_.keep_restore_point(h.parts, ids, m.pos, m.shared, err);
+    };
     bool ok = true;
     if (!cuts.empty() && cuts[0].pos == from)   // (the state as it is)
-        ok = model_.keep_restore_point(h.parts, ids, from, cuts[next_cut++].shared, err);
+        ok = keep_next_cut();
     Clock::time_point turn = Clock::now();
     double read_ms[2] = {0, 0};   // the model's reads before `tail` and from it
     bool measure_tail = has_read_prompt_ && tail > from && tail < to;
     for (int64_t q = from, n = 0; ok && q < to; q += n) {
-        n = std::min(piece, to - q);
+        n = std::min(piece - (q - grid) % piece, to - q);
         if (next_cut < cuts.size() && cuts[next_cut].pos < q + n)
             n = cuts[next_cut].pos - q;
         ok = model_.wait_state(err);
@@ -1373,7 +1388,7 @@ bool PagedEngine::read_prompt(Held& h, const std::vector<int64_t>& ids, int64_t 
             ok = model_.wait_state(err);
         read_ms[q >= tail] += get_ms_since(r0);
         if (ok && next_cut < cuts.size() && cuts[next_cut].pos == q + n)
-            ok = model_.keep_restore_point(h.parts, ids, q + n, cuts[next_cut++].shared, err);
+            ok = keep_next_cut();
         const double turn_ms = get_ms_since(turn);
         if (q + n >= to || turn_ms < (double) settings_.prompt_turn_ms)
             continue;
