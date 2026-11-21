@@ -2439,6 +2439,14 @@ int Model::load() {
                                  "--vram-reserve-mib, an explicit --layer-split, or close other programs using the GPU\n");
         };
         problem.can_start = can_start;
+        if (strata::core::session_pool_state()) {
+            // the paged engine (strata-q38) carves a card's session for a page pool: it needs a GDN and a QSA layer
+            const int64_t qi = std::max<int64_t>(g.qsa_interval, 1);
+            problem.can_run = [qi](int64_t lb, int64_t le) {
+                const int64_t qsa = le / qi - lb / qi;
+                return qsa != 0 && qsa != le - lb;
+            };
+        }
         const char* const log_prefix = "strata generate: layer split auto: ";
         // THE LAYER SPLIT'S SPILL WALK, STEP 2: THE KV WINDOW DOWN.  No placement can start the prompt path with the window asked for: the sessions of the cards are smaller with a
         // smaller one (the rest of the K/V streams from pinned RAM), so the search runs again at 20480, 8192, 4096 cells a layer (the engine's smallest) and keeps the first window

@@ -2614,6 +2614,7 @@ std::vector<int64_t> PagedEngine::plan_cut() const {
         }
         return true;
     };
+    problem.can_run = [&](int64_t lb, int64_t le) { return model_.can_run_layers(lb, le); };
     const SplitPlan plan = plan_layer_split(problem, (facts_.name + ": the layer cut: ").c_str());
     return plan.cuts.empty() || plan.start_unchecked ? get_cut() : plan.cuts;
 }
