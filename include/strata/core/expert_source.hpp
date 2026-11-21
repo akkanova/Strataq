@@ -443,6 +443,10 @@ struct ExpertDispatch {
     /// of what the device hit path reads.  When set, the pool leaves a resident expert's row at zero (the GPU
     /// computes it) without any `Launch` callback.
     const int32_t* host_res = nullptr;
+    /// The conversation each of a verify window's tokens belongs to (null: the window is one conversation's), so
+    /// that STRATA_ROUTE_TAIL_SKIP decides for each conversation by its own tokens, as if it ran alone.  Set by
+    /// strata-q38 (paged_model.cpp) before a window that mixes conversations.
+    const int32_t* token_owner = nullptr;
     /// Plan v0.3 P4: split every expert by rows across the pool's threads (default on; A/B `--no-split-rows`).
     bool split_rows = true;
 

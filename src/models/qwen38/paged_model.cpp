@@ -233,8 +233,14 @@ public:
     }
     bool run_rows(const std::vector<strata::spec::StepRow>& rows, std::vector<int32_t>& picks,
                   std::string& err) override {
-        strata::core::set_tail_skip_rank(is_one_conversation(rows) ? tail_rank_ : 0);
-        if (!run_rows(rows, histories_, picks, err))
+        owners_.clear();
+        for (const auto& row : rows)
+            owners_.push_back(row.session);
+        m_.drive.d.token_owner = is_one_conversation(rows) ? nullptr : owners_.data();
+        strata::core::set_tail_skip_rank(tail_rank_);
+        const bool ok = run_rows(rows, histories_, picks, err);
+        m_.drive.d.token_owner = nullptr;
+        if (!ok)
             return false;
         refine_pcie_shares();
         return true;
@@ -323,10 +329,12 @@ private:
     std::vector<const std::vector<int32_t>*> histories_; ///< consumed tokens for the current step
     std::vector<int> history_lengths_; ///< each session's penalty window
     std::vector<uint8_t> staging_;     ///< an expert read from the SSD on its way to a GPU (load_expert)
-    int tail_rank_ = 0;   ///< the route tail skip's rank for a window of one conversation (choose_tail_skip_rank)
+    int tail_rank_ = 0;   ///< the route tail skip's rank (choose_tail_skip_rank)
+    std::vector<int32_t> owners_;   ///< each serial-window token's conversation (ExpertDispatch::token_owner)
     strata::qwen38::PcieAuto pcie_auto_;   ///< refines the cards' PCIe shares in the first decode windows
-    /// Tells whether every row of a verify window is one conversation's.  The route tail skip is off otherwise, as
-    /// in the older engine, because one conversation's skips would then depend on another's tokens.
+    /// Tells whether every row of a verify window is one conversation's.  A pipelined group that mixes them runs
+    /// without the route tail skip, since its windows share the dispatch with the other groups in flight and cannot
+    /// say whose each token is (ExpertDispatch::token_owner).
     static bool is_one_conversation(const std::vector<strata::spec::StepRow>& rows);
     /// Feeds a finished decode window to pcie_auto_ and, when it picks a new share, gives every card its own share
     /// for its link against the CPU pool's measured rate (as the older engine's layer split does).

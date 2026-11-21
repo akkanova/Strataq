@@ -388,13 +388,13 @@ private:
     /// Gets the paused conversation that goes first, the lowest priority then the least recently used, among those in
     /// RAM (`in_ram`) or on the SSD; paused_.end() when there is none.
     std::vector<Paused>::iterator find_lowest(bool in_ram);
-    /// Runs a round of the old engine's adaptive tier, with its options, every decode step while a card's pool has
-    /// more than kEveryStepFreeBytes free beyond --tokens-min's pages, else every --adapt-every steps: counts a use,
-    /// in the GPUs' pools, of the experts there that the steps since the last round routed to; then the experts
-    /// routed to most that the pools do not hold come in (at most --adapt-swaps): into free pages while there are
-    /// some, else into the pages of the least-routed expert of their layer when they beat it by --adapt-min-gain
-    /// routings.  The routing counts then decay by popularity_decay_ per step.  False (ERR printed) when a copy
-    /// failed.
+    /// Runs a round of the old engine's adaptive tier, with its options, every decode step while a card that lacks
+    /// some of its layers' experts has more than kEveryStepFreeBytes free in its pool beyond --tokens-min's pages,
+    /// else every --adapt-every steps: counts a use, in the GPUs' pools, of the experts there that the steps since
+    /// the last round routed to; then the experts routed to most that the pools do not hold come in (at most
+    /// --adapt-swaps): into free pages while there are some, else into the pages of the least-routed expert of their
+    /// layer when they beat it by --adapt-min-gain routings.  The routing counts then decay by popularity_decay_ per
+    /// step.  False (ERR printed) when a copy failed.
     bool adapt_experts();
     /// Loads a batch of the start-up fill (fill_round), or waits until pages open to its experts.  The serve loop runs
     /// it between requests, and decode_step after each step, while the fill runs.  False on a load or residency
@@ -2101,16 +2101,26 @@ std::vector<Paused>::iterator PagedEngine::find_lowest(bool in_ram) {
 
 bool PagedEngine::adapt_experts() {
     std::vector<float>& usage = model_.get_usage();
+    if (usage.empty())
+        return true;
+    std::vector<int32_t>& residency = model_.get_residency();
+    const int64_t n_expert = facts_.n_expert;
+    // a card whose layers' experts are all on a GPU (its own or a lender's) has nothing to bring in, however free
+    // its pool; choose_expert_swaps passes over the lent ones too
+    const auto lacks_experts = [&](const PagedCard& card) {
+        for (int64_t i = card.lb * n_expert; i < card.le * n_expert; ++i)
+            if (residency[(size_t) i] < 0 && !is_lent(i / n_expert, i % n_expert))
+                return true;
+        return false;
+    };
     const bool roomy = std::any_of(cards_.begin(), cards_.end(), [&](const PagedCard& card) {
         const strata::core::PagePool& pool = card.experts.pool();
         const uint64_t free = pool.report().free.pages, kept = pool.pages_for(settings_.tokens_min);
-        return (free - std::min(free, kept)) * pool.page_bytes() > kEveryStepFreeBytes;
+        return (free - std::min(free, kept)) * pool.page_bytes() > kEveryStepFreeBytes && lacks_experts(card);
     });
-    if (usage.empty() || steps_ - adapted_at_ < (roomy ? 1 : facts_.adapt_every))
+    if (steps_ - adapted_at_ < (roomy ? 1 : facts_.adapt_every))
         return true;
     const Clock::time_point t0 = Clock::now();
-    std::vector<int32_t>& residency = model_.get_residency();
-    const int64_t n_expert = facts_.n_expert;
     seen_.resize(usage.size(), 0.0f);
     for (size_t i = 0; i < usage.size(); ++i)
         if (const int64_t l = (int64_t) i / n_expert, e = (int64_t) i % n_expert; usage[i] > seen_[i]) {
