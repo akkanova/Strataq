@@ -2127,7 +2127,10 @@ bool PagedEngine::adapt_experts() {
     int moved = 0;
     for (size_t i = 0; i < swaps.size() && moved < facts_.adapt_swaps; ++i) {
         const strata::core::ExpertSwap& s = swaps[i];
-        const int got = get_card_of(s.layer).experts.replace({s.layer, s.out}, {s.layer, s.in}, err);
+        PagedCard& card = get_card_of(s.layer);
+        // the holding card's device current: the eviction's copy-back (hooks_.leaving) reads its pages
+        const strata::core::OnDevice on(card.dev);
+        const int got = card.experts.replace({s.layer, s.out}, {s.layer, s.in}, err);
         if (got < 0) {
             print_error_or_exit("moving an expert into the GPU's pool: " + err);
             return false;
