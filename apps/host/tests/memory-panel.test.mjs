@@ -764,7 +764,52 @@ test('suffix mode uses engine labels and is submitted as one mutually exclusive 
   assert.deepEqual(calls, []);
   apply(fire);
   await settle();
-  assert.deepEqual(calls, [[{drafter: false, suffix_draft: 3, lookup_chain: 0}, 'session']]);
+  assert.deepEqual(calls, [[{drafter: false, suffix_draft: 3}, 'session']]);
+});
+
+test('the Drafter list combines MTP, the suffix drafter and lookup, sending only what a choice changes', async () => {
+  const choose = async (settings, value) => {
+    const {calls, onChange} = recorder(), {element, fire} = mount({...live, settings: {...live.settings,
+      has_drafter: 1, ...settings}, details: {drafter_label: 'MTP'}}, onChange);
+    const selected = /<option value="(\w+)" selected/.exec(element.innerHTML)[1];
+    fire('change', {target: control('[data-setting]', {dataset: {setting: 'drafter'}, value})});
+    apply(fire);
+    await settle();
+    return [selected, calls[0]?.[0]];
+  };
+  const {element} = mount({...live, settings: {...live.settings, suffix_draft: 0, lookup_chain: 0},
+    details: {drafter_label: 'MTP'}}, () => {});
+  assert.deepEqual([...element.innerHTML.matchAll(/<option value="\w+"[^>]*>([^<]*)/g)].map(m => m[1]),
+    ['No MTP', 'MTP', 'Use suffix drafter (0 GiB)', 'MTP, or suffix drafter', 'MTP + lookup',
+      'MTP + lookup, or suffix drafter']);
+  assert.deepEqual(await choose({drafter: 1, suffix_draft: 0, lookup_chain: 0}, 'either'),
+    ['on', {suffix_draft: 3}]);
+  assert.deepEqual(await choose({drafter: 1, suffix_draft: 0, lookup_chain: 0}, 'all'),
+    ['on', {suffix_draft: 3, lookup_chain: 1}]);
+  assert.deepEqual(await choose({drafter: 1, suffix_draft: 4, lookup_chain: 2}, 'on'),
+    ['all', {suffix_draft: 0, lookup_chain: 0}]);
+  assert.deepEqual(await choose({drafter: 1, suffix_draft: 0, lookup_chain: 2}, 'either'),
+    ['chain', {suffix_draft: 3, lookup_chain: 0}]);
+  assert.deepEqual(await choose({drafter: 0, suffix_draft: 0, lookup_chain: 2}, 'suffix'),
+    ['off', {suffix_draft: 3}]);
+  assert.deepEqual(await choose({drafter: 0, suffix_draft: 4, lookup_chain: 2}, 'all'),
+    ['suffix', {drafter: true}]);
+  assert.deepEqual(await choose({drafter: 1, suffix_draft: 4, lookup_chain: 2}, 'all'),
+    ['all', undefined]);
+});
+
+test('revising a staged Drafter choice discards its chain edit and keeps the running chain value', async () => {
+  for (const lookup_chain of [0, 2]) {
+    for (const choice of ['off', 'suffix']) {
+      const {calls, onChange} = recorder(), {fire} = mount({...live,
+        settings: {...live.settings, drafter: 1, suffix_draft: 0, lookup_chain}}, onChange);
+      for (const value of [lookup_chain ? 'on' : 'chain', choice])
+        fire('change', {target: control('[data-setting]', {dataset: {setting: 'drafter'}, value})});
+      apply(fire);
+      await settle();
+      assert.deepEqual(calls, [[{drafter: false, ...(choice === 'suffix' ? {suffix_draft: 3} : {})}, 'session']]);
+    }
+  }
 });
 
 test('a drafter the engine did not load is shown, with its words, but cannot be chosen', () => {
@@ -788,7 +833,7 @@ test('a selected unavailable drafter still allows switching to suffix drafting',
   fire('change', {target: control('[data-setting]', {dataset: {setting: 'drafter'}, value: 'suffix'})});
   apply(fire);
   await settle();
-  assert.deepEqual(calls, [[{drafter: false, suffix_draft: 3, lookup_chain: 0}, 'session']]);
+  assert.deepEqual(calls, [[{drafter: false, suffix_draft: 3}, 'session']]);
 });
 
 test('allocation tooltips sort every category by label', () => {

@@ -83,6 +83,15 @@ const SETTINGS = {context: "Per-conversation token limit", concurrent: "Conversa
                   copy_back: "Experts the GPU evicts"};
 /** The settings that are switches: the engine reports them as 1 or 0 and takes "on" or "off". */
 const SWITCHES = ["drafter", "save_on_shutdown"];
+/** Defines the Memory panel's prediction modes. Suffix guesses may replace model guesses; chained guesses follow
+ * them. A null label uses the mode's own words instead of extending the model drafter's label.
+ * @type {[choice: string, use: {model: boolean, suffix: boolean, chain: boolean}, label: string | null][]} */
+const DRAFTER_CHOICES = [["off", {model: false, suffix: false, chain: false}, null],
+                         ["on", {model: true, suffix: false, chain: false}, ""],
+                         ["suffix", {model: false, suffix: true, chain: false}, null],
+                         ["either", {model: true, suffix: true, chain: false}, ", or suffix drafter"],
+                         ["chain", {model: true, suffix: false, chain: true}, " + lookup"],
+                         ["all", {model: true, suffix: true, chain: true}, " + lookup, or suffix drafter"]];
 /** The settings that take one of a few words: the engine reports the word's index and takes the word.
  * @type {Record<string, string[]>} */
 const WORDS = {copy_back: ["off", "on", "auto"]};
@@ -324,11 +333,21 @@ function finishDrag(element, panel) {
 function changeControl(element, panel, input) {
   const key = input.dataset.setting ?? "";
   if (key === "drafter") {
-    panel.pending.drafter = input.value === "on";
-    if (panel.view.settings.suffix_draft != null) {
-      panel.pending.suffix_draft = input.value === "suffix" ? 3 : 0;
-      panel.pending.lookup_chain = 0;
+    const s = panel.view.settings;
+    const {model, suffix, chain} = (DRAFTER_CHOICES.find(([c]) => c === input.value) ?? DRAFTER_CHOICES[0])[1];
+    /** @type {Record<string, number | boolean>} */
+    const chosen = {drafter: model};
+    delete panel.pending.lookup_chain;
+    if (s.suffix_draft != null) {
+      chosen.suffix_draft = suffix ? s.suffix_draft || 3 : 0;
+      if (model)
+        chosen.lookup_chain = chain ? s.lookup_chain || 1 : 0;
     }
+    for (const [k, v] of Object.entries(chosen))
+      if (Number(v) === Number(s[k]))
+        delete panel.pending[k];
+      else
+        panel.pending[k] = v;
   } else if (input.type === "checkbox")
     panel.pending[key] = input.checked;
   else
@@ -468,22 +487,24 @@ function drawControls(panel) {
  * @param {Record<string, string> | undefined} details
  * @param {string} disabled */
 function drawDrafterControl(settings, details = {}, disabled = "") {
-  const suffix = !settings.drafter && !!(settings.suffix_draft || settings.lookup_chain);
+  const now = {model: !!settings.drafter, suffix: !!settings.suffix_draft,
+    chain: !!settings.drafter && !!settings.lookup_chain};
   const help = getControlHelp("drafter", settings) + " " +
     (details.drafter_details || "Drafter discovery details are not reported by this engine.") +
     (settings.suffix_draft == null ? "" :
-      " Suffix drafting uses greedy sampling only. Mode changes take effect on the next request.");
-  const model = `<option value="on"${settings.drafter ? " selected" : ""}` +
-    `${settings.has_drafter === 0 ? " disabled" : ""}>` +
-    `${esc(details.drafter_label || (settings.has_drafter === 0 ? "No model drafter loaded" :
-      "Use model drafter (VRAM cost not reported)"))}</option>`;
-  const lookup = settings.suffix_draft == null ? "" :
-    `<option value="suffix"${suffix ? " selected" : ""}>` +
-    `${esc(details.suffix_label || "Use suffix drafter (0 GiB)")}</option>`;
+      " Suffix drafting and lookup use greedy sampling only. \"Or suffix drafter\": a step takes the suffix " +
+      "drafter's guesses instead of MTP's where they start alike and have paid off so far. \"+ lookup\": a step " +
+      "may append guesses found in the conversation's text after MTP's. Mode changes take effect on the next request.");
+  const model = details.drafter_label || (settings.has_drafter === 0 ? "No model drafter loaded" :
+    "Use model drafter (VRAM cost not reported)");
+  const own = {off: "No MTP", suffix: details.suffix_label || "Use suffix drafter (0 GiB)"};
+  const options = DRAFTER_CHOICES.filter(([, use]) => settings.suffix_draft != null || !(use.suffix || use.chain))
+    .map(([choice, use, words]) => `<option value="${choice}"` +
+      `${use.model === now.model && use.suffix === now.suffix && use.chain === now.chain ? " selected" : ""}` +
+      `${use.model && settings.has_drafter === 0 ? " disabled" : ""}>` +
+      `${esc(words == null ? own[choice] : model + words)}</option>`);
   return `<label data-control="drafter" title="${esc(help)}">Drafter ` +
-    `<select class="st-input mem-input" data-setting="drafter"${disabled}>` +
-    `<option value="off"${!settings.drafter && !suffix ? " selected" : ""}>No MTP</option>` +
-    `${model}${lookup}</select></label>`;
+    `<select class="st-input mem-input" data-setting="drafter"${disabled}>${options.join("")}</select></label>`;
 }
 
 /** Gets controls supported by this engine; context_capacity advertises a live per-conversation limit.

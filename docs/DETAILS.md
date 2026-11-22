@@ -2241,6 +2241,10 @@ including with cost mode enabled. It reads the existing `dspark_conf`, `dspark_c
 request keys; a negative floor uses the engine's default. Model adapters run their networks, bind state, and
 return raw proposals and confidences. DeepSeek's plain step after a rejected model proposal is scheduled here too.
 `--lookahead 0` disables all drafting. `--drafter off` switches off only the model drafter.
+The Memory panel's Drafter list combines the model drafter, the suffix drafter (`--suffix-draft 3`: a step takes its
+guesses instead of the model's where the planner expects them to pay) and lookup after the model's guesses
+(`--lookup-chain 1`), six choices in all. It sends only the settings a choice changes, so a `--suffix-draft` or
+`--lookup-chain` the engine started with stays unless the choice needs another value.
 
 In `strata-ds41`, the Memory panel's Drafter switch (`CHANGE_SETTINGS drafter=off|on`) also releases and
 reloads DSpark's dense tensors. `--drafter off` and `--dspark off` start with those tensors released;
