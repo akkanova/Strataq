@@ -109,7 +109,7 @@ const WORD_LABELS = {copy_back: ["Dropped (read from the SSD again)", "Copied ba
  * @type {[rule: string, label: string][]} */
 const DRAFT_RULES = [["exact", "Exact"], ["speculative", "Speculative sampling"],
   ["typical", "Typical acceptance (Medusa) *"], ["lower-temperature", "Lower temperature *"],
-  ...[75, 90, 98].map((n) => /** @type {[string, string]} */ ([`top-${n}`, `Top ${n}% *`]))];
+  ...[75, 90, 99].map((n) => /** @type {[string, string]} */ ([`top-${n}`, `Top ${n}% *`]))];
 /** The draft acceptance choice's tooltip: what every rule in DRAFT_RULES does. */
 const DRAFT_RULE_HELP = [
   "Which of the drafter's guessed words an answer keeps. At temperature 0 all options give the same answers.",

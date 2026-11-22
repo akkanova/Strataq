@@ -875,7 +875,7 @@ test('the draft acceptance rule is a choice beside the drafter, sent and saved a
   };
   assert.deepEqual(selected(element), ['exact', 'Exact']);
   for (const label of ['Speculative sampling', 'Typical acceptance (Medusa) *', 'Lower temperature *', 'Top 75% *',
-                       'Top 90% *', 'Top 98% *'])
+                       'Top 90% *', 'Top 99% *'])
     assert.ok(element.innerHTML.includes(`>${label}</option>`), label);
   assert.match(element.innerHTML, /At temperature 0 all options give the same answers/);
   assert.match(element.innerHTML, /\* this option can change the output distribution"/);
