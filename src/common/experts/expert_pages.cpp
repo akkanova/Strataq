@@ -98,6 +98,10 @@ int32_t ExpertPages::get_slot(PageId page) const {
     return (int32_t) ((uint64_t) (pool_->page_address(page) - arena_) / pool_->page_bytes());
 }
 
+uint8_t* ExpertPages::get_slot_address(int32_t slot) const {
+    return cache_ == nullptr ? pool_->page_address((PageId) slot) : arena_ + (uint64_t) slot * pool_->page_bytes();
+}
+
 /// Makes the pool (open's shared part) with the conversations' `layout` and `config`'s limits, in chunks of `memory`
 /// (the cache's arena first) up to `bytes`.
 bool ExpertPages::open_pool(ChunkMemory memory, uint64_t bytes, const StateLayout& layout, PagePoolConfig config,
@@ -109,6 +113,7 @@ bool ExpertPages::open_pool(ChunkMemory memory, uint64_t bytes, const StateLayou
     memory_ = std::move(memory);
     n_expert_ = n_expert;
     max_experts_ = max_experts;
+    blob_bytes_ = blob_bytes;
     pages_.clear();
     for (const uint64_t b : blob_bytes)
         pages_.push_back((uint32_t) ((b + page - 1) / page));
@@ -161,8 +166,9 @@ void ExpertPages::stop_wanting_if(const std::function<bool(ExpertKey)>& is_held_
 
 int ExpertPages::refill(int max, uint64_t& wait_ms, std::string& err) {
     wait_ms = 0;
-    int loaded = 0;
-    while (loaded < max && !evicted_.empty()) {
+    std::vector<ExpertKey> keys;
+    std::vector<int32_t> slots;
+    while ((int) keys.size() < max && !evicted_.empty()) {
         const ExpertKey key = ranked_[(size_t) *evicted_.begin()];
         const int32_t slot = admit_free(key);
         if (slot == kNotResident) {
@@ -173,12 +179,22 @@ int ExpertPages::refill(int max, uint64_t& wait_ms, std::string& err) {
                 blocked_at_free_ = pool_->report().free.pages;
             break;
         }
-        if (!hooks_.load(key, slot, err))
-            return -1;
-        hooks_.moved(key, slot);
-        ++loaded;
+        keys.push_back(key);
+        slots.push_back(slot);
     }
-    return loaded;
+    if (!keys.empty() && !hooks_.load(keys.data(), slots.data(), keys.size(), err)) {
+        for (const ExpertKey& key : keys) {
+            pool_->remove_expert(key);
+            if (cache_ != nullptr)
+                cache_->evict(key.layer, key.expert);
+            evicted_.insert(rank_[index_of(key)]);
+        }
+        blocked_at_free_ = UINT64_MAX;
+        return -1;
+    }
+    for (size_t i = 0; i < keys.size(); ++i)
+        hooks_.moved(keys[i], slots[i]);
+    return (int) keys.size();
 }
 
 int32_t ExpertPages::admit(int64_t layer, int64_t expert, uint64_t used_at) {
@@ -204,7 +220,7 @@ int ExpertPages::replace(ExpertKey gone, ExpertKey key, std::string& err) {
     if (pool_->find_expert(key) != no_page)
         return 0;
     if (const int32_t free_slot = admit_free(key); free_slot != kNotResident) {
-        if (!hooks_.load(key, free_slot, err)) {
+        if (!hooks_.load(&key, &free_slot, 1, err)) {
             pool_->remove_expert(key);
             if (cache_ != nullptr)
                 cache_->evict(key.layer, key.expert);
@@ -229,7 +245,7 @@ int ExpertPages::replace(ExpertKey gone, ExpertKey key, std::string& err) {
         ranked_.push_back(key);
     }
     const int32_t slot = get_slot(first);
-    if (!hooks_.load(key, slot, err)) {
+    if (!hooks_.load(&key, &slot, 1, err)) {
         pool_->remove_expert(key);
         if (cache_ != nullptr)
             cache_->evict(gone.layer, gone.expert);

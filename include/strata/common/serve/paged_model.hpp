@@ -199,9 +199,6 @@ public:
     /// the GPUs hold) becomes how many of them are among the whole profile's first `max_experts`.
     virtual std::vector<strata::core::ExpertKey> get_card_ranking(int64_t lb, int64_t le,
                                                                   int64_t& max_experts) const = 0;
-    /// Copies expert `key`'s bytes into `card`'s pool from page `first`: the card's ExpertPages calls it when it takes
-    /// an expert in (ExpertPages::Hooks::load).
-    virtual bool load_expert(const PagedCard& card, strata::core::ExpertKey key, int32_t first, std::string& err) = 0;
     /// Gets the residency table: per expert (layer * n_expert + expert), its first page (ExpertPages' slot) in the pool
     /// of the card that runs its layer, else kNotResident.  The engine writes it as experts come and go and then calls
     /// publish_residency for each card; it reads it to choose the adaptive tier's swaps.

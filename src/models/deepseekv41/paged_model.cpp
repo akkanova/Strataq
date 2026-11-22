@@ -293,10 +293,9 @@ struct Part final : strata::serve::PagedPart {
 /// part owns the conversation's host state.
 class PagedDeepSeek final : public strata::serve::PagedModel {
 public:
-    /// `drafting`: the drafter is switched on at the start; `files`: the experts on the SSD; `ram`: the RAM's pool,
-    /// which the model reads (Options::expert_pages).
+    /// `drafting`: the drafter is switched on at the start.
     PagedDeepSeek(Model& m, const Options& o, const ProgramOptions& x, bool drafting,
-                  const std::vector<int>& eos, ExpertFiles& files, strata::core::RamExperts& ram, PagedCards& cards);
+                  const std::vector<int>& eos, PagedCards& cards);
 
     PagedParts make_parts(PagedCard& card, size_t first, size_t count, std::string& err) override;
     bool get_card_layout(const PagedCard& card, int64_t lb, int64_t le, strata::core::StateLayout& layout,
@@ -309,7 +308,6 @@ public:
         return m_.get_drafter_weight_bytes((int) card.index);
     }
     std::vector<strata::core::ExpertKey> get_card_ranking(int64_t lb, int64_t le, int64_t& max_experts) const override;
-    bool load_expert(const PagedCard& card, strata::core::ExpertKey key, int32_t first, std::string& err) override;
     std::vector<int32_t>& get_residency() override { return residency_; }
     bool publish_residency(const PagedCard& card, std::string& err) override;
     std::vector<float>& get_usage() override { return m_.get_usage(); }
@@ -442,8 +440,6 @@ private:
         note_logprobs(row.session, row.pos, pick, m_.vocab(),
                       [&](float* out) { return m_.copy_logits_row(logit_row, out); });
     }
-    bool copy_expert(const PagedCard& card, strata::core::ExpertKey key, int32_t first, bool from_ram,
-                     std::string& err);
     /// Gets the rows the prompt path's buffers hold when the engine lends them for chunks of `chunk` tokens: 16 more
     /// (the chunk path's row unit), up to the ceiling, for the prompt's last token, which read_prompt takes along, so
     /// that a read whose other tokens the chunk holds stays one chunk.  Never past the ceiling: the hand-offs between
@@ -465,9 +461,6 @@ private:
     Model& m_;
     const Options& o_;
     const ProgramOptions x_;
-    ExpertFiles& files_;
-    strata::core::RamExperts& ram_;
-    std::vector<uint8_t> staging_;     ///< an expert read from the files on its way to the GPU
     std::vector<uint64_t> blobs_;      ///< per layer (the trunk's, then the drafter's): one expert's bytes
     std::vector<int32_t> residency_;
     std::vector<Part*> leads_;          ///< The lead stage's parts, by conversation.
@@ -657,7 +650,7 @@ int run_paged_engine(int argc, char** argv) {
         std::fprintf(stderr, "%s: %s\n", kProgram.c_str(), err.c_str());
         return 1;
     }
-    PagedDeepSeek model(m, o, x, settings.drafter, parse_ids(eos), files, ram, cards);
+    PagedDeepSeek model(m, o, x, settings.drafter, parse_ids(eos), cards);
     for (PagedCard& card : cards) {
         strata::core::StateLayout stage_layout;
         int64_t most = x.gpu_experts;
@@ -689,9 +682,8 @@ int run_paged_engine(int argc, char** argv) {
 namespace {
 
 PagedDeepSeek::PagedDeepSeek(Model& m, const Options& o, const ProgramOptions& x,
-                             bool drafting, const std::vector<int>& eos, ExpertFiles& files,
-                             strata::core::RamExperts& ram, PagedCards& cards)
-    : m_(m), o_(o), x_(x), files_(files), ram_(ram), drafting_(drafting) {
+                             bool drafting, const std::vector<int>& eos, PagedCards& cards)
+    : m_(m), o_(o), x_(x), drafting_(drafting) {
     for (PagedCard& card : cards)
         cards_.push_back(&card);
     drafter_card_ = cards_.back();
@@ -732,7 +724,6 @@ PagedDeepSeek::PagedDeepSeek(Model& m, const Options& o, const ProgramOptions& x
     facts.adapt_swaps = x.adapt_swaps;
     facts.adapt_min_gain = x.adapt_min_gain;
     facts.adapt_decay = x.adapt_decay;
-    staging_.resize(*std::max_element(blobs_.begin(), blobs_.end()));
     residency_.assign(blobs_.size() * (size_t) g.n_exp, strata::core::kNotResident);
     const std::vector<strata::core::ExpertKey> all = get_ranking(m, 0, 0, true);
     drafter_experts_.assign(all.begin(), all.end());
@@ -755,10 +746,6 @@ std::vector<strata::core::ExpertKey> PagedDeepSeek::get_pool_ranking(int64_t lb,
     return ranking;
 }
 
-bool PagedDeepSeek::load_expert(const PagedCard& card, strata::core::ExpertKey key, int32_t first, std::string& err) {
-    return copy_expert(card, key, first, key.layer < facts.n_layers && ram_.holds(key.layer, key.expert), err);
-}
-
 bool PagedDeepSeek::publish_residency(const PagedCard& card, std::string& err) {
     const strata::core::PagePool& pool = card.experts.pool();
     std::vector<const uint8_t*> at(residency_.size(), nullptr);
@@ -770,25 +757,6 @@ bool PagedDeepSeek::publish_residency(const PagedCard& card, std::string& err) {
             at[i] = pool.page_address((strata::core::PageId) residency_[i]);
     const strata::core::OnDevice on(card.dev);
     return m_.set_expert_addresses(at, err, (int) card.index);
-}
-
-/// Copies expert `key` into `card`'s pool from page `first`: from the RAM's pool (`from_ram`, which holds it) or from
-/// the files through the staging buffer.
-bool PagedDeepSeek::copy_expert(const PagedCard& card, strata::core::ExpertKey key, int32_t first, bool from_ram,
-                                std::string& err) {
-    const uint8_t* bytes = from_ram ? ram_.blob(key.layer, key.expert)
-                                    : files_.copy_blob(key.layer, key.expert, staging_.data()) ? staging_.data()
-                                                                                              : nullptr;
-    const strata::core::OnDevice on(card.dev);
-    if (bytes == nullptr ||
-        !strata::core::gpu_copy(card.experts.pool().page_address((strata::core::PageId) first), bytes,
-                                (size_t) blobs_[(size_t) key.layer])) {
-        err = "copying layer " + std::to_string(key.layer) + " expert " + std::to_string(key.expert) + " to " +
-              card.id + " failed";
-        return false;
-    }
-    strata::core::count_gpu_traffic(card.dev, blobs_[(size_t) key.layer], 0);
-    return true;
 }
 
 PagedParts PagedDeepSeek::make_parts(PagedCard& card, size_t first, size_t count, std::string& err) {

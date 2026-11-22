@@ -45,6 +45,12 @@ public:
     /// Puts up to `max` of the experts the pool wants into free pages (ExpertPages::refill), reading them from the
     /// SSD in one batch of requests.  Gets how many, or -1 (with `err`) when the read failed; then none of them stays.
     int refill(int max, uint64_t& wait_ms, std::string& err);
+    /// Gives `use` the bytes of `n` experts for GPU loading, keys[i] being bytes[i] long. Held experts use the
+    /// pool's pages; others use one batch of SSD reads, including layers past the pool's (DeepSeek's drafter).
+    /// Keeps the pages and staging buffer stable until `use` returns; `use` must not call this pool again or keep
+    /// the pointers. Returns false on allocation, read or consumer failure.
+    bool use_blobs(const ExpertKey* keys, const uint64_t* bytes, size_t n,
+                   const std::function<bool(const uint8_t* const*)>& use);
     /// Takes or gives back chunks so that the pool and the staging ring hold `bytes` (ExpertPages::resize).
     PoolResize resize(uint64_t bytes) { return pages_.resize(bytes > ring_bytes() ? bytes - ring_bytes() : 0); }
     /// Copies expert `key` in from `bytes` (any memory: a GPU's pages it is leaving) when the pool does not hold it:
@@ -112,9 +118,9 @@ private:
     uint8_t* alloc(uint64_t bytes);
     void free(uint8_t* p);
 
-    /// While `refill` runs, the batch it reads from the SSD after admitting its experts (the `load` hook adds them);
-    /// null otherwise, when the hook reads each expert at once.
-    Reads* refill_reads_ = nullptr;
+    /// Where use_blobs reads experts for the GPUs' pools: as large as its largest batch so far
+    uint8_t* gpu_staging_ = nullptr;
+    uint64_t gpu_staging_bytes_ = 0;
     /// While keep_copy runs, the bytes the `load` hook copies in instead of reading the SSD; null otherwise.
     const uint8_t* copy_from_ = nullptr;
     ExpertSource* files_ = nullptr;
@@ -133,8 +139,8 @@ private:
     /// one read from the SSD, as the layer's work may still read it (the previous layers' work is done).  0 before
     /// the first layer: only lower-ranked experts give way.
     uint64_t layer_t0_ = 0;
-    /// Held by blob, prefetch, refill and keep_copy, which change the pool and the ring; shared by copy_blobs,
-    /// which only reads them
+    /// Held by blob, prefetch, refill, use_blobs and keep_copy, which change the pool and the ring; shared by
+    /// copy_blobs, which only reads them
     mutable std::shared_mutex mu_;
 };
 

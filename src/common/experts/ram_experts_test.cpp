@@ -152,6 +152,9 @@ int main() {
         later_ssd.fail = true;
         check(later.refill(2, ms, err) == -1 && !later.holds(2, 0) && !later.holds(0, 1),
               "a failed SSD batch publishes none of its experts");
+        later_ssd.fail = false;
+        check(later.pages().is_refill_wanted() && later.refill(2, ms, err) == 2 && later.holds(2, 0) &&
+                  later.holds(0, 1), "a failed refill keeps its experts eligible for retry");
     }
     check(is_expert(ram.blob(1, 2), 1, 2) && !ram.transient(1, 2), "an expert in the pool is its bytes there");
     const int filled = ssd.reads;
@@ -166,6 +169,34 @@ int main() {
     check(ram.copy_blob(1, 0, out.data()) && is_expert(out.data(), 1, 0) && ram.copy_blob(1, 6, out.data()) &&
               is_expert(out.data(), 1, 6),
           "copy_blob gives the pool's and the SSD's experts");
+    {
+        const ExpertKey keys[] = {{1, 0}, {1, 6}, {2, 6}};   // one the pool holds, two it does not
+        const uint64_t bytes[] = {kBlobs[1], kBlobs[1], kBlobs[2]};
+        const int reads = ssd.reads, batches = ssd.batches;
+        check(ram.use_blobs(keys, bytes, 3, [&](const uint8_t* const* from) {
+                  return is_expert(from[0], 1, 0) && is_expert(from[1], 1, 6) && is_expert(from[2], 2, 6);
+              }) && ssd.reads == reads + 2 && ssd.batches == batches + 1 &&
+                  !ram.holds(1, 6) && !ram.holds(2, 6),
+              "use_blobs gives held experts and reads the others in one batch");
+        ssd.fail = true;
+        check(!ram.use_blobs(keys, bytes, 3, [](const uint8_t* const*) {
+                  check(false, "a failed read must not call the consumer");
+                  return true;
+              }), "use_blobs fails when the SSD read fails");
+        ssd.fail = false;
+    }
+
+    {
+        RamExperts trunk;
+        check(trunk.open(ssd, 4 * kPage, 1, layout, config, {kBlobs[0]}, kExperts, {{0, 0}}, err), err.c_str());
+        const ExpertKey key{2, 6};
+        const uint64_t bytes = kBlobs[2];
+        check(trunk.use_blobs(&key, &bytes, 1, [](const uint8_t* const* from) {
+                  return is_expert(from[0], 2, 6);
+              }), "use_blobs reads a drafter layer past the RAM pool's layers");
+        check(!trunk.use_blobs(&key, &bytes, 1, [](const uint8_t* const*) { return false; }),
+              "use_blobs reports a consumer failure");
+    }
 
     PagePool& pool = ram.pages().pool();
     check(pool.grow_conversation(9, 8).empty(), "a paused conversation takes pages");

@@ -187,7 +187,6 @@ public:
                          std::string& err) const override;
     uint64_t get_gpu_keep(const PagedCard& card) const override;
     std::vector<strata::core::ExpertKey> get_card_ranking(int64_t lb, int64_t le, int64_t& max_experts) const override;
-    bool load_expert(const PagedCard& card, strata::core::ExpertKey key, int32_t first, std::string& err) override;
     std::vector<int32_t>& get_residency() override { return m_.host_res; }
     bool publish_residency(const PagedCard& card, std::string& err) override;
     std::vector<float>& get_usage() override { return m_.drive.d.usage; }
@@ -327,7 +326,6 @@ private:
     std::vector<int32_t> picks_;       ///< the last step's token after each row, for the drafter
     std::vector<const std::vector<int32_t>*> histories_; ///< consumed tokens for the current step
     std::vector<int> history_lengths_; ///< each session's penalty window
-    std::vector<uint8_t> staging_;     ///< an expert read from the SSD on its way to a GPU (load_expert)
 };
 
 std::string get_split_hop_refusal(const Options& o);
@@ -523,7 +521,6 @@ PagedQwen::PagedQwen(Model& m, Conversation& conv, const PagedCards& cards, Mode
     facts.draft_limits.confidence = (float) o.spec_min_p;
     facts.drafter_start = "--mtp and a --lookahead above 0";
     facts.expert_bytes = get_blob_bytes(m);
-    staging_.resize(*std::max_element(facts.expert_bytes.begin(), facts.expert_bytes.end()));
     for (size_t i = 0; i < m.profile_all.size() && (int64_t) i < o.expert_cache; ++i)
         facts.split_ranking.push_back({m.profile_all[i].first, m.profile_all[i].second});
     facts.gpu_experts = o.expert_cache;
@@ -676,18 +673,6 @@ uint64_t PagedQwen::get_gpu_keep(const PagedCard& card) const {
 
 std::vector<strata::core::ExpertKey> PagedQwen::get_card_ranking(int64_t lb, int64_t le, int64_t& max_experts) const {
     return qwen38::get_card_ranking(m_, lb, le, max_experts);
-}
-
-bool PagedQwen::load_expert(const PagedCard& card, strata::core::ExpertKey key, int32_t first, std::string& err) {
-    const auto bytes = (int64_t) facts.expert_bytes[(size_t) key.layer];
-    // an expert the RAM's pool lacks is read past it, so that the pool keeps its pages for the experts the GPUs lack
-    const uint8_t* blob = ram_.holds(key.layer, key.expert) ? m_.srcp->blob_stable(key.layer, key.expert)
-                          : m_.srcp->copy_blob(key.layer, key.expert, staging_.data()) ? staging_.data()
-                                                                                       : nullptr;
-    if (blob == nullptr)
-        err = "no bytes for layer " + std::to_string(key.layer) + " expert " + std::to_string(key.expert);
-    const strata::core::OnDevice on(card.dev);
-    return blob != nullptr && cards_[card.index].cache->fill_slot_blocking(first, blob, err, bytes);
 }
 
 bool PagedQwen::publish_residency(const PagedCard& card, std::string& err) {

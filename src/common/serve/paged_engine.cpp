@@ -5,6 +5,7 @@
 
 #include "strata/base/gpu/memory_info.hpp"
 #include "strata/base/gpu/on_device.hpp"
+#include "strata/base/gpu/runtime.hpp"
 #include "strata/base/gpu/traffic.hpp"
 #include "strata/common/experts/card_rules.hpp"
 #include "strata/common/experts/expert_swaps.hpp"
@@ -422,6 +423,10 @@ private:
     /// many experts came in, or -1 on a load or residency upload failure; `wait_ms` gets 0, or the milliseconds until
     /// pages open to the next expert.
     int fill_round(uint64_t& wait_ms);
+    /// Copies `n` experts into `card`'s pool (its ExpertPages' `load` hook): keys[i] to slot slots[i], from the RAM's
+    /// pool or from one batch of SSD reads (RamExperts::use_blobs).  False (and `err`) when a read or a copy failed.
+    bool load_experts(const PagedCard& card, const strata::core::ExpertKey* keys, const int32_t* slots, size_t n,
+                      std::string& err);
     /// Tells whether a pool can take more of the start-up fill's experts now (ExpertPages::is_refill_wanted).
     bool is_fill_wanted() const;
     /// Uploads the cards' residency tables when experts came or left since the last upload.
@@ -638,9 +643,8 @@ PagedEngine::PagedEngine(PagedModel& model, PagedCards& cards, strata::core::Ram
     }
     for (PagedCard& card : cards_) {
         strata::core::ExpertPages::Hooks hooks;
-        hooks.load = [this, &c = card](strata::core::ExpertKey key, int32_t slot, std::string& err) {
-            return model_.load_expert(c, key, slot, err);
-        };
+        hooks.load = [this, &c = card](const strata::core::ExpertKey* keys, const int32_t* slots, size_t n,
+                                       std::string& err) { return load_experts(c, keys, slots, n, err); };
         // an expert of another card's layers goes to the card's `lent`, not to the residency table its layer's card
         // reads; an evicted one leaves whichever holds it
         hooks.moved = [this, &c = card](strata::core::ExpertKey key, int32_t slot) {
@@ -2174,6 +2178,28 @@ int PagedEngine::fill_round(uint64_t& wait_ms) {
         filling_since_.reset();
         refilling_ = false;
     }
+    return loaded;
+}
+
+bool PagedEngine::load_experts(const PagedCard& card, const strata::core::ExpertKey* keys, const int32_t* slots,
+                               size_t n, std::string& err) {
+    std::vector<uint64_t> bytes(n);
+    for (size_t i = 0; i < n; ++i)
+        bytes[i] = card.experts.get_expert_bytes(keys[i].layer);
+    const bool loaded = ram_.use_blobs(keys, bytes.data(), n, [&](const uint8_t* const* from) {
+        const strata::core::OnDevice on(card.dev);
+        for (size_t i = 0; i < n; ++i) {
+            if (!strata::core::gpu_copy(card.experts.get_slot_address(slots[i]), from[i], (size_t) bytes[i])) {
+                err = "copying layer " + std::to_string(keys[i].layer) + " expert " + std::to_string(keys[i].expert) +
+                      " to " + card.id + " failed";
+                return false;
+            }
+            strata::core::count_gpu_traffic(card.dev, bytes[i], 0);
+        }
+        return true;
+    });
+    if (!loaded && err.empty())
+        err = "reading " + std::to_string(n) + " experts for " + card.id + " failed";
     return loaded;
 }
 
