@@ -3,6 +3,7 @@
 #include "strata/base/gpu/emulate.hpp"
 #include "strata/base/gpu/sm75_series.hpp"
 #include "strata/base/gpu/sm120_series.hpp"
+#include "strata/base/platform/env.hpp"
 #include "strata/core/dispatch_stats.hpp"
 #include "strata/core/defaults_026.hpp"
 #define STRATA_Q81_FASTMATH_DIV 1   // #3948: the q8_1 tails divide as native_mmvq.cu (--use_fast_math) does, see q8_1_finite.hpp
@@ -482,10 +483,7 @@ bool gr_up_wide_on() {
     // CUDA-measured kernel on there (unmeasured on AMD).  The persistent HC read is the HIP card's own opt-in.
     return false;
 #else
-    static const int env = [] {
-        const char* v = std::getenv("STRATA_GR_UP_WIDE");
-        return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1;
-    }();
+    static const int env = strata::platform::env_tri("STRATA_GR_UP_WIDE");
     if (env >= 0) return env != 0;
     static int per_dev[64];   // 0 unknown, 1 no, 2 yes
     int dev = 0;
@@ -494,7 +492,7 @@ bool gr_up_wide_on() {
         int major = 0, minor = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-        per_dev[dev] = strata::gr_up_wide_default(false, major, minor, strata::qwen_defaults_026()) ? 2 : 1;
+        per_dev[dev] = strata::gr_up_wide_default(false, major, minor, strata::defaults_026()) ? 2 : 1;
         cudaGetLastError();   // drop what an attribute query on a CPU-only box leaves behind
     }
     return per_dev[dev] == 2;
@@ -1511,10 +1509,7 @@ namespace {
 // same bits; checked bitwise on the 5070 for 0.1.40). Default off: a 10-pair interleaved decode A/B on the RTX 5070 (Q2_0,
 // default config) did not show the +2.8-3.5% of bench #832 (medians 0.97-0.99 of the off arm).
 bool gr_down_max4() {
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_GR_DOWN_MAX4");
-        return v != nullptr && std::atoi(v) != 0;
-    }();
+    static const bool on = strata::platform::env_tri("STRATA_GR_DOWN_MAX4") == 1;
     return on;
 }
 
@@ -1629,10 +1624,7 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
     // n_out = tokens a down launch, ncols = tokens
     strata::dispatch::kernel(strata::dispatch::kHc, variant, m.a[0].s_down != nullptr ? 1 : 0, tv, chunk_tok, n_tok);
     const size_t per_tok = (staged ? (size_t) 2 * H_TILE : (size_t) tv) * sizeof(float);
-    static const bool no_multi_gr = [] {
-        const char* no = std::getenv("STRATA_NO_MULTI_GR");
-        return no != nullptr && no[0] != '\0' && no[0] != '0';
-    }();
+    static const bool no_multi_gr = strata::platform::is_env_on("STRATA_NO_MULTI_GR");
     const bool exact_t = !no_multi_gr;
     for (int c0 = 0; c0 < n_tok; c0 += chunk_tok) {
         const int ct = n_tok - c0 < chunk_tok ? n_tok - c0 : chunk_tok;
@@ -2680,7 +2672,7 @@ static bool gr_v3_default_on(int dev) {
         cudaDeviceProp p;
         const bool ok = cudaGetDeviceProperties(&p, dev) == cudaSuccess;
         if (!ok) cudaGetLastError();
-        per_dev[dev] = ok && strata::gr_v3_default(false, p.major, p.minor, p.integrated != 0, (double) p.totalGlobalMem, strata::qwen_defaults_026()) ? 2 : 1;
+        per_dev[dev] = ok && strata::gr_v3_default(false, p.major, p.minor, p.integrated != 0, (double) p.totalGlobalMem, strata::defaults_026()) ? 2 : 1;
     }
     return per_dev[dev] == 2;
 #endif
@@ -3649,7 +3641,7 @@ void launch(const FusedGrArgs* a, int n_tok, const DevState& st, cudaStream_t s,
     kernel_for(n_tok)<<<NB, THREADS, 0, s>>>(f);
 }
 bool env_on() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_HC_PERSIST"); return v != nullptr && std::atoi(v) != 0; }();
+    static const bool on = strata::platform::env_tri("STRATA_HC_PERSIST") == 1;
     return on;
 }
 }  // namespace hcp

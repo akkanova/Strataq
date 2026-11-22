@@ -1,4 +1,5 @@
 #include "strata/common/serve/loop.hpp"
+#include "strata/common/serve/option_names.hpp"
 #include "strata/common/serve/request_output.hpp"
 #define DPCT_COMPAT_RT_VERSION 12080
 // src/program/generate.cpp - P2.S6: `strata generate`.
@@ -76,7 +77,7 @@ namespace strata::prefill { void set_nonresident_share(double share); }   // SYC
 #include "strata/common/kernels/mrope.hpp"
 #include "strata/models/qwen38/kernels/kv_q4.hpp"
 #include "strata/common/experts/split_rules.hpp"
-#include "strata/models/qwen38/adapt_decay.hpp"
+#include "strata/models/common/adapt_decay.hpp"
 #include "strata/models/qwen38/kernels/qsa.hpp"
 #include "strata/models/qwen38/native_head.hpp"
 #include "strata/models/qwen38/verify.hpp"
@@ -776,7 +777,7 @@ void usage() {
                  "  --pack DIR           the pack directory (default pack/full)\n"
                  "  --tokens LIST        the prompt as comma-separated token IDS (required)\n"
                  "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
-                 "  --ple-gguf PATH      required PLE table (original second GGUF shard); with --native, the model's\n"
+                 "  --ple-gguf PATH      required PLE table (original second GGUF shard); with --model, the model's\n"
                  "                       shard that holds per_layer_token_embd.weight when not given\n"
                  "  --no-ple             explicit diagnostic ablation of the PLE layer\n"
                  "  --ple-io direct|mmap|ram  n-gram table reads (plan v0.3 P2). direct (default): unbuffered SSD\n"
@@ -815,12 +816,12 @@ void usage() {
                  "  --native-ple-postops  experimental pinned PLE postprojection arithmetic\n"
                  "  --native-router       experimental pinned CUDA 512-expert top-10 routing\n"
                  "  --cpu-oracle-q8-0     experimental pinned CPU expert quantization and dot reduction\n"
-                 "  --native SHARD1      every full-context native path at once (plan v0.3 P1): stream-token,\n"
+                 "  --model SHARD1       every full-context native path at once (plan v0.3 P1): stream-token,\n"
                  "                       GR MMVF, BF16, head, dense + PLE key, MoE combine, GDN, router, QSA,\n"
                  "                       indexer, RoPE, PLE postops, and the CPU q8_0 contract unless the\n"
                  "                       expert cache is on. Individual --native-* flags stay for A/B.\n"
                  "  --native-head-gguf PATH  native Q5_K head from model shard 1; requires --stream-token\n"
-                 "  --embd-gguf PATH     the token embedding from this GGUF instead of --native's (tools/embd_bf16_pack.py:\n"
+                 "  --embd-gguf PATH     the token embedding from this GGUF instead of --model's (tools/embd_bf16_pack.py:\n"
                  "                       BF16 as the checkpoint ships it; mapped host memory, no VRAM)\n"
                  "  --native-dense-gguf PATH native GDN/QSA/shared projections; repeat for each source model shard\n"
                  "  --expert-cache-cpu-order  experimental GPU expert reduction matching CPU order\n"
@@ -900,7 +901,7 @@ void usage() {
                  "  --cvec-dir per-layer|single:L  each layer's own direction (default) or layer L's everywhere (project)\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
-                 "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
+                 "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --model); auto =\n"
                  "                       the largest chunk up to 8192 whose buffers the expert cache can lend;\n"
                  "                       auto:16384 / auto:32768 (or STRATA_PREFILL_AUTO_MAX) allow bigger ones\n"
                  "  --no-pool            skip the CPU expert pool (the GPU-only floor)\n"
@@ -1803,7 +1804,7 @@ int main(int argc, char **argv) try {
     bool have_tokens = false;
     bool have_logits_stride = false;
     for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
+        const std::string a = strata::serve::get_primary_option(argv[i]);
         auto next = [&](const char* what) -> const char* {
             if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", what); std::exit(2); }
             return argv[++i];
@@ -1885,7 +1886,7 @@ int main(int argc, char **argv) try {
         else if (a == "--native-ple-postops") o.native_ple_postops = true;
         else if (a == "--native-router") o.native_router = true;
         else if (a == "--cpu-oracle-q8-0") o.cpu_oracle_q8_0 = true;
-        else if (a == "--native") o.native_preset = next("--native");
+        else if (a == "--model") o.native_preset = next("--model");
         else if (a == "--native-head-gguf") o.native_head_gguf = next("--native-head-gguf");
         else if (a == "--embd-gguf") o.embd_gguf = next("--embd-gguf");
         else if (a == "--native-dense-gguf") o.native_dense_gguf.push_back(next("--native-dense-gguf"));
@@ -1958,7 +1959,6 @@ int main(int argc, char **argv) try {
         else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
         else if (a == "--spec") o.spec = std::atoi(next("--spec"));
         else if (a == "--batch") o.batch = std::atoi(next("--batch"));
-        else if (a == "--slots") o.batch = std::atoi(next("--slots"));   // the same as --batch
         else if (a == "--trim-stage-weights") o.trim_stage_weights = true;
         else if (a == "--batch-groups") {
             const std::string bg = next("--batch-groups");
@@ -2482,7 +2482,7 @@ int main(int argc, char **argv) try {
                 const strata::GgufFile meta(o.native_shards.front());
                 const std::string why = strata::model_family_not_supported(strata::model_family(meta));
                 if (strata::model_family(meta) != strata::ModelFamily::Unknown && !why.empty()) {
-                    std::fprintf(stderr, "strata generate: --native %s: %s\n", o.native_preset.c_str(), why.c_str());
+                    std::fprintf(stderr, "strata generate: --model %s: %s\n", o.native_preset.c_str(), why.c_str());
                     return 2;
                 }
             }
@@ -2494,11 +2494,11 @@ int main(int argc, char **argv) try {
                 if (model.find("per_layer_token_embd.weight", &at) != nullptr) o.ple_gguf = o.native_shards[at];
             }
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "strata generate: --native %s: %s\n", o.native_preset.c_str(), e.what());
+            std::fprintf(stderr, "strata generate: --model %s: %s\n", o.native_preset.c_str(), e.what());
             return 2;
         }
         if (o.no_ple || o.ple_gguf.empty()) {
-            std::fprintf(stderr, "strata generate: --native requires --ple-gguf (the PLE key is native too), and no "
+            std::fprintf(stderr, "strata generate: --model requires --ple-gguf (the PLE key is native too), and no "
                                  "shard of the model holds per_layer_token_embd.weight\n");
             return 2;
         }

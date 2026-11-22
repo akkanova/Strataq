@@ -17,6 +17,7 @@
 #pragma once
 #include <cstdlib>
 
+#include "strata/base/gpu/shape_graph_cache.hpp"
 #include "strata/models/qwen38/session.hpp"
 
 #include <cuda_runtime.h>
@@ -234,7 +235,7 @@ private:
     float *logits_ = nullptr, *topval_ = nullptr, *hsel_ = nullptr, *out_prob_ = nullptr;
     int32_t *toptok_ = nullptr, *out_tok_ = nullptr;
     uint32_t* topscratch_ = nullptr;
-    cudaGraphExec_t exec_[kRows + 1] = {};
+    strata::core::ShapeGraphCache<int> graphs_;   ///< the captured rounds by their count of new rows (1..kRows)
     const float* graph_taps_ = nullptr;
     int ndraft_ = kDrafts;          ///< drafts a window can use (set_max_drafts)
     int64_t have_ctx_ = 0;

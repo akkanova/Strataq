@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace strata::ds4;
@@ -70,6 +71,23 @@ int main() {
         check(files.copy_blobs(ls.data(), es.data(), dst.data(), dst.size()), "10 experts are read in batches");
         std::vector<uint8_t> one(layers[1].blob, fill);
         check(files.copy_blob(1, 3, one.data()) && one == blobs[8], "one expert reads as in a batch");
+        std::vector<std::thread> readers;
+        int results[4] = {};
+        for (size_t t = 0; t < 4; ++t)
+            readers.emplace_back([&, t] {
+                std::vector<std::vector<uint8_t>> copies;
+                std::vector<uint8_t*> targets;
+                for (const auto& blob : blobs)
+                    copies.emplace_back(blob.size(), fill);
+                for (auto& copy : copies)
+                    targets.push_back(copy.data());
+                if (files.copy_blobs(ls.data(), es.data(), targets.data(), targets.size()) && copies == blobs)
+                    results[t] = 1;
+            });
+        for (std::thread& reader : readers)
+            reader.join();
+        for (int result : results)
+            check(result == 1, "one ExpertFiles instance serves concurrent batches");
         for (size_t i = 0; i < blobs.size(); ++i) {
             const ExpertFileLayout& l = layers[(size_t) ls[i]];
             bool same = true, untouched = true;

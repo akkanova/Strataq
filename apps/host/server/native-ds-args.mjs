@@ -15,8 +15,10 @@ export const DS_VALUE_FLAGS = new Set([
 ]);
 /** Options that stand alone. */
 export const DS_SWITCH_FLAGS = new Set(['--no-expert-cache', '--profile-readonly', '--verbose', '-v']);
-/** The Qwen engine's names for settings the DeepSeek engine has under another name (same meaning). */
-export const DS_RENAMED = { '--vram-reserve-mib': '--reserve-mib' };
+/** Uses spellings accepted by installed DeepSeek engines that predate the shared option names. */
+export const DS_RENAMED = {
+  '--vram-reserve-mib': '--reserve-mib', '--eos-ids': '--eos', '--ctx': '--max-context',
+};
 
 const isFlag = text => typeof text === 'string' && text.startsWith('-') && text.length > 1 && /^-{1,2}[A-Za-z]/.test(text);
 /** The words that follow `flag` at `at` up to the next option: its value (one word, or none for a switch at the end of the list). */

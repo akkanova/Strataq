@@ -4,6 +4,7 @@
 // (ggml/src/ggml-cuda/vecdotq.cuh, dequantize.cuh, quantize.cu at the commit in third_party/ggml/VERSION.txt;
 // MIT license, third_party/ggml/LICENSE).  The block structs and codebook grids come from its ggml-common.h,
 // included unchanged.
+#include "strata/base/platform/env.hpp"
 #include "strata/base/gpu/managed_memory.hpp"
 #include "strata/common/kernels/iq_kernels.hpp"
 #include "strata/core/defaults_026.hpp"
@@ -3413,18 +3414,13 @@ bool gu_split(int t) {
     }
 }
 
-bool env_on(const char* name) {
-    const char* v = std::getenv(name);
-    return v != nullptr && v[0] != '\0' && v[0] != '0';
-}
+using strata::platform::env_int;
+using strata::platform::is_env_on;
 // STRATA_OLD_IQ_MMVQ=1 keeps the per-column kernels (bitwise equal to the new ones; kept for A/B timing)
-bool g_old_kernels = env_on("STRATA_OLD_IQ_MMVQ");
-bool g_no_sub16_gu = env_on("STRATA_NO_SUB16_GU");
+bool g_old_kernels = is_env_on("STRATA_OLD_IQ_MMVQ");
+bool g_no_sub16_gu = is_env_on("STRATA_NO_SUB16_GU");
 // STRATA_IQ_STAGE_GRID=0 disables staging 64-bit i-quant codebook tables into shared memory
-bool g_stage_grid = [] {
-    const char* v = std::getenv("STRATA_IQ_STAGE_GRID");
-    return v == nullptr || v[0] == '\0' || v[0] != '0';
-}();
+bool g_stage_grid = !strata::platform::is_env_off("STRATA_IQ_STAGE_GRID");
 // The single-matrix mmvq (128-thread blocks, one per 4 rows) pays the 2-8 KB staging per block: on the RTX 5070 its
 // IQ2_XS / IQ2_S / IQ1_M calls were 10-20% slower staged at 3-8 columns (iq_multi_parity --bench), while the grouped
 // expert kernels gain.  So mmvq stages only with STRATA_IQ_STAGE_GRID_MMVQ=1 (bitwise the same either way).
@@ -3439,10 +3435,7 @@ bool g_stage_grid_mmvq = g_stage_grid && [] {
 // it is not on by default.  On an RTX 3090 Ti, forced on, the IQ3_S layers took 3-13% longer.
 bool stage_tables_on() {
     if (!g_stage_grid) return false;
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_IQ_STAGE_TABLES");
-        return v && v[0] && v[0] != '0';
-    }();
+    static const bool on = strata::platform::is_env_on("STRATA_IQ_STAGE_TABLES");
     return on;
 }
 
@@ -4074,25 +4067,21 @@ void s27_launch_ts(bool ts, const NativeExpertLayout& L, int64_t cap_groups, cud
 }
 
 // ---- EXPDEC launch: knobs, shapes, rows per block
-int env_int_or(const char* name, int dflt) {
-    const char* v = std::getenv(name);
-    return v != nullptr && v[0] != '\0' ? std::atoi(v) : dflt;
-}
 // read at first use (not at load), so a per-architecture default set at start (nv_defaults.hpp) is seen; native_expert_set_expdec overrides
 int g_expdec = -1;
-int expdec_mode() { if (g_expdec < 0) g_expdec = env_on("STRATA_EXPDEC") ? 1 : 0; return g_expdec; }
-int g_expdec_r = env_int_or("STRATA_EXPDEC_R", 1);          // gate/up rows per lane: 1, 2 (bench: R=1 wins on the 2080 Ti)
-int g_expdec_dr = env_int_or("STRATA_EXPDEC_DR", 4);        // down rows per lane: 1, 2, 4 (Q2_0: R=4 wins on both cards)
-int g_expdec_minb = env_int_or("STRATA_EXPDEC_MINB", STRATA_EXPDEC_MINB);   // gate/up __launch_bounds__ min blocks: 2 (<= 128 regs) or 4 (<= 64)
-int g_expdec_d20 = env_int_or("STRATA_EXPDEC_D20", 0);      // 1: EXPDEC also for the IQ4_NL down (bench: no gain, default kernel)
+int expdec_mode() { if (g_expdec < 0) g_expdec = is_env_on("STRATA_EXPDEC") ? 1 : 0; return g_expdec; }
+int g_expdec_r = env_int("STRATA_EXPDEC_R", 1);          // gate/up rows per lane: 1, 2 (bench: R=1 wins on the 2080 Ti)
+int g_expdec_dr = env_int("STRATA_EXPDEC_DR", 4);        // down rows per lane: 1, 2, 4 (Q2_0: R=4 wins on both cards)
+int g_expdec_minb = env_int("STRATA_EXPDEC_MINB", STRATA_EXPDEC_MINB);   // gate/up __launch_bounds__ min blocks: 2 (<= 128 regs) or 4 (<= 64)
+int g_expdec_d20 = env_int("STRATA_EXPDEC_D20", 0);      // 1: EXPDEC also for the IQ4_NL down (bench: no gain, default kernel)
 // 1: EXPDEC for the down too (Q2_0; IQ4_NL with _D20).  Default 0: in the engine (nsys of a 131k decode on a 2080 Ti) the Q2_0 down
 // with EXPDEC was ~10% slower than the default kernel although the bench alone had it at 0.78.  Read at first use, so a per-architecture
 // default set at start (arch_defaults.cpp: gfx12) is seen; native_expert_set_expdec_params overrides.
 int g_expdec_down = -1;
-int expdec_down_on() { if (g_expdec_down < 0) g_expdec_down = env_int_or("STRATA_EXPDEC_DOWN", 0) != 0 ? 1 : 0; return g_expdec_down; }
-int g_expdec_rb = env_int_or("STRATA_EXPDEC_RB", 0);        // gate/up rows per block (0 = auto)
-int g_expdec_drb = env_int_or("STRATA_EXPDEC_DRB", 0);      // down rows per block (0 = auto)
-int g_expdec_minblk = env_int_or("STRATA_EXPDEC_MINBLK", 800);   // auto: the most rows per block that keep this many blocks
+int expdec_down_on() { if (g_expdec_down < 0) g_expdec_down = env_int("STRATA_EXPDEC_DOWN", 0) != 0 ? 1 : 0; return g_expdec_down; }
+int g_expdec_rb = env_int("STRATA_EXPDEC_RB", 0);        // gate/up rows per block (0 = auto)
+int g_expdec_drb = env_int("STRATA_EXPDEC_DRB", 0);      // down rows per block (0 = auto)
+int g_expdec_minblk = env_int("STRATA_EXPDEC_MINBLK", 800);   // auto: the most rows per block that keep this many blocks
 int expdec_r() { return g_expdec_r == 2 ? 2 : 1; }
 int expdec_dr() { return g_expdec_dr == 1 || g_expdec_dr == 2 ? g_expdec_dr : 4; }
 
@@ -4590,7 +4579,7 @@ __global__ void __launch_bounds__(256, 4) native_down_ws_kernel(const unsigned l
 // STRATA_DOWN_WS=1 on a compute capability 6.0 device: the IQ4_NL / Q2_0 down rows at n_ff 640 take
 // native_down_ws_kernel (whatever the expert mode: it is bitwise mode 0's, and mode 8's matches mode 0)
 bool down_ws_on(const NativeExpertLayout& L) {
-    static const bool env = env_on("STRATA_DOWN_WS");
+    static const bool env = is_env_on("STRATA_DOWN_WS");
     if (!env || g_old_kernels || g_no_sub16_gu || L.n_ff != 640 || (L.d_type != 20 && L.d_type != 42)) return false;
     static int per_dev[64];   // 0 unknown, 1 no, 2 yes
     int dev = 0;
@@ -6196,7 +6185,7 @@ int exp_mode() {
         const char* sm61 = std::getenv("STRATA_SM61_TABLE");
         const bool p40 = major == 6 && minor == 1 && (sm61 == nullptr || std::atoi(sm61) != 0);
         const char* sm121 = std::getenv("STRATA_SM121_PERF");
-        const bool gb10 = major == 12 && minor == 1 && !strata::qwen_defaults_026() &&
+        const bool gb10 = major == 12 && minor == 1 && !strata::defaults_026() &&
                           (sm121 == nullptr || std::atoi(sm121) != 0);
         // Turing (sm_75): mode 4 (native_expert_bench, real Q2_0 rows of Flash-Next, bitwise equal to mode 0 on an RTX
         // 2080 Ti: 10 experts x 1 entry 47.3 -> 41.4 us, 30 x 1 120.2 -> 100.2 us); the down projection keeps the CUDA
@@ -6235,7 +6224,7 @@ void native_expert_set_mode(int mode, int phase) {
 }
 
 namespace {
-bool g_grouped_v1 = env_on("STRATA_GROUPED_V1");
+bool g_grouped_v1 = is_env_on("STRATA_GROUPED_V1");
 }  // namespace
 
 void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
@@ -6466,7 +6455,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #if defined(STRATA_HIP_GFX906)
     // gfx906: the separate SwiGLU and q8_1 passes stay the default (the A/B baseline); the RDNA one-pass
     // kernel (bitwise the same) with STRATA_HIP_SWIGLU_FUSED=1
-    static const bool sw_fused = env_on("STRATA_HIP_SWIGLU_FUSED");
+    static const bool sw_fused = is_env_on("STRATA_HIP_SWIGLU_FUSED");
     const bool sw_v1 = v1 || !sw_fused;
 #else
     const bool sw_v1 = v1;

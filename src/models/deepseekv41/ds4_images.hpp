@@ -1,5 +1,6 @@
 #pragma once
 #include "ds4_model.hpp"
+#include "strata/base/hash.hpp"
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -40,13 +41,7 @@ inline bool read_pics(const std::string& path, std::vector<Pic>& v, std::string&
         p.width = wh[0], p.height = wh[1];
         p.rgb.resize((size_t) p.width * p.height * 3);
         ok = std::fread(p.rgb.data(), 1, p.rgb.size(), f) == p.rgb.size();
-        uint64_t h = 1469598103934665603ull;   // FNV-1a over the size and the pixels
-        for (int32_t x : wh)
-            for (int b = 0; b < 4; ++b)
-                h = (h ^ (uint8_t) (x >> (8 * b))) * 1099511628211ull;
-        for (uint8_t b : p.rgb)
-            h = (h ^ b) * 1099511628211ull;
-        p.hash = h;
+        p.hash = strata::core::fnv1a64(p.rgb.data(), p.rgb.size(), strata::core::fnv1a64(wh, sizeof wh));
         v.push_back(std::move(p));
     }
     std::fclose(f);

@@ -13,6 +13,7 @@
 // partials are reduced through shuffle; the CPU walks every chunk in order with its own accumulator shape.
 // The two agree to float rounding and not to the bit, which is the same contract `s_gemv_parity` carries for
 // the same reason.  `bench/micro/moe_hit_parity.cu` is the check.
+#include "strata/base/platform/env.hpp"
 #include "strata/models/common/kernels/s2_expert_grouped.hpp"
 #include "strata/core/geometry.hpp"
 #include "strata/common/kernels/dp4a.hpp"
@@ -591,10 +592,7 @@ void launch_hit_gu(bool fast, const uint8_t* blob_base, const int32_t* slot_inde
 }
 
 bool swiglu_q8_on() {
-    static const bool on = [] {
-        const char* e = std::getenv("STRATA_S2_SWIGLU_Q8");
-        return e == nullptr || e[0] != '0';
-    }();
+    static const bool on = !strata::platform::is_env_off("STRATA_S2_SWIGLU_Q8");
     return on;
 }
 

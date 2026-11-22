@@ -10,7 +10,6 @@
 #include "strata/common/experts/card_rules.hpp"
 #include "strata/common/experts/expert_swaps.hpp"
 #include "strata/common/experts/ram_tier.hpp"
-#include "strata/common/experts/split_rules.hpp"
 #include "strata/common/kernels/window_limits.hpp"
 #include "strata/common/serve/decode_selection.hpp"
 #include "strata/common/serve/conversation_residency.hpp"
@@ -280,20 +279,24 @@ private:
     /// get_session_identity) and the layout of the pages.  False (and `err`) when the model files cannot be read.
     bool find_identity(std::string& err);
     /// Gets where the read of `ids` from `from` stops to keep the restore points its request asked for (`asked`),
-    /// by the shared policy (strata/common/state/restore_points.hpp); none in a prompt with pictures (`pictures`),
-    /// whose spans the model reads whole.  `tail` gets the asked tail point when the read stops there (tail_cost_
-    /// decides whether it may), else -1.
+    /// by the shared policy (strata/common/state/restore_points.hpp), none in a prompt with pictures (`pictures`),
+    /// whose spans the model reads whole; and, when `checkpoints`, the model's own (PagedModelFacts::checkpoints).
+    /// `tail` gets the asked tail point when the read stops there (tail_cost_ decides whether it may), else -1.
     std::vector<strata::core::MarkAt> plan_restore_points(const strata::serve::RestorePointRequest& asked,
                                                           const std::vector<int64_t>& ids, int64_t from,
-                                                          bool pictures, int64_t& tail);
+                                                          bool pictures, bool checkpoints, int64_t& tail);
     /// Reads `ids[from, to)` into `h` (the request began at `t0`), keeping a restore point at each of `cuts`
-    /// (plan_restore_points, whose `tail` the read's times measure for tail_cost_); `read_to` gets how far it got.
-    /// Conversations that decode meanwhile take steps between the prompt's turns (PagedSettings::decode_share_percent
-    /// and prompt_turn_ms).  False with `err` "cancelled" after a STOP, else on a failure that ends the engine
-    /// (`fatal`: a decode step failed, its ERR printed, or an expert fill failed, reported on stderr).
+    /// (plan_restore_points, whose `tail` the read's times measure for tail_cost_); `read_to` gets the tokens `h`
+    /// holds then.  Conversations that decode meanwhile take steps where the model yields between the prompt's turns
+    /// (PagedSettings::decode_share_percent and prompt_turn_ms).  False with `err` "cancelled" after a STOP, else on a
+    /// failure that ends the engine (`fatal`: a decode step failed, its ERR printed, or an expert fill failed,
+    /// reported on stderr).
     bool read_prompt(Held& h, const std::vector<int64_t>& ids, int64_t from, int64_t to,
                      const std::vector<strata::core::MarkAt>& cuts, int64_t tail, Clock::time_point t0,
                      int64_t& read_to, bool& fatal, std::string& err);
+    /// Makes `h` hold its tokens up to its latest restore point at or before `pos` (PagedModel::rewind), or none
+    /// when it has no such point or cannot go back; gets how many it holds.
+    int64_t go_back(Held& h, int64_t pos);
     /// Runs one step of the selected conversations and prints what it emitted; false (ERR printed) ends the engine.
     bool decode_step();
     /// Gets the unfinished requests selected by priority and request order for the next decode step.
@@ -455,6 +458,14 @@ private:
     bool is_lent(int64_t layer, int64_t expert) const {
         const int32_t holder = holder_.empty() ? -1 : holder_[(size_t) layer];
         return holder >= 0 && cards_[(size_t) holder].lent[(size_t) (layer * facts_.n_expert + expert)] >= 0;
+    }
+    /// Gets the card whose pool holds expert `i` (layer * n_expert + expert) for decode steps: the one that runs its
+    /// layer or holds it lent; null when none does.
+    PagedCard* find_holder(size_t i, const std::vector<int32_t>& residency) {
+        const int64_t l = (int64_t) i / facts_.n_expert, e = (int64_t) i % facts_.n_expert;
+        return residency[i] >= 0 ? &get_card_of(l)
+             : is_lent(l, e)                  ? &cards_[(size_t) holder_[(size_t) l]]
+                                              : nullptr;
     }
     /// Describes the conversations for LIST_CONVERSATIONS and GET_CONTEXT_WINDOWS.
     std::vector<strata::core::HeldConversation> list_conversations() const;
@@ -639,6 +650,8 @@ PagedEngine::PagedEngine(PagedModel& model, PagedCards& cards, strata::core::Ram
             settings_.step.concurrent, get_most_concurrent(), smallest == UINT64_MAX ? 0 : smallest,
             facts_.extra_resident_vram);
     }
+    if (!settings_.draft_rule)
+        settings_.draft_rule = facts_.draft_rule;
     apply_settings();
     if (settings_.conversation_context < 0)
         settings_.conversation_context = std::min(facts_.context, settings_.tokens_max);
@@ -1164,11 +1177,8 @@ bool PagedEngine::serve_request(const std::string& line, bool admit) {
         print_error_or_exit(err);
         return true;
     }
-    if (resume == 0) {
-        h.forget();
-        for (const std::unique_ptr<PagedPart>& part : h.parts)
-            part->clear_state();
-    }
+    if (resume == 0)
+        (void) go_back(h, 0);
     h.policy = policy;
     print_response("RESUME %lld\n", (long long) resume);
     h.images = std::move(images);
@@ -1190,7 +1200,7 @@ bool PagedEngine::serve_request(const std::string& line, bool admit) {
         bool fatal = false;
         int64_t tail = -1;
         const std::vector<strata::core::MarkAt> cuts =
-            plan_restore_points(restore, ids, resume, !h.images.empty(), tail);
+            plan_restore_points(restore, ids, resume, !h.images.empty(), model_.keeps_checkpoints(h.parts), tail);
         const bool ok = read_prompt(h, ids, resume, n - 1, cuts, tail, t0, read_to, fatal, err);
         if (fatal)
             return false;
@@ -1238,7 +1248,7 @@ bool PagedEngine::serve_request(const std::string& line, bool admit) {
     }
     h.prompt_tokens = n;
     h.resumed = resume;
-    h.prompt_read = read_to - resume;
+    h.prompt_read = std::max<int64_t>(read_to - resume, 0);
     h.prompt_ms = prompt_ms;
     if (!h.decoding)
         finish_request(h, finish);
@@ -1294,20 +1304,28 @@ void PagedEngine::finish_request(Held& h, const char* finish) {
 
 std::vector<strata::core::MarkAt> PagedEngine::plan_restore_points(const strata::serve::RestorePointRequest& asked,
                                                                    const std::vector<int64_t>& ids, int64_t from,
-                                                                   bool pictures, int64_t& tail) {
+                                                                   bool pictures, bool checkpoints, int64_t& tail) {
     tail = -1;
-    if (pictures)
-        return {};
-    std::vector<int64_t> at = asked.marks;
-    // (a tail the read goes past: kept while stopping there costs no more than reading its tokens again)
-    const bool past = asked.tail > from && asked.tail < (int64_t) ids.size() - 1;
-    if (asked.tail > 0 && (!past || tail_cost_.keep_tail(facts_.name.c_str())))
-        at.push_back(tail = asked.tail);
-    std::vector<strata::core::MarkAt> cuts = strata::core::mark_plan(
-        at, asked.get_shared(), from, (int64_t) ids.size(), facts_.restore_points, strata::core::kMarkGap);
-    std::erase_if(cuts, [](const strata::core::MarkAt& m) { return m.pos <= 0; });   // (no state before a token)
-    if (std::none_of(cuts.begin(), cuts.end(), [&](const strata::core::MarkAt& m) { return m.pos == tail; }))
-        tail = -1;
+    std::vector<strata::core::MarkAt> cuts;
+    if (!pictures) {
+        std::vector<int64_t> at = asked.marks;
+        // (a tail the read goes past: kept while stopping there costs no more than reading its tokens again)
+        const bool past = asked.tail > from && asked.tail < (int64_t) ids.size() - 1;
+        if (asked.tail > 0 && (!past || tail_cost_.keep_tail(facts_.name.c_str())))
+            at.push_back(tail = asked.tail);
+        cuts = strata::core::mark_plan(at, asked.get_shared(), from, (int64_t) ids.size(), facts_.restore_points,
+                                       strata::core::kMarkGap);
+        std::erase_if(cuts, [](const strata::core::MarkAt& m) { return m.pos <= 0; });   // (no state before a token)
+        if (std::none_of(cuts.begin(), cuts.end(), [&](const strata::core::MarkAt& m) { return m.pos == tail; }))
+            tail = -1;
+    }
+    if (checkpoints)
+        for (const int64_t at : strata::core::find_prompt_checkpoints(facts_.checkpoints, ids, from))
+            if (std::none_of(cuts.begin(), cuts.end(), [at](const strata::core::MarkAt& m) { return m.pos == at; }))
+                cuts.push_back({at, false, false});
+    std::sort(cuts.begin(), cuts.end(), [](const strata::core::MarkAt& a, const strata::core::MarkAt& b) {
+        return a.pos < b.pos;
+    });
     return cuts;
 }
 
@@ -1318,17 +1336,21 @@ bool PagedEngine::read_prompt(Held& h, const std::vector<int64_t>& ids, int64_t 
     h.live.assign(ids.begin(), ids.begin() + from);
     double decode_ms = 0;                       // the turns given to decoding conversations since t0
     Clock::time_point counted = Clock::now();   // where totals_.prompt_us stops
-    const PagedModel::ChunkDone on_chunk = [&](int64_t pos0, int64_t T, std::string& e) -> bool {
+    PagedModel::PromptControl control;
+    control.progress = [&](int64_t pos) {
+        const double ms = get_ms_since(t0), reading_ms = ms - decode_ms;
+        print_response("PP %lld %lld %.0f %.1f\n", (long long) pos, (long long) ids.size(), ms,
+                       reading_ms > 0 ? 1000.0 * (double) (pos - from) / reading_ms : 0.0);
+        strata::core::progress_beat();
+    };
+    control.on_chunk = [&](int64_t pos0, int64_t T, std::string& e) -> bool {
         totals_.prompt_tokens += pos0 + T - read_to;
         totals_.prompt_us += std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - counted).count();
         counted = Clock::now();
         read_to = pos0 + T;
         h.live.insert(h.live.end(), ids.begin() + h.live.size(), ids.begin() + read_to);
         h.last_tokens_at = (uint64_t) std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-        const double ms = get_ms_since(t0), reading_ms = ms - decode_ms;
-        print_response("PP %lld %lld %.0f %.1f\n", (long long) read_to, (long long) ids.size(), ms,
-                    reading_ms > 0 ? 1000.0 * (double) (read_to - from) / reading_ms : 0.0);
-        strata::core::progress_beat();
+        control.progress(read_to);
         if (command_loop_)
             command_loop_->poll_inspections();
         if (input_.is_stop_requested())
@@ -1339,19 +1361,31 @@ bool PagedEngine::read_prompt(Held& h, const std::vector<int64_t>& ids, int64_t 
             return true;
         return false;
     };
-    // beside conversations that decode, a chunk at a time, and they decode between two turns of whole chunks
-    const int64_t piece = std::max<int64_t>(model_.get_prompt_chunk(), 1);
+    control.should_stop = [&] { return input_.is_stop_requested(); };
+    const int64_t piece = std::max<int64_t>(model_.get_prompt_chunk(to - from, !is_decoding()), 1);
     size_t next_cut = 0;
+    int64_t grid = from;   // where the read's chunks are counted from: only a point it was asked for restarts them
+    const auto keep_next_cut = [&] {
+        const strata::core::MarkAt& m = cuts[next_cut++];
+        if (m.asked)
+            grid = m.pos;
+        return model_.keep_restore_point(h.parts, ids, m.pos, m.shared, err);
+    };
     bool ok = true;
     if (!cuts.empty() && cuts[0].pos == from)   // (the state as it is)
-        ok = model_.keep_restore_point(h.parts, ids, from, cuts[next_cut++].shared, err);
+        ok = keep_next_cut();
     Clock::time_point turn = Clock::now();
+    const auto should_yield = [&] {
+        return get_ms_since(turn) >= (double) settings_.prompt_turn_ms && is_decoding() && can_decode_while_reading();
+    };
     double read_ms[2] = {0, 0};   // the model's reads before `tail` and from it
     bool measure_tail = has_read_prompt_ && tail > from && tail < to;
-    for (int64_t q = from, n = 0; ok && q < to; q += n) {
-        n = std::min(piece, to - q);
+    for (int64_t q = from, n = 0, took = 0; ok && q < to; q += took) {
+        n = std::min(piece - (q - grid) % piece, to - q);
         if (next_cut < cuts.size() && cuts[next_cut].pos < q + n)
             n = cuts[next_cut].pos - q;
+        control.should_yield = settings_.decode_share_percent > 0 && is_decoding()
+                                   ? should_yield : std::function<bool()>{};
         ok = model_.wait_state(err);
         if (ok && filling_since_ && q + n < to) {
             // Expert refills can change the prompt's cache between the two measured runs.
@@ -1360,14 +1394,17 @@ bool PagedEngine::read_prompt(Held& h, const std::vector<int64_t>& ids, int64_t 
             ok = !fatal;
         }
         const Clock::time_point r0 = Clock::now();
-        ok = ok && model_.read_prompt(h.parts, ids, q, n, is_model_drafting(), on_chunk, err);
+        ok = ok && model_.read_prompt(h.parts, ids, q, n, is_model_drafting(), control, took, err);
+        if (!ok && took < 0)
+            read_to = go_back(h, read_to);
+        measure_tail = measure_tail && took == n;   // (a yield splits the measured runs)
         if (ok && measure_tail)
             ok = model_.wait_state(err);
         read_ms[q >= tail] += get_ms_since(r0);
-        if (ok && next_cut < cuts.size() && cuts[next_cut].pos == q + n)
-            ok = model_.keep_restore_point(h.parts, ids, q + n, cuts[next_cut++].shared, err);
+        if (ok && next_cut < cuts.size() && cuts[next_cut].pos == q + took)
+            ok = keep_next_cut();
         const double turn_ms = get_ms_since(turn);
-        if (q + n >= to || turn_ms < (double) settings_.prompt_turn_ms)
+        if (q + took >= to || turn_ms < (double) settings_.prompt_turn_ms)
             continue;
         const double budget_ms = (double) settings_.decode_share_percent / 100.0 * turn_ms;
         const Clock::time_point td = Clock::now();
@@ -1387,6 +1424,19 @@ bool PagedEngine::read_prompt(Held& h, const std::vector<int64_t>& ids, int64_t 
     has_read_prompt_ = has_read_prompt_ || ok;
     reading_ = nullptr;
     return ok;
+}
+
+int64_t PagedEngine::go_back(Held& h, int64_t pos) {
+    int64_t back = 0;
+    for (const int64_t point : model_.get_rewind_points(h.parts))
+        if (point <= pos)
+            back = std::max(back, point);
+    if (std::string err; back > 0 && model_.rewind(h.parts, back, err))
+        return back;
+    h.forget();
+    for (const std::unique_ptr<PagedPart>& part : h.parts)
+        part->clear_state();
+    return 0;
 }
 
 bool PagedEngine::decode_step() {
@@ -1431,9 +1481,18 @@ bool PagedEngine::decode_step() {
         return false;
     }
     // The usage table merges pipeline groups; shared experts across groups count once for the whole wave.
-    if (const int64_t routed = std::inner_product(usage.begin(), usage.end(), routed_before_.begin(), (int64_t) 0,
-                                                  std::plus<>(), std::greater<>());
-        routed > 0) {
+    const std::vector<int32_t>& residency = model_.get_residency();
+    int64_t routed = 0;
+    for (size_t i = 0; i < usage.size(); ++i) {
+        if (usage[i] <= routed_before_[i])
+            continue;
+        ++routed;
+        if (PagedCard* const holder = find_holder(i, residency))
+            ++holder->experts.traffic().hits;
+        else
+            ++get_card_of((int64_t) i / facts_.n_expert).experts.traffic().misses;
+    }
+    if (routed > 0) {
         routed_experts_ += routed;
         routed_rows_ += step_rows_;
         ++routed_steps_;
@@ -2130,13 +2189,8 @@ bool PagedEngine::adapt_experts() {
     const int64_t n_expert = facts_.n_expert;
     seen_.resize(usage.size(), 0.0f);
     for (size_t i = 0; i < usage.size(); ++i)
-        if (const int64_t l = (int64_t) i / n_expert, e = (int64_t) i % n_expert; usage[i] > seen_[i]) {
-            PagedCard* const holder = residency[i] >= 0 ? &get_card_of(l)
-                                 : is_lent(l, e)     ? &cards_[(size_t) holder_[(size_t) l]]
-                                                     : nullptr;
-            if (holder != nullptr)
-                holder->experts.note_use({(int32_t) l, (int32_t) e});
-        }
+        if (PagedCard* const holder = usage[i] > seen_[i] ? find_holder(i, residency) : nullptr)
+            holder->experts.note_use({(int32_t) (i / (size_t) n_expert), (int32_t) (i % (size_t) n_expert)});
     const std::vector<strata::core::ExpertSwap> swaps = strata::core::choose_expert_swaps(
         usage, residency, facts_.n_layers, n_expert, facts_.adapt_min_gain,
         [this](int64_t l, int32_t e) { return is_lent(l, e); }, true);
@@ -2350,6 +2404,7 @@ strata::serve::MemoryReport PagedEngine::describe_memory() const {
         gpu.kept_free = settings_.get_vram_reserve_bytes();
         if (has_found_share_end(card.dev))
             gpu.dedicated_room = get_dedicated_room(card.dev);
+        gpu.traffic = card.experts.traffic().get_counts();
         report.experts_pending += filling_since_ ? card.experts.get_missing_count() : 0;
     }
     strata::serve::Memory& ram = report.at("ram");
@@ -2370,6 +2425,7 @@ strata::serve::MemoryReport PagedEngine::describe_memory() const {
     ram.fragmented_pages = rr.fragmented.pages;
     ram.setting = rr.total.bytes + ram_.ring_bytes();
     ram.mapped = strata::core::get_memory_manager().get_mapped_bytes();
+    ram.traffic = ram_.pages().traffic().get_counts();
     ram.smallest = get_smallest_ram();
     ram.largest = get_largest_ram();
     strata::serve::Memory& ssd = report.at("ssd");
@@ -2450,7 +2506,8 @@ strata::serve::MemoryReport PagedEngine::describe_memory() const {
                       {"drafter_details", facts_.has_drafter ? "Discovered drafter: " + facts_.drafter_label :
                        "No model drafter was loaded on startup; restart with " + facts_.drafter_start},
                       {"suffix_label", "Use suffix drafter (0 GiB)"},
-                      {"kv_quantization", facts_.kv_quantization}};
+                      {"kv_quantization", facts_.kv_quantization},
+                      {"draft_rule", strata::kernels::get_draft_rule_name(*settings_.draft_rule)}};
     report.settings.emplace_back("has_drafter", facts_.has_drafter ? 1 : 0);
     report.per_conversation = true;
     return report;
@@ -2475,6 +2532,13 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
              : name == "shared_memory" ? shared_ok
              : name == "step_profile"  ? s.step_profile
                                        : s.save_on_shutdown) = text == "on";
+            continue;
+        }
+        if (name == "draft_rule") {
+            strata::kernels::DraftRule rule;
+            if (!strata::kernels::parse_draft_rule(text, rule))
+                return std::string("draft_rule takes ") + strata::kernels::kDraftRuleChoices + ", not " + text;
+            s.draft_rule = rule;
             continue;
         }
         char* end = nullptr;
@@ -2605,6 +2669,7 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
     settings_.route_prior_pct = s.route_prior_pct;
     settings_.draft_confidence_pct = s.draft_confidence_pct;
     settings_.draft_cumulative_pct = s.draft_cumulative_pct;
+    settings_.draft_rule = s.draft_rule;
     std::string err;
     if (!s.drafter && settings_.drafter)
         (void) switch_drafter(false, err);
@@ -2740,16 +2805,14 @@ std::vector<int64_t> PagedEngine::plan_cut() const {
             tokens = std::max(tokens, h->dec.pos + h->dec.max_new - h->dec.produced + settings_.step.lookahead + 1);
         }
     std::vector<uint64_t> pools;
-    std::vector<double> links;
+    std::vector<double> layer_ms, links;
     for (const PagedCard& card : cards_) {
         pools.push_back(card.experts.pool().report().total.bytes);
+        layer_ms.push_back(card.layer_ms);
         links.push_back(card.link.to_gbps);
     }
-    SplitProblem problem = make_paged_split_problem(sizes, pools, std::max<int64_t>(decoding, 1),
+    SplitProblem problem = make_paged_split_problem(sizes, pools, layer_ms, links, std::max<int64_t>(decoding, 1),
                                                     std::min(tokens, facts_.context));
-    const std::vector<double> miss_scale = strata::program::split_rules::link_miss_scale(links);
-    for (size_t k = 0; k < cards_.size(); ++k)
-        problem.cards[k] = {cards_[k].layer_ms, miss_scale[k]};
     for (const ExpertKey& key : facts_.split_ranking)
         problem.ranked_layers.push_back(key.layer);
     problem.can_start = [&](const std::vector<SplitFill>& fills) {
@@ -3034,6 +3097,7 @@ void PagedEngine::apply_settings() {
         model_.set_route_tail_skip((int) settings_.route_tail_skip);
     if (settings_.route_prior_pct >= 0 && model_.get_route_prior() >= 0)
         model_.set_route_prior((float) std::log1p((double) settings_.route_prior_pct / 100.0));
+    model_.set_draft_rule(*settings_.draft_rule);
 }
 
 uint64_t PagedEngine::get_smallest_gpu(const PagedCard& card, int64_t tokens_min) const {

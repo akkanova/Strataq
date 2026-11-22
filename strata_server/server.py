@@ -6704,10 +6704,11 @@ def apply_vision_defaults(cfg: dict) -> dict:
         return cfg
     cfg["vision"] = {**cfg["vision"], "elastic": True}
     args = list(cfg.get("args") or [])
-    if "--vram-reserve-mib" not in args[:-1]:
+    flag = next((f for f in ("--vram-reserve-mib", "--reserve-mib") if f in args[:-1]), None)   # (--reserve-mib: older name)
+    if flag is None:
         args += ["--vram-reserve-mib", str(VISION_RESERVE_MIB)]
-    elif args[args.index("--vram-reserve-mib") + 1] == "700":
-        args[args.index("--vram-reserve-mib") + 1] = str(VISION_RESERVE_MIB)
+    elif args[args.index(flag) + 1] == "700":
+        args[args.index(flag) + 1] = str(VISION_RESERVE_MIB)
     cfg["args"] = args
     return cfg
 

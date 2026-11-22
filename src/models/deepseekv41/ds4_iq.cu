@@ -1438,8 +1438,8 @@ __global__ void __launch_bounds__(kThreads) dq_rows_kernel(const uint8_t* __rest
 // row-per-lane dq_rows_kernel, which main's fd33cb6ee gave 16-byte stores and a staged input.  That kernel gave different dense weights on
 // every run on a gfx11 device (Strix Halo: layer 0 of a 200-token prompt differed by 27% between two runs of the same engine on the 2.25
 // pack, 26% on UD-IQ1_S, where its Q6_K matrices also overflowed the staging buffer), so a gfx11 device no longer defaults to it - it
-// was picked there for speed (4K prompt 79.5 -> 88.5 tok/s) - and DS4_DEFAULTS=026 does not reach it there either.  DS4_DQ_OLD=1 still
-// forces it, and only for the types its staging serves (dq_old_ok); anywhere else DS4_DQ_OLD=0 forces kernel2 and DS4_DEFAULTS=026 /
+// was picked there for speed (4K prompt 79.5 -> 88.5 tok/s) - and STRATA_DEFAULTS=026 does not reach it there either.  DS4_DQ_OLD=1 still
+// forces it, and only for the types its staging serves (dq_old_ok); anywhere else DS4_DQ_OLD=0 forces kernel2 and STRATA_DEFAULTS=026 /
 // DS4_DQ_OLD=1 keep 0.2.6's kernel.  The detection is the device's gcnArchName (HIP only; a CUDA build has no gfx11).
 static bool dq_device_is_gfx11() {
 #if defined(STRATA_USE_HIP)
@@ -1463,7 +1463,7 @@ static bool dq_use_old_kernel() {
     const char* dq_env = std::getenv("DS4_DQ_OLD");
     const int env = dq_env != nullptr && *dq_env != '\0' ? (std::atoi(dq_env) != 0 ? 1 : 0) : -1;
     if (dq_device_is_gfx11()) return env == 1;
-    const bool v026 = strata::ds4::defaults_026();   // DS4_DEFAULTS=026: 0.2.6's row-per-lane dequantizer (the same values, bit for bit)
+    const bool v026 = strata::ds4::defaults_026();   // STRATA_DEFAULTS=026: 0.2.6's row-per-lane dequantizer (the same values, bit for bit)
     return strata::ds4::dq_old_default(env, false, v026);
 }
 

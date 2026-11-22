@@ -506,6 +506,19 @@ void test_resident_memory_budget() {
             "subtracting the clamping margin underflowed");
 }
 
+/// Checks get_uma_free_bytes with its default 6 GiB headroom (skipped when STRATA_UMA_HEADROOM_GIB is set).
+void test_uma_free_bytes() {
+    using strata::core::detail::get_uma_free_bytes;
+    constexpr uint64_t GiB = 1ull << 30;
+    if (std::getenv("STRATA_UMA_HEADROOM_GIB") != nullptr)
+        return;
+    require(get_uma_free_bytes(10 * GiB, 20 * GiB) == 14 * GiB, "the host's room above the headroom was not counted");
+    require(get_uma_free_bytes(16 * GiB, 20 * GiB) == 16 * GiB, "a larger GPU figure was lowered");
+    require(get_uma_free_bytes(GiB, 5 * GiB) == GiB, "RAM below the headroom underflowed");
+    require(get_uma_free_bytes(0, 6 * GiB) == 0, "RAM at the headroom produced usable memory");
+    require(get_uma_free_bytes(GiB, 0) == GiB, "an unavailable host figure lowered GPU memory");
+}
+
 void test_cgroup_memory_budget() {
     using namespace strata::core::detail;
     constexpr uint64_t GiB = 1ull << 30;
@@ -1032,6 +1045,7 @@ int main(int argc, char** argv) {
         test_split_lend_regions();
         test_resident_exchange();
         test_resident_memory_budget();
+        test_uma_free_bytes();
         test_pin_pacing();
         test_wait_for_ram();
         test_numa_slice_ranges();

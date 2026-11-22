@@ -13,7 +13,9 @@
 //   moe(x): 6 of 384 routed experts (sqrt-softplus scores, biased top-k) + the shared expert
 //   h = post * moe + comb^T h;  pre = f_pre
 // and after the last layer logits = head(rmsnorm(sum_s pre[s] h[s])).
+#include "strata/common/experts/ram_tier.hpp"
 #include "strata/common/state/restore_points.hpp"
+#include "strata/common/artifact/tensor_directory.hpp"
 #include "ds4_ring_link.hpp"
 #include "ds4_launch.h"   // strata_ds4_launch: <<<>>> on CUDA and HIP, a dispatch on Metal
 #include "ds4_model.hpp"
@@ -26,11 +28,14 @@
 #include "ds4_gguf_cpu.hpp"
 #include "ds4_kernels.cuh"
 #include "strata/models/deepseekv41/geometry.hpp"
+#include "strata/base/gpu/gpu_set.hpp"
 #include "strata/base/gpu/memory_info.hpp"
 #include "strata/base/gpu/runtime.hpp"
+#include "strata/base/platform/env.hpp"
 #include "strata/base/gpu/on_device.hpp"
 #include "strata/base/gpu/traffic.hpp"
 #include "strata/base/platform/os.hpp"
+#include "strata/common/experts/expert_profile.hpp"
 #include "strata/core/expert_source.hpp"
 #include "ds4_pcie.cuh"
 #include "ds4_pcie.hpp"
@@ -43,6 +48,7 @@
 #endif
 #include "strata/models/deepseekv41/exl3_cpu.hpp"
 #include "strata/models/deepseekv41/exl3.hpp"
+#include "strata/common/experts/expert_swaps.hpp"
 #include "strata/common/kernels/f16_bits.hpp"
 #include "strata/models/deepseekv41/moe_win.hpp"
 #include "strata/models/deepseekv41/sampler.hpp"
@@ -113,11 +119,7 @@ constexpr bool kHipBuild = true;
 constexpr bool kHipBuild = false;
 #endif
 
-// an environment variable as 0 / 1, or -1 when it is not set (the rules in ds4_experts_rule.hpp take this form)
-int env_tri(const char* name) {
-    const char* v = std::getenv(name);
-    return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1;
-}
+using strata::platform::env_tri;
 
 double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -245,71 +247,20 @@ void free_node_memory(void* p, size_t bytes) {
     platform::anon_free(p, bytes);
 }
 void pin_self(int cpu) { platform::pin_self(cpu); }
-// the RAM this process can still get: MemAvailable, and below it the tightest cgroup v2 limit on the way to the root
-// (its limit less what is charged, the page cache counted as free: the kernel takes it back); ~0: not known
+// the RAM this process can still get (~0: not known), cgroup limits included.  macOS: not known (this engine's
+// placement has not been tried with host_available_memory's vm_stat figure there)
 uint64_t ram_avail() {
-#if defined(_WIN32)
-    return platform::ram_avail();
+#if defined(__APPLE__)
+    return ~uint64_t{0};
+#else
+    strata::core::detail::HostMemory m;
+    const bool known = strata::core::detail::host_available_memory(m);
+    // Windows supplies commit capacity on a successful read even when no physical RAM remains.
+    return known || m.commit != ~uint64_t{0} ? m.available : ~uint64_t{0};
 #endif
-    uint64_t avail = ~uint64_t{0};
-    {
-        std::istringstream mi(read_file("/proc/meminfo"));
-        std::string k;
-        uint64_t kb = 0;
-        while (mi >> k >> kb) {
-            if (k == "MemAvailable:") avail = kb << 10;
-            mi.ignore(64, '\n');
-        }
-    }
-    std::string cg = read_file("/proc/self/cgroup");   // "0::/user.slice/..."
-    const size_t at = cg.find("0::");
-    if (at == std::string::npos) return avail;
-    cg = cg.substr(at + 3);
-    cg = cg.substr(0, cg.find('\n'));
-    for (;;) {
-        const std::string dir = "/sys/fs/cgroup" + (cg == "/" ? std::string() : cg);
-        const std::string mx = read_file(dir + "/memory.max");
-        if (!mx.empty() && mx.compare(0, 3, "max") != 0) {
-            const uint64_t lim = std::strtoull(mx.c_str(), nullptr, 10);
-            const uint64_t cur = std::strtoull(read_file(dir + "/memory.current").c_str(), nullptr, 10);
-            uint64_t file = 0;
-            std::istringstream st(read_file(dir + "/memory.stat"));
-            std::string k;
-            uint64_t v = 0;
-            while (st >> k >> v)
-                if (k == "file") file = v;
-            const uint64_t used = cur > file ? cur - file : 0;
-            avail = std::min(avail, lim > used ? lim - used : 0);
-        }
-        if (cg.empty() || cg == "/") break;
-        const size_t sl = cg.rfind('/');
-        cg = sl == 0 || sl == std::string::npos ? "/" : cg.substr(0, sl);
-    }
-    return avail;
 }
 
-// the device memory the experts' placement may count on: cudaMemGetInfo's free, but on an integrated NVIDIA GPU on Linux
-// (a DGX Spark's GB10, one memory with the CPU) what the kernel can still give back, MemAvailable less
-// DS4_UMA_HEADROOM_GIB (6): cudaMemGetInfo counts only MemFree there, and the model's files just read fill the page cache
-// (measured on a GB10: 55 GB "free" with 115 GB available).  Not on HIP: a Strix Halo's GPU memory is its carve-out plus
-// the GTT pool, which hipMemGetInfo already counts and MemAvailable may exceed
-size_t uma_free(int dev, size_t fr) {
-#if !defined(_WIN32) && !defined(STRATA_USE_HIP)
-    int integrated = 0;
-    if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) != cudaSuccess) {
-        (void) cudaGetLastError();
-        return fr;
-    }
-    if (!integrated) return fr;
-    const char* h = std::getenv("DS4_UMA_HEADROOM_GIB");
-    const uint64_t head = (uint64_t) (h ? std::atof(h) : 6.0) << 30, avail = ram_avail();
-    if (avail != ~uint64_t{0} && avail > head && avail - head > fr) return (size_t) (avail - head);
-#else
-    (void) dev;
-#endif
-    return fr;
-}
-// a GPU that shares the PC's memory (a Mac, a Spark's GB10, a Strix Halo, an APU): nothing to give back by keeping the tower in host memory
+// whether GPU `dev` shares the PC's memory (a Mac, a Spark's GB10, a Strix Halo, an APU); false when the runtime cannot say
 bool gpu_integrated(int dev) {
 #if defined(STRATA_METAL)
     (void) dev;
@@ -322,6 +273,21 @@ bool gpu_integrated(int dev) {
     }
     return v != 0;
 #endif
+}
+// the device memory the experts' placement may count on: cudaMemGetInfo's free, but on an integrated NVIDIA GPU on Linux
+// (a DGX Spark's GB10, one memory with the CPU) get_uma_free_bytes's view of ram_avail: cudaMemGetInfo counts only
+// MemFree there, and the model's files just read fill the page cache (measured on a GB10: 55 GB "free" with 115 GB
+// available).  Not on HIP: a Strix Halo's GPU memory is its carve-out plus the GTT pool, which hipMemGetInfo already
+// counts and MemAvailable may exceed
+size_t uma_free(int dev, size_t fr) {
+#if !defined(_WIN32) && !defined(STRATA_USE_HIP)
+    const uint64_t avail = gpu_integrated(dev) ? ram_avail() : ~uint64_t{0};
+    if (avail != ~uint64_t{0})
+        return strata::core::detail::get_uma_free_bytes(fr, avail);
+#else
+    (void) dev;
+#endif
+    return fr;
 }
 // cudaMemGetInfo for the current device, with uma_free's view on an integrated GPU (Maya v1.1.20's mem_info; the Windows APU
 // dedicated-memory clamp (strata/platform/dedicated.hpp) is not ported: commit_charged covers that PC here)
@@ -361,12 +327,7 @@ float f16_to_f32(uint16_t h) {
 }
 
 // ------------------------------------------------------------------ the pack
-struct Tensor {
-    std::string dtype;
-    int file = -1;
-    uint64_t off = 0, bytes = 0;
-    std::vector<int64_t> shape;
-};
+using Tensor = artifact::TensorEntry;
 
 struct Pack {
     std::string dir, model_dir;
@@ -420,41 +381,11 @@ struct Pack {
             }
         }
         model_dir = str("model_dir");
-        std::FILE* f = std::fopen((d + "/tensors.txt").c_str(), "r");
-        if (f == nullptr) {
-            err = d + "/tensors.txt: not found";
+        artifact::TensorDirectory toc;
+        if (!toc.load(d + "/tensors.txt", err))
             return false;
-        }
-        std::vector<char> buf(1 << 16);
-        while (std::fgets(buf.data(), (int) buf.size(), f) != nullptr) {
-            char* s = buf.data();
-            if (s[0] == 'f') {   // file <i> <name>
-                char name[4096];
-                int i = 0;
-                if (std::sscanf(s, "file %d %4095s", &i, name) == 2) {
-                    if ((int) files.size() <= i) files.resize((size_t) i + 1);
-                    files[(size_t) i] = name;
-                }
-                continue;
-            }
-            if (s[0] != 't') continue;
-            char* save = nullptr;
-            ::strtok_r(s, " \n", &save);
-            const char* name = ::strtok_r(nullptr, " \n", &save);
-            const char* dt = ::strtok_r(nullptr, " \n", &save);
-            const char* fi = ::strtok_r(nullptr, " \n", &save);
-            const char* off = ::strtok_r(nullptr, " \n", &save);
-            const char* nb = ::strtok_r(nullptr, " \n", &save);
-            if (name == nullptr || nb == nullptr) continue;
-            Tensor x;
-            x.dtype = dt;
-            x.file = std::atoi(fi);
-            x.off = std::strtoull(off, nullptr, 10);
-            x.bytes = std::strtoull(nb, nullptr, 10);
-            while (const char* dim = ::strtok_r(nullptr, " \n", &save)) x.shape.push_back(std::atoll(dim));
-            t.emplace(name, std::move(x));
-        }
-        std::fclose(f);
+        files = std::move(toc.files);
+        t = std::move(toc.tensors);
         for (const std::string& fn : files) {
             const std::string p = model_dir + "/" + fn;
             const platform::fd_t fd = platform::open_ro(p);
@@ -1070,25 +1001,11 @@ struct Model::Impl {
     std::vector<Group> groups;
     std::vector<std::unique_ptr<Worker>> workers;   // threads mode: one per device
     bool par = false;                 // threads mode (the windows: decode)
-    mutable int all_gfx12 = -1;       // rdna4(): -1 not asked yet
+    strata::core::GpuSetFacts gpu_set;   // the traits every GPU in devs shares (read at the load)
     // Every GPU the engine uses is a gfx1200 / gfx1201 (RDNA4: R9700, RX 9000) in a HIP build.  The DeepSeek engine's share-based defaults (the small
     // chunk for multi-card tp runs, the whole-chunk slab, the small staging ring, the pinned copy at share >= 0.5) and the drafter's cumulative cut are
     // the 4 x R9700 measurements, so only RDNA4 takes them until another AMD part is tested (Strix Halo next).
-    bool rdna4() const {
-        if (all_gfx12 < 0) {
-            bool yes = false;
-#if defined(STRATA_USE_HIP)
-            yes = !devs.empty();
-            for (const auto& d : devs) {
-                cudaDeviceProp prop{};
-                yes = yes && cudaGetDeviceProperties(&prop, d.id) == cudaSuccess &&
-                      (std::strncmp(prop.gcnArchName, "gfx1200", 7) == 0 || std::strncmp(prop.gcnArchName, "gfx1201", 7) == 0);
-            }
-#endif
-            all_gfx12 = yes ? 1 : 0;
-        }
-        return all_gfx12 == 1;
-    }
+    bool rdna4() const { return gpu_set.all_gfx12; }
     bool prompt_par = false;          // the prompt path's chunks (a thread a GPU), as --tp / --threads asked
     unsigned win_seq = 0;             // the windows the threads ran (the hand-offs' seq)
     // the chunked prompt path (threads mode): chunk tokens a pass, runs shorter than chunk_min in windows
@@ -1237,6 +1154,7 @@ struct Model::Impl {
     int* d_ints = nullptr;            // on the head device: drafts in, picks out
     int64_t verified_p0 = 0;          // the first position of the window verify_rows ran, and its rows
     int verified_rows = 0;
+    strata::kernels::DraftRule draft_rule;   // which drafts pick_verified_rows keeps for a sampled request
     // a sampled round's drafts: the distribution q each one was drawn from (its kept list, on the head device) for
     // verify()'s rule - a point at the draft for the drafter's argmax; and the chain they were drawn with (verify()
     // checks it is its own)
@@ -1393,7 +1311,7 @@ struct Model::Impl {
     static constexpr int kMaxSwaps = 8;
     // the swap rule: a CPU-lane expert in when its heat passes the coldest VRAM one's x margin + bonus; heat x decay
     // every 256 tokens; at most `inflight` swaps under way (DS4_CACHE_MARGIN / _BONUS / _DECAY / _INFLIGHT)
-    static float env_f(const char* k, float d) { return std::getenv(k) ? (float) std::atof(std::getenv(k)) : d; }
+    static float env_f(const char* k, float d) { return (float) strata::platform::env_double(k, d); }
     const float c_margin = env_f("DS4_CACHE_MARGIN", 1.25f), c_bonus = env_f("DS4_CACHE_BONUS", 1.0f),
                 c_decay = env_f("DS4_CACHE_DECAY", 0.9f);
     const int c_inflight = std::max(1, (int) env_f("DS4_CACHE_INFLIGHT", (float) kMaxSwaps));
@@ -1450,14 +1368,11 @@ struct Model::Impl {
         const char* v = std::getenv("STRATA_DS4_RAM_SKIP_W");
         return v != nullptr ? std::max(0.0f, (float) std::atof(v)) : 0.0f;
     }();
-    const int disk_skip_from = [] {
-        const char* v = std::getenv("STRATA_DS4_DISK_SKIP_FROM");
-        return v != nullptr ? std::max(0, std::atoi(v)) : 0;
-    }();
+    const int disk_skip_from = std::max(0, strata::platform::env_int("STRATA_DS4_DISK_SKIP_FROM", 0));
     // the RAM store (--ssd-cache): the CPU lane's experts in slots a policy owns, read unbuffered (null: off)
     std::unique_ptr<ExpertStore> store;
     // (Options::expert_pages) the blobs of the experts the CPU lane computes now, by expert, from the RAM's pool
-    // (cpu_experts_paged); and each expert's routings in windows ([layer][expert], count_usage; empty: not counted)
+    // (cpu_experts_paged); and each expert's routings ([layer][expert], count_usage; empty: not counted)
     std::vector<const uint8_t*> held;
     std::vector<float> usage;
     std::atomic<int64_t> cpu_expert_count{0};   // get_cpu_experts; the CPU lane's threads add to it
@@ -1599,12 +1514,7 @@ struct Model::Impl {
     bool commit_charged(const Dev& d) const {
         if (std::getenv("DS4_COMMIT_CAP_GB") != nullptr) return true;
 #if defined(_WIN32)
-        int v = 0;
-        if (cudaDeviceGetAttribute(&v, cudaDevAttrIntegrated, d.id) != cudaSuccess) {
-            (void) cudaGetLastError();
-            return false;
-        }
-        return v != 0;
+        return gpu_integrated(d.id);
 #else
         (void) d;
         return false;
@@ -2107,15 +2017,18 @@ struct Model::Impl {
     }
 
     // ---- weights
+    // Copies tensor t whole to dst on device d in staged rounds, so that a large tensor needs no host copy of itself.
     bool upload(Dev& d, const Tensor& t, void* dst, std::string& err) {
-        std::vector<uint8_t> tmp(t.bytes);
-        if (!pk.read(t, tmp.data())) {
-            err = "read failed";
-            return false;
-        }
+        std::vector<uint8_t> stage((size_t) std::min(t.bytes, artifact::kStageRound));
         cudaSetDevice(d.id);
-        CK(cudaMemcpy(dst, tmp.data(), t.bytes, cudaMemcpyHostToDevice));
-        return true;
+        return artifact::for_each_round(t.bytes, [&](uint64_t done, uint64_t n) {
+            if (!pk.read_at(t.file, t.off + done, n, stage.data())) {
+                err = "read failed";
+                return false;
+            }
+            CK(cudaMemcpy((uint8_t*) dst + done, stage.data(), n, cudaMemcpyHostToDevice));
+            return true;
+        });
     }
     // a dense matrix in a ggml block type (x3::Mat fmt kFmtGG, row = k / 256 blocks): whole, or part of its rows / inputs
     bool mat_gg(Dev& d, const std::string& pre, const Tensor& t, int ggt, x3::Mat& m, std::string& err, size_t* acct, int part,
@@ -2748,6 +2661,7 @@ struct Model::Impl {
         if (ids.empty())
             for (int i = 0; i < ndev; ++i) ids.push_back(i);
         devs.resize(ids.size());
+        gpu_set = strata::core::read_gpu_set_facts(ids);
         if (prof_on) prof_pool.resize((size_t) ndev);
         for (size_t i = 0; i < ids.size(); ++i) {
             Dev& d = devs[i];
@@ -2938,12 +2852,9 @@ struct Model::Impl {
             if (!l.mtp) {   // experts a word takes: --experts N / the faster-mode rule (ds4_experts_rule.hpp), DS4_TOPK=N over both (a test)
                 if (il == 0) {
                     uint64_t vram_all = 0;
-                    bool integrated = false;   // (a GPU that shares the PC's RAM: Strix Halo)
-                    for (const Dev& dv : devs) {
+                    for (const Dev& dv : devs)
                         vram_all += (uint64_t) dv.total;
-                        cudaDeviceProp ip{};
-                        if (cudaGetDeviceProperties(&ip, dv.id) == cudaSuccess && ip.integrated) integrated = true;
-                    }
+                    const bool integrated = gpu_set.all_integrated;
                     // two or more RDNA4 cards holding at least half of the experts (the 4 x R9700 class): Faster by default too
                     const bool multi_rdna4 = rdna4() && devs.size() >= 2 && gpu_expert_share() >= 0.5;
                     const bool single_rdna4 = rdna4() && devs.size() == 1;   // one R9700 / RX 9000 card: the CPU lane does most of the experts
@@ -3569,21 +3480,22 @@ struct Model::Impl {
                              nth, (unsigned long long) mb, eg_cache.capacity());
         }
         prof.assign((size_t) (g.nl + g.n_mtp) * g.n_exp, 0u);
-        if (!o.profile.empty()) {
-            std::FILE* f = std::fopen(o.profile.c_str(), "rb");
-            if (f != nullptr) {
-                std::fseek(f, 0, SEEK_END);
-                const long long bytes = (long long) std::ftell(f);
-                std::rewind(f);
-                if (bytes >= 0 && !profile_size_fits((uint64_t) bytes, g.nl, g.n_exp)) {   // another model's counts (see ds4_experts_rule.hpp)
-                    std::fprintf(stderr, "ds4: %s is %lld bytes and this model's profile is %d layers of %d experts (%d bytes and a few drafter rows): "
-                                         "not read, the experts start unranked\n", o.profile.c_str(), bytes, g.nl, g.n_exp, g.nl * g.n_exp * 4);
-                } else {
-                    std::vector<uint32_t> p(prof.size());
-                    const size_t n = std::fread(p.data(), 4, p.size(), f);
-                    if (n == p.size() || n == (size_t) g.nl * g.n_exp) std::copy(p.begin(), p.begin() + (long) n, prof.begin());
-                }
-                std::fclose(f);
+        std::error_code profile_ec;
+        if (!o.profile.empty() && (std::filesystem::exists(o.profile, profile_ec) || profile_ec)) {
+            std::vector<uint32_t> p;
+            std::string perr;
+            if (!strata::core::read_expert_counts(o.profile, g.n_exp, g.nl + kProfileExtraRows, p, perr)) {
+                std::fprintf(stderr, "ds4: %s - the experts start unranked\n", perr.c_str());
+            } else if (!profile_size_fits((uint64_t) p.size() * 4, g.nl, g.n_exp)) {
+                std::fprintf(stderr, "ds4: %s holds %zu rows and this model's profile is %d layers of %d experts "
+                                     "(and a few drafter rows): "
+                                     "not read, the experts start unranked\n",
+                             o.profile.c_str(), p.size() / g.n_exp, g.nl, g.n_exp);
+            } else if (p.size() >= prof.size() || p.size() == (size_t) g.nl * g.n_exp) {
+                std::copy_n(p.begin(), std::min(p.size(), prof.size()), prof.begin());
+            } else {
+                std::fprintf(stderr, "ds4: %s has incomplete drafter rows - the experts start unranked\n",
+                             o.profile.c_str());
             }
         }
         prof_load = prof;
@@ -4183,7 +4095,7 @@ struct Model::Impl {
     // estimated), and with hand-offs between groups their pinned rows (two chunks a GPU) within an eighth of the RAM;
     // else c0
     int chunk_default(int c0) const {
-        const auto env_on = [](const char* k) { return std::getenv(k) == nullptr || std::atoi(std::getenv(k)) != 0; };
+        const auto env_on = [](const char* k) { return env_tri(k) != 0; };
         if (!pk.gguf || !file_experts || o.expert_pages != nullptr || !one_gpu_or("DS4_BORROW") || !env_on("DS4_FLOW"))
             return c0;
         for (const Group& G : groups)
@@ -6391,10 +6303,6 @@ struct Model::Impl {
     // helper GPU - the setup #476's path was measured on (Linux; Windows with pin by need, see pin_by_need).  AMD,
     // several GPUs or groups, an integrated GPU or a helper GPU: off, as in v1.1.27 (DS4_STREAM_WIN / DS4_LAND /
     // DS4_STREAM_ZC = 1 turn one on anyway, 0 off)
-    static int env_tri(const char* name) {   // -1: not set, else its value != 0
-        const char* v = std::getenv(name);
-        return v == nullptr || v[0] == '\0' ? -1 : std::atoi(v) != 0;
-    }
     // ... and only where the CPU lane's experts actually stream from RAM (#496): it costs VRAM and decode time where
     // nothing streams - a 48 GB L40S beside 28 Xeon threads (an expert 0.13 ms on the CPU lane against 0.77 streamed:
     // 0 of every pick count streamed) decoded 17-19% slower with it.  At the start it is off when the pack's times file
@@ -6825,12 +6733,9 @@ struct Model::Impl {
         if (avail == ~uint64_t{0}) return gb;
         // (the prompt buffers and the context's caches are touched after this point and, on such a machine, take RAM too: measured on
         // Strix Halo about 0.11 MB a token of context beyond 16384, a 40960 context ending 2.5 GB lower than a 16384 one)
-        bool any_integrated = false;   // (only a device the driver calls integrated can share the RAM: a discrete card's pinned buffers also lower the free RAM, #4147)
-        for (const Dev& d : devs) {
-            int v = 0;
-            if (cudaDeviceGetAttribute(&v, cudaDevAttrIntegrated, d.id) == cudaSuccess) any_integrated = any_integrated || v != 0;
-            else (void) cudaGetLastError();
-        }
+        // (only a device the driver calls integrated can share the RAM: a discrete card's pinned buffers also lower the free RAM, #4147)
+        const bool any_integrated = std::any_of(devs.begin(), devs.end(),
+                                               [](const Dev& d) { return gpu_integrated(d.id); });
         const bool uma = strata::ds4::store_gpu_shares_ram(any_integrated, avail0_, avail);
         const double ctx_gb = uma ? 1.1e-4 * std::max(0.0, (double) o.max_context - 16384.0) : 0.0;
         const double room = (double) avail / 1e9 - 12.0 - ctx_gb;
@@ -7506,28 +7411,10 @@ struct Model::Impl {
     }
     // the restore point at position `at` to fill (nullptr: none kept, or one there already - in use again)
     Check* mark_room(int64_t at, bool shared) {
-        if (marks_cap() <= 0 || at <= 0) return nullptr;
-        for (Check& x : mk)
-            if (x.pos == at) {
-                x.shared = x.shared || shared;
-                x.used = ++mark_clock;
-                return nullptr;
-            }
-        size_t k = mk.size();
-        if ((int) k >= marks_cap()) {
-            std::vector<MarkUse> u;
-            for (const Check& x : mk) u.push_back({x.pos, x.shared, x.used});
-            u.push_back({at, shared, mark_clock + 1});
-            k = (size_t) mark_victim(u);
-            if (k == mk.size())
-                return nullptr;
-        } else
-            mk.emplace_back();
-        Check& c = mk[k];   // (one given up: its buffers taken over)
-        c.shared = shared;
-        c.used = ++mark_clock;
-        slot_held = false;   // (a slot taken before holds no such point)
-        return &c;
+        Check* c = strata::core::make_restore_point_room(mk, mark_clock, at, shared, marks_cap(), mark_victim);
+        if (c != nullptr)
+            slot_held = false;   // (a slot taken before holds no such point)
+        return c;
     }
     // checkpoint i of best_check()'s: ck, then the marks
     const Check& check_at(int i) const { return i < kChecks ? ck[i] : mk[(size_t) (i - kChecks)]; }
@@ -7611,8 +7498,7 @@ struct Model::Impl {
         for (Check& o2 : ck)   // a later checkpoint saw tokens the state no longer has
             if (o2.pos > pos) o2.pos = -1;
         mk.erase(std::remove_if(mk.begin(), mk.end(), [this](const Check& x) { return x.pos > pos; }), mk.end());
-        for (Check& x : mk)   // (a mark gone back to: in use)
-            if (x.pos == pos) x.used = ++mark_clock;
+        strata::core::touch_restore_point(mk, mark_clock, pos);
         return true;
     }
 
@@ -8019,8 +7905,6 @@ struct Model::Impl {
         for (int k = 0; k < kChecks; ++k)
             std::swap(ck[k], s.checks[(size_t) k]);
         mk.swap(s.marks);
-        for (const Check& c : mk)   // (the clock orders one conversation's marks: it goes on past all of theirs)
-            mark_clock = std::max(mark_clock, c.used);
         set_position();
     }
 
@@ -9851,10 +9735,10 @@ struct Model::Impl {
             b.clear();
         }
     }
-    // (Options::expert_pages) a routing of layer l's expert e in a window, for the paged engine's adaptive tier
-    void count_usage(const Layer& l, int e) {
+    // Adds weighted routings to the paged engine's adaptive counts, excluding MTP layers.
+    void count_usage(const Layer& l, int e, float n = 1.0f) {
         if (!usage.empty() && !l.mtp)
-            usage[(size_t) l.il * g.n_exp + e] += 1.0f;
+            usage[(size_t) l.il * g.n_exp + e] += n;
     }
     // an expert the CPU lane reads from the files (neither in VRAM nor in the RAM tier)
     static bool file_read(const Layer& l, int e) {
@@ -10699,10 +10583,7 @@ struct Model::Impl {
                                            // read by serve_lane's thread)
     double tok_ab_t0 = 0;
     bool tok_ab_active() const {
-        static const bool on = [] {
-            const char* v = std::getenv("DS4_STREAM_TOKEN_AB");
-            return v == nullptr || std::atoi(v) != 0;
-        }();
+        static const bool on = strata::platform::env_tri("DS4_STREAM_TOKEN_AB") != 0;
         if (!on || !ln_force.empty() || tok_ab.verdict > 0) return false;
         for (const LaneCls& C : ln_cls)
             if (C.stream) return true;
@@ -12041,8 +11922,8 @@ struct Model::Impl {
         return pick_verified_rows(0, p0, drafts, temperature, top_p, top_k, min_p, seed, counter, picks, err);
     }
 
-    /// Applies the existing speculative sampler to one conversation's logit rows, from row0 on; p0 is the position of
-    /// that window's first row (where the penalties' history of its picks ends).
+    /// Picks the tokens of one conversation's verify rows from its logit rows, from row0 on, under draft_rule; p0 is
+    /// the position of that window's first row (where the penalties' history of its picks ends).
     bool pick_verified_rows(int row0, int64_t p0, const std::vector<int>& drafts, float temperature, float top_p,
                             int top_k, float min_p, uint64_t seed, uint64_t counter, std::vector<int>& picks,
                             std::string& err) {
@@ -12053,11 +11934,17 @@ struct Model::Impl {
         if ((!d_ints && !dalloc(hd, d_ints, 64, err)) || (!d_specq && !dalloc(hd, d_specq, kWin, err)))
             return false;
         int m = 0;
+        strata::dsv41k::SamplerParams sp;
+        sp.greedy = temperature <= 0.0f;
+        sp.temperature = temperature;
+        sp.top_p = top_p;
+        sp.top_k = top_k;
+        sp.min_p = min_p;
+        sp.seed = seed;
+        sp.counter = counter;
+        sp.draft_rule = draft_rule;
         // (penalties: row t counts the tokens up to its own position - y and the drafts before it, toks[0 .. p0 + 1 + t))
-        if (temperature <= 0.0f) {
-            strata::dsv41k::SamplerParams sp;
-            sp.greedy = true;
-            sp.temperature = 0.0f;
+        if (sp.greedy || draft_rule.kind == strata::kernels::DraftRule::Exact) {   // each row's plain pick
             int h = 0;
             const int* hr = pen_rows(p0 + 1, T, sp, h);
             strata::dsv41k::sample_tokens(hd.logits + (size_t) row0 * V, T, V, hr, h, sp, d_ints + 16, hd.st);
@@ -12069,10 +11956,11 @@ struct Model::Impl {
             while (m < n && h_idx[m] == drafts[(size_t) m]) ++m;
             picks.assign(h_idx, h_idx + m + 1);
         } else {
-            // row i keeps draft i with probability min(1, p(d) / q(d)), else draws from the residual max(0, p - q)
-            // (never d itself): each row a token distributed as the model's own draw at that position, p through the
-            // request's chain - the top_k / top_p / min_p cut included (the drafter's argmax can lie outside it: p(d) 0,
-            // never kept); past the first rejection the rows do not count
+            // row i keeps draft i or writes another token under the draft rule (draft_rule.hpp; speculative: with
+            // probability min(1, p(d) / q(d)), else a draw from the residual max(0, p - q), each row a token
+            // distributed as the model's own draw at that position), p through the request's chain - the top_k / top_p
+            // / min_p cut included (the drafter's argmax can lie outside it: p(d) 0, never kept); past the first
+            // rejection the rows do not count
             const bool own = drafts_q && dq_temp == temperature && dq_top_p == top_p && dq_top_k == top_k &&
                              dq_min_p == min_p && dq_seed == seed && dq_counter == counter;
             if (!own) {   // the drafter's argmax: q a point at each draft
@@ -12086,14 +11974,6 @@ struct Model::Impl {
             }
             for (int i = 0; i < n; ++i) h_idx[i] = drafts[(size_t) i];
             CK(cudaMemcpyAsync(d_ints + 32, h_idx, (size_t) n * 4, cudaMemcpyHostToDevice, hd.st));
-            strata::dsv41k::SamplerParams sp;
-            sp.greedy = false;
-            sp.temperature = temperature;
-            sp.top_p = top_p;
-            sp.top_k = top_k;
-            sp.min_p = min_p;
-            sp.seed = seed;
-            sp.counter = counter;
             int h = 0;
             const int* hr = pen_rows(p0 + 1, n, sp, h);
             strata::dsv41k::sample_verify(hd.logits + (size_t) row0 * V, n, V, sp, d_specq,
@@ -12579,6 +12459,11 @@ struct Model::Impl {
         if (mi == 0) {   // the profile (the CPU lane's experts: by the plan's order)
             uint32_t* pr = prof.data() + (size_t) l.il * g.n_exp;
             int n_picked = 0;
+            // Swaps stay within a layer, so fully resident layers need no prompt counts.
+            const bool lacking = !usage.empty() && !l.mtp &&
+                                 std::any_of(l.slot.begin(), l.slot.end(), [](int s) { return s < 0; });
+            const float per = strata::core::get_prompt_routing_weight(strata::core::kPromptRoutings, l.k_exp,
+                                                                      (int64_t) T * l.k_exp);
             for (int e = 0; e < l.n_exp; ++e) {
                 const int v = L0.vs_pin[e];
                 const int cnt = b[(size_t) v + 1] - b[(size_t) v];
@@ -12587,6 +12472,8 @@ struct Model::Impl {
                     ++n_picked;
                     l.heat[(size_t) e] += (float) cnt;
                     if (l.slot[(size_t) e] < 0) l.cpu_hits.push_back(e);
+                    if (lacking)
+                        count_usage(l, e, per * (float) cnt);
                 }
             }
             static const bool ustat = std::getenv("DS4_UNPICKED_STAT") != nullptr;
@@ -13363,12 +13250,12 @@ struct Model::Impl {
     }
     // a run layer-major? - one device holding every layer on the flow, several chunks, and what the chunks after the
     // first would read from the files again more than the chunks' states moved to host memory and back at every layer
-    // (DS4_LAYER_MAJOR=0: never); then its host memory: the chunks' states (pinned, else pageable) and the layer cache,
-    // the largest layer's experts read from the files if RAM allows (ram_avail() less kRamMargin; DS4_LAYER_CACHE_MB
-    // sets it) - at least one expert, or not layer-major
+    // (DS4_LAYER_MAJOR=0: never; any other number: whatever the cost; --prompt-order sets it); then its host memory:
+    // the chunks' states (pinned, else pageable) and the layer cache, the largest layer's experts read from the files
+    // if RAM allows (ram_avail() less kRamMargin; DS4_LAYER_CACHE_MB sets it) - at least one expert, or not layer-major
     bool lm_begin(const Run& run) {
-        static const char* env = std::getenv("DS4_LAYER_MAJOR");
-        if (devs.size() != 1 || run.T.size() < 2 || (env != nullptr && std::atoi(env) == 0)) return false;
+        static const int asked = env_tri("DS4_LAYER_MAJOR");
+        if (devs.size() != 1 || run.T.size() < 2 || asked == 0) return false;
         Chunk& c = *chunks[0];
         if (!c.flow) return false;
         size_t need = 0, n_exp = 0, blob_max = 0;
@@ -13388,7 +13275,7 @@ struct Model::Impl {
         for (int T : run.T) rows += T;
         const size_t hb = chunk_hand_bytes(), state_b = run.T.size() * hb;
         const double moved = 2.0 * (double) rows * ((double) hb / (double) chunk) * (double) g.nl;
-        if (need == 0 || (double) (run.T.size() - 1) * file_b <= moved) return false;
+        if (need == 0 || (asked < 0 && (double) (run.T.size() - 1) * file_b <= moved)) return false;
         size_t lc_bytes = need;
         if (const char* mb = std::getenv("DS4_LAYER_CACHE_MB")) lc_bytes = std::min(need, (size_t) std::atoll(mb) << 20);
         else {
@@ -15944,14 +15831,9 @@ struct Model::Impl {
 
     void save_profile() const {
         if (o.profile.empty() || o.profile_readonly) return;   // (--profile-readonly: a test keeps the file it read)
-        const std::string tmp = o.profile + ".tmp";
-        std::FILE* f = std::fopen(tmp.c_str(), "wb");
-        if (f == nullptr) return;
-        const bool ok = std::fwrite(prof.data(), 4, prof.size(), f) == prof.size();
-        std::fclose(f);
-        // (the old profile replaced: std::rename does not replace an existing file on Windows, so there the profile
-        // never moved on and only .tmp files were left)
-        if (!ok || !platform::replace_file(tmp, o.profile)) std::remove(tmp.c_str());
+        std::string err;
+        if (!strata::core::write_expert_counts(o.profile, (int64_t) prof.size() / g.n_exp, g.n_exp, prof, err))
+            std::fprintf(stderr, "ds4: %s\n", err.c_str());
     }
 
     std::vector<std::string> info_lines() const {
@@ -16331,6 +16213,7 @@ int Model::poll_group(int stage, std::string& err) { return p_->poll_group(stage
 bool Model::finish_group(int group, const std::function<void(int)>& select, std::string& err) {
     return p_->finish_group(group, select, err);
 }
+void Model::set_draft_rule(strata::kernels::DraftRule rule) { p_->draft_rule = rule; }
 int Model::sample_row(int row, float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter) {
     return p_->sample_row(row, t, tp, tk, mp, seed, counter, nullptr, p_->row_positions[row] + 1);
 }

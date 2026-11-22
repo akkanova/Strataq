@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -38,6 +39,29 @@ struct StepRow {
     int64_t pos = 0;
     int parent = -1;   ///< the row whose token this one follows; -1: the conversation's last kept token
 };
+
+/// Calls `fn(first, end)` for each run [first, end) of consecutive rows among `count` whose `session_of(row)` is the
+/// same, in row order. A `fn` that returns bool can stop the walk by returning false; this then returns false.
+/// Returns true after visiting all runs, including when there are no rows. The lookup must have no side effects.
+template <class Index, class SessionOf, class Fn>
+bool for_each_window(Index count, SessionOf&& session_of, Fn&& fn) {
+    for (Index first = 0, end = 0; first < count; first = end) {
+        end = first + 1;
+        while (end < count && session_of(end) == session_of(first))
+            ++end;
+        if constexpr (std::is_void_v<decltype(fn(first, end))>)
+            fn(first, end);
+        else if (!fn(first, end))
+            return false;
+    }
+    return true;
+}
+
+/// Walks a step's windows: the runs of consecutive rows of one conversation (see the overload above).
+template <class Fn>
+bool for_each_window(const std::vector<StepRow>& rows, Fn&& fn) {
+    return for_each_window(rows.size(), [&](size_t r) { return rows[r].session; }, fn);
+}
 
 /// Selects confidence floors and the model's drafting restrictions for the shared step.
 struct DraftLimits {

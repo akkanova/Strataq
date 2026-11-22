@@ -18,6 +18,7 @@
 // The legacy canonical projections use their explicit Q8_0/Q8_K activation images. The optional native
 // BF16 path affects only the scalar gate: it reads the original F32 input and uses pinned CUDA MMVF plus
 // an FP32 sigmoid. Native projection overrides independently select CUDA Q8_1 MMVQ and FP32 SwiGLU.
+#include "strata/base/platform/env.hpp"
 #include "strata/models/qwen38/kernels/shared_expert.hpp"
 #include "strata/common/kernels/fuse_decode.hpp"
 #include "strata/common/kernels/bf16_gemv.hpp"
@@ -205,10 +206,7 @@ void launch_sigmoid_scale_rows(float* out, const float* g, int n_embd, int n_tok
 }
 
 bool fused_swiglu_q81_enabled() {
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_FUSED_SWIGLU_Q81");
-        return v == nullptr || std::atoi(v) != 0;
-    }();
+    static const bool on = strata::platform::env_tri("STRATA_FUSED_SWIGLU_Q81") != 0;
     return on;
 }
 }  // namespace

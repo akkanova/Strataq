@@ -35,6 +35,7 @@
 #include "strata/common/state/token_listing.hpp"
 #include "strata/common/serve/gpu_fatal.hpp"
 #include "strata/common/serve/loop.hpp"
+#include "strata/common/serve/option_names.hpp"
 #include "strata/common/serve/request.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/common/experts/expert_profile.hpp"
@@ -92,7 +93,7 @@
 #endif
 #include "strata/models/qwen38/conversation.hpp"
 #include "strata/models/qwen38/model.hpp"
-#include "strata/models/qwen38/prompt_images.hpp"
+#include "strata/models/common/prompt_images.hpp"
 #include "strata/program/batch_read.hpp"
 #include "strata/models/qwen38/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
@@ -250,10 +251,7 @@ const bool crash_bt_installed = [] {
 // loop is dropped without draining the groups first.  A pipelined read never gives way (batch_read_piece), so the
 // BYIELD is for a read that has ended, and the drain (and the refill after it) did nothing for it
 bool pipe_byield_nodrain_env() {
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_PIPE_BYIELD_NODRAIN");
-        return v && v[0] != '0';
-    }();
+    static const bool on = strata::platform::is_env_on("STRATA_PIPE_BYIELD_NODRAIN");
     return on;
 }
 // STRATA_ADMIT_MERGE_FIRST=1 (read once; off by default): a batch admission reads the last prompt tokens of its last
@@ -262,10 +260,7 @@ bool pipe_byield_nodrain_env() {
 // every expert is in VRAM, and row T-1 is the first window's position with its history and its Philox draw, so the
 // token and the state are the same; the rows before it commit as the prompt windows commit them
 bool admit_merge_first_env() {
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_ADMIT_MERGE_FIRST");
-        return v && v[0] != '0';
-    }();
+    static const bool on = strata::platform::is_env_on("STRATA_ADMIT_MERGE_FIRST");
     return on;
 }
 // STRATA_CKPT_POOL=1 (read once; off by default): the serve loop keeps the running-state vectors of the conversation
@@ -277,10 +272,7 @@ bool park_async_env() {   // STRATA_PARK_ASYNC (strata/core/conversation_snapsho
     return on;
 }
 bool ckpt_pool_env() {
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_CKPT_POOL");
-        return v && v[0] != '0';
-    }();
+    static const bool on = strata::platform::is_env_on("STRATA_CKPT_POOL");
     return on;
 }
 // STRATA_CKPT_POOL_READY=N (opt-in, N = 1..16, read once; only with the pool on, STRATA_CKPT_POOL): the pool keeps N ready
@@ -301,10 +293,7 @@ size_t ckpt_pool_cap_env() { return std::max<size_t>(2, ckpt_pool_ready_env()); 
 // first on the calling thread and each later stage's on a thread of its own device (kept for the process: the copies'
 // private streams are per thread), instead of one stage after the other.  Each part is the same copy of the same state
 bool ckpt_threads_env() {
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_CKPT_THREADS");
-        return v && v[0] != '0';
-    }();
+    static const bool on = strata::platform::is_env_on("STRATA_CKPT_THREADS");
     return on;
 }
 // STRATA_SLOT_CKPT_MOVE=1 (read once; off by default): a batch admission MOVES its own turn checkpoint into the slot
@@ -314,10 +303,7 @@ bool ckpt_threads_env() {
 // same history).  The same bytes are restored from another container, so the tokens are the same.  It keeps the
 // dropped checkpoints' storage as STRATA_CKPT_POOL does (the slot's old checkpoint is the next save's)
 bool slot_ckpt_move_env() {
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_SLOT_CKPT_MOVE");
-        return v && v[0] != '0';
-    }();
+    static const bool on = strata::platform::is_env_on("STRATA_SLOT_CKPT_MOVE");
     return on;
 }
 // STRATA_SLOT_COPY_BATCHSYNC=1 (read once; off by default): the direct slot copy (STRATA_SLOT_COPY_DIRECT) only queues
@@ -325,10 +311,7 @@ bool slot_ckpt_move_env() {
 // for each of its ~116 copies.  A streamed K/V state's residency refresh waits for its copies through an event.  The
 // same copies in the same order on one stream, so the slot holds the same bytes
 bool slot_copy_batchsync_env() {
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_SLOT_COPY_BATCHSYNC");
-        return v && v[0] != '0';
-    }();
+    static const bool on = strata::platform::is_env_on("STRATA_SLOT_COPY_BATCHSYNC");
     return on;
 }
 
@@ -1049,12 +1032,6 @@ private:
 using ImgKey = strata::core::ConversationImageKey;
 using ConvCheckpoint = strata::core::ConversationCheckpoint;
 
-uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull) {
-    const uint8_t* p = (const uint8_t*) data;
-    for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
-    return h;
-}
-
 using ConvStateSizes = strata::core::ConversationStateSizes;
 
 ConvStateSizes conv_state_sizes(const strata::core::ModelGeometry& g, const strata::core::SessionState& ss) {
@@ -1218,11 +1195,11 @@ private:
 /// GPU (Strix Halo and the other APUs, whose "link" is the shared memory) and STRATA_DEFAULTS=026 keep 0.60 and 1.85.  STRATA_PCIE_SHARE_MAX /
 /// STRATA_PCIE_K_RULE=0 or 1 set either by hand.
 static double pcie_share_max() {
-    static const double v = strata::pcie_share_ceiling(spill_discrete_gpu(), strata::qwen_defaults_026(), std::getenv("STRATA_PCIE_SHARE_MAX"));
+    static const double v = strata::pcie_share_ceiling(spill_discrete_gpu(), strata::defaults_026(), std::getenv("STRATA_PCIE_SHARE_MAX"));
     return v;
 }
 static double pcie_pool_k(double r) {
-    static const bool on = strata::pcie_k_rule_default(spill_discrete_gpu(), strata::qwen_defaults_026(), std::getenv("STRATA_PCIE_K_RULE"));
+    static const bool on = strata::pcie_k_rule_default(spill_discrete_gpu(), strata::defaults_026(), std::getenv("STRATA_PCIE_K_RULE"));
     return strata::pcie_pool_k(r, on);
 }
 
@@ -1396,9 +1373,11 @@ int main(int argc, char** argv) {
 #if defined(STRATA_HAVE_QWEN35)
     // **THE FAMILY SWITCH.**  A Qwen3.6-35B-A3B file (GGUF architecture qwen35moe) runs on its own engine path
     // (src/models/qwen36), decided here from the file's header before any of this engine's state exists; every other file
-    // goes on below exactly as before.  Only the architecture string is read (the header of --native's shard).
-    for (int i = 1; i + 1 < argc; ++i) {
-        if (std::strcmp(argv[i], "--native") != 0 && std::strcmp(argv[i], "--model") != 0) continue;
+    // goes on below exactly as before.  Only the architecture string is read (the header of --model's shard).
+    for (int i = argc - 2; i >= 1; --i) {
+        if (std::strcmp(strata::serve::get_primary_option(argv[i]), "--model") != 0) {
+            continue;
+        }
         bool qwen35 = false;
         try {
             const strata::GgufFile meta(strata::gguf_split_paths(argv[i + 1]).front());
@@ -2610,10 +2589,7 @@ int main(int argc, char** argv) {
         o.adapt_async_self = strata::core::adapt_async_self_decides(aa);
     }
     if (o.adapt_async) {
-        static const bool pl_async = [] {
-            const char* v = std::getenv("STRATA_PIPELINE_ADAPT_ASYNC");
-            return v == nullptr || std::atoi(v) != 0;
-        }();
+        static const bool pl_async = strata::platform::env_tri("STRATA_PIPELINE_ADAPT_ASYNC") != 0;
         const char* why = !o.serve ? "it needs --serve"
                         : o.adapt_every <= 0 || o.adapt_swaps <= 0 ? "the adaptive tier is off"
                         : !o.resident_cpu_experts && srcp != &arena_src ? "it needs the resident RAM mode, --resident-experts, or the expert arena"
@@ -2628,10 +2604,7 @@ int main(int argc, char** argv) {
     }
     // #340: whether a layer split's stage whose card has room for the prompt path's buffers keeps them as its own
     // instead of borrowing cache slots.  STRATA_SPLIT_OWN_BUFFERS=0: every stage borrows (0.1.30/0.1.31).
-    static const bool split_own_ok = [] {
-        const char* v = std::getenv("STRATA_SPLIT_OWN_BUFFERS");
-        return v == nullptr || v[0] != '0';
-    }();
+    static const bool split_own_ok = !strata::platform::is_env_off("STRATA_SPLIT_OWN_BUFFERS");
     // STRATA_PIPE_ADAPT_EVERY (batch_groups.hpp; the rounds run in the pipelined loop below): said once here, with the
     // other start-up lines, before READY
     if (o.serve && o.batch > 0 && o.batch_groups > 1 && multi_gpu) {
@@ -2851,7 +2824,7 @@ int main(int argc, char** argv) {
                 const char* fe = std::getenv("STRATA_PF_FUSED");
                 const char* le = std::getenv("STRATA_PREFILL_LAYER_MAJOR");
                 const strata::SmallCardPromptPath pp = strata::small_card_prompt_path(
-                    chunk, pf_small_hip, 1, strata::kernels::cpu::expert_layout().native, strata::qwen_defaults_026(),
+                    chunk, pf_small_hip, 1, strata::kernels::cpu::expert_layout().native, strata::defaults_026(),
                     fe != nullptr && fe[0] != '\0', le != nullptr && le[0] != '\0');
                 if (pp.any()) {
                     const int64_t chunk_default = chunk;
@@ -3452,10 +3425,7 @@ int main(int argc, char** argv) {
             // STRATA_SPLIT_OVERLAP=1 (opt-in; measured on 2x RX 7900 XTX only): a ready word per hand-off, raised by the
             // writing stage's GPU, so the next stage's window is launched early and the host never syncs between
             // stages (Verifier::set_handoff_flags).  Not for --split-device 0 (both stages on one GPU).
-            const bool overlap_asked = [] {
-                const char* v = std::getenv("STRATA_SPLIT_OVERLAP");
-                return v != nullptr && std::atoi(v) != 0;
-            }();
+            const bool overlap_asked = strata::platform::env_tri("STRATA_SPLIT_OVERLAP") == 1;
             // --pipeline-windows (#859) runs its own overlapped loop with its own hand-offs: the two do not mix
             const bool overlap = overlap_asked && !split_same && o.pipeline_windows == 0;
             if (overlap_asked && o.pipeline_windows > 0)
@@ -4459,7 +4429,7 @@ int main(int argc, char** argv) {
         // STRATA_SPLIT_MTP_BATCH=1 (default off): the layer split's drafter is on the last stage, so E-9 (Prefill::draft_kv)
         // runs there, on the Prefill that ran the chunk, instead of the drafter's own per-8-row pass.  The drafts' K/V
         // come from Q8_1 x Q8_0 MMQ rather than mmvq: drafts may differ, the target's tokens never.
-        static const bool split_mtp_batch = strata::program::draft_kv::split_env_on(std::getenv("STRATA_SPLIT_MTP_BATCH"));
+        static const bool split_mtp_batch = strata::platform::env_tri("STRATA_SPLIT_MTP_BATCH") == 1;
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
             // KVA: a chunk the late layers did not compute has no real final rows: its draft cells are neither built
             // nor read (the floor rises before the cells are built, so they are skipped)
@@ -6054,10 +6024,7 @@ int main(int argc, char** argv) {
         // a slot copy can go device to device (the same bytes into the same places as the checkpoint/K-V image
         // round trip through host memory, which costs ~40-90 ms per admission on a 4-card split); each device is
         // synchronized once before and once after.  Opt-in: STRATA_SLOT_COPY_DIRECT=1 (default: the host path).
-        static const bool slot_copy_direct = [] {
-            const char* v = std::getenv("STRATA_SLOT_COPY_DIRECT");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
-        }();
+        static const bool slot_copy_direct = strata::platform::is_env_on("STRATA_SLOT_COPY_DIRECT");
         // synchronizes every device a slot session is on; false when one failed (the others are synchronized still)
         auto sync_all_slot_devices = [&]() {
             bool ok = true;
@@ -7625,7 +7592,7 @@ int main(int argc, char** argv) {
                 if (!geni) {
                     for (int64_t c = 0; c < cells; ++c) put(c, c, c, c);
                 } else {
-                    strata::qwen38::read_prompt_images(emb_path, ids, g.n_embd, req_img_keys, mrope_host,
+                    strata::models::read_prompt_images(emb_path, ids, g.n_embd, req_img_keys, mrope_host,
                                                        img_rows, row_ptr, req_imgs, ve);
                 }
                 tr("positions built", (long long) img_rows.size());
@@ -8927,10 +8894,7 @@ int main(int argc, char** argv) {
                 // stop for an admission.  The prompt writes the main session, the windows the slots' sessions; the prompt
                 // borrows no cache slots (--no-prefill-borrow), so the windows' experts stay where they are.  The same
                 // bytes are computed as in the serial form (a window's rows do not depend on what else is on the GPU).
-                static const bool conc1 = [] {
-                    const char* v = std::getenv("STRATA_BATCH_CONCURRENT_READ");
-                    return v != nullptr && std::atoi(v) != 0;
-                }();
+                static const bool conc1 = strata::platform::env_tri("STRATA_BATCH_CONCURRENT_READ") == 1;
                 auto run_conc = [&](int64_t q, int64_t r) -> bool {
                     if (!conc1 || piped || !stages.empty() || o.batch <= 0 || !o.no_prefill_borrow || !batch_on() ||
                         !req_imgs.empty() || kvg.on)
@@ -9044,12 +9008,9 @@ int main(int argc, char** argv) {
                 // I/O read-ahead: one thread at a time).  Pictures are read the usual way (their rows go up through
                 // pinned slots of a size known only then).
                 static const bool pr_conc = [&] {
-                    const char* v = std::getenv("STRATA_PIPED_CONCURRENT");
-                    if (v == nullptr || std::atoi(v) == 0) return false;
-                    auto env_on = [](const char* k) {
-                        const char* x = std::getenv(k);
-                        return x != nullptr && std::atoi(x) != 0;
-                    };
+                    auto env_on = [](const char* k) { return strata::platform::env_tri(k) == 1; };
+                    if (!env_on("STRATA_PIPED_CONCURRENT"))
+                        return false;
                     strata::program::ConcurrentReadSetup s;
                     s.prefill_help = env_on("STRATA_PREFILL_HELP");
                     s.split_mtp_batch = env_on("STRATA_SPLIT_MTP_BATCH");
@@ -9089,10 +9050,7 @@ int main(int argc, char** argv) {
                     // host's core and the pool workers' CPUs instead (--aux-cpus places them, when it is on).
                     // STRATA_PIPED_CONCURRENT_UNPIN=0 keeps the inherited CPUs (an A/B); STRATA_TEST_CONC_ON_HOST_CPU=1
                     // (Windows, a test) puts them on the host thread's CPUs first, as Linux does.
-                    static const bool conc_unpin = [] {
-                        const char* v = std::getenv("STRATA_PIPED_CONCURRENT_UNPIN");
-                        return v == nullptr || std::atoi(v) != 0;
-                    }();
+                    static const bool conc_unpin = strata::platform::env_tri("STRATA_PIPED_CONCURRENT_UNPIN") != 0;
 #if defined(_WIN32)
                     static const bool conc_on_host = std::getenv("STRATA_TEST_CONC_ON_HOST_CPU") != nullptr;
                     std::vector<ULONG> host_cpu_sets;
@@ -9176,10 +9134,8 @@ int main(int argc, char** argv) {
                             if (busy) continue;
                             // STRATA_TEST_BELL_SLEEP_US=N (a test, an A/B of the wait below): sleep N us instead, as
                             // the first form of this thread did (a whole timer tick on Windows)
-                            static const int test_sleep_us = [] {
-                                const char* t = std::getenv("STRATA_TEST_BELL_SLEEP_US");
-                                return t != nullptr ? std::max(0, std::atoi(t)) : 0;
-                            }();
+                            static const int test_sleep_us =
+                                std::max(0, strata::platform::env_int("STRATA_TEST_BELL_SLEEP_US", 0));
                             if (test_sleep_us > 0) {
                                 std::this_thread::sleep_for(std::chrono::microseconds(test_sleep_us));
                                 continue;
@@ -9472,10 +9428,7 @@ int main(int argc, char** argv) {
             if (!req_ckpt) turn_at = -1;
             const int64_t root_at = o.prompt_cache > 0 && (read_from == 0 || resumed_from0)
                 ? strata::core::find_prompt_root_boundary(ids, last_turn, o.turn_token, o.prompt_cache_root) : -1;
-            static const bool message_checkpoint = [] {
-                const char* e = std::getenv("STRATA_CACHE_MESSAGE_BOUNDARY");
-                return e != nullptr && std::atoi(e) != 0;
-            }();
+            static const bool message_checkpoint = strata::platform::env_tri("STRATA_CACHE_MESSAGE_BOUNDARY") == 1;
             // Only add a snapshot; the existing token and image checks still decide reuse.
             const int64_t message_at = message_checkpoint && !multi_gpu && o.prompt_cache > 0
                 ? strata::program::message_checkpoint_boundary(ids, resume, turn_at, o.turn_token) : -1;
@@ -10550,10 +10503,7 @@ int main(int argc, char** argv) {
                 // RAM places of experts of their layer that are not routed to (count below 0.5), one pair per layer,
                 // the largest difference first.  One blob read each, on this thread; the RAM stays the same size, and
                 // the routing, the weights and the VRAM tier's own rule are untouched.
-                static const int ram_adapt_n = [] {
-                    const char* e = std::getenv("STRATA_RAM_ADAPT");
-                    return e != nullptr ? std::max(0, std::atoi(e)) : 0;
-                }();
+                static const int ram_adapt_n = std::max(0, strata::platform::env_int("STRATA_RAM_ADAPT", 0));
                 if (ram_adapt_n > 0 && ram_adapt2.on && !first_window && !drive.d.usage.empty() && pending.empty() &&
                     (!ajob || astate == AState::Idle) && src.complement_ready() && !multi_gpu && !peer.valid() &&
                     !remote_opt && o.batch == 0) {
@@ -11014,7 +10964,7 @@ int main(int argc, char** argv) {
                             hash_ok = false;
                             break;
                         }
-                        h = fnv1a(hash_buffer.data(), n, h);
+                        h = strata::core::fnv1a64(hash_buffer.data(), n, h);
                         offset += n;
                     }
                     return h;

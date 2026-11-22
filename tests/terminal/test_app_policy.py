@@ -27,6 +27,11 @@ class GeneratedPolicy(unittest.TestCase):
             self.assertEqual((row["label"], row["hint"], row["default"], row["env"], row.get("legacy", {})),
                              (sw.label, sw.effect, sw.default, dict(sw.env), dict(sw.legacy)))
 
+    def test_retired_switch_names_reach_the_client(self):
+        for row in app_policy.table():
+            sw = speed_switches.BY_ID[row["id"]]
+            self.assertEqual(row.get("cleanup_env", []), list(sw.cleanup_env))
+
     def test_the_drafting_families_and_names_are_drafting_py_own(self):
         text = app_policy.render()
         for family in drafting.SUPPORTED_FAMILIES:

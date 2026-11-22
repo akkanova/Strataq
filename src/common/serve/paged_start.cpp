@@ -27,6 +27,7 @@
 #include <mutex>
 #include <numeric>
 #include <set>
+#include <tuple>
 
 namespace strata::serve {
 
@@ -80,6 +81,7 @@ private:
     bool watched_;
     bool reading_;
 };
+strata::core::LinkSpeed get_host_link(int dev);
 }  // namespace
 
 int take_paged_options(int& argc, char** argv, const std::string& program, PagedSettings& s) {
@@ -90,7 +92,7 @@ int take_paged_options(int& argc, char** argv, const std::string& program, Paged
     };
     int64_t rows = s.step.rows, lookahead = -1, concurrent = -1, mtp_rows = 0;   // -1: chosen after parsing
     int64_t half_life = -1;   // -1: --expert-popularity-decay's
-    std::string drafter = "on", save_on_shutdown = "off", step_profile = "off", gpu_mib, popularity_decay;
+    std::string drafter = "on", save_on_shutdown = "off", step_profile = "off", gpu_mib, popularity_decay, draft_rule;
     std::string batch_groups = std::to_string(s.batch_groups);
     const Own own[] = {{"--tokens-min", &s.tokens_min},       {"--tokens-max", &s.tokens_max},
                        {"--conversation-tokens", &s.conversation_context},
@@ -107,7 +109,9 @@ int take_paged_options(int& argc, char** argv, const std::string& program, Paged
                        {"--concurrent", &concurrent}, {"--batch-groups", nullptr, &batch_groups},
                        {"--pause-dir", nullptr, &s.pause_dir}, {"--copy-back", nullptr, &s.copy_back},
                        {"--drafter", nullptr, &drafter},      {"--remote-experts", nullptr, &s.remote_experts},
+                       {"--draft-rule", nullptr, &draft_rule},
                        {"--save-on-shutdown", nullptr, &save_on_shutdown},
+                       {"--prompt-order", nullptr, &s.prompt_order},
                        {"--expert-popularity-decay", nullptr, &popularity_decay},
                        {"--expert-half-life", &half_life},    {"--route-tail-skip", &s.route_tail_skip},
                        {"--route-prior-pct", &s.route_prior_pct},
@@ -158,10 +162,6 @@ int take_paged_options(int& argc, char** argv, const std::string& program, Paged
         std::fprintf(stderr, "%s: --batch-groups takes auto (or 0) or a whole number of groups\n", name);
         return 2;
     }
-    if (s.copy_back != "auto" && s.copy_back != "on" && s.copy_back != "off") {
-        std::fprintf(stderr, "%s: --copy-back takes auto, on or off\n", name);
-        return 2;
-    }
     if (!popularity_decay.empty() &&
         !((s.popularity_decay = std::strtod(popularity_decay.c_str(), nullptr)) > 0 && s.popularity_decay <= 1)) {
         std::fprintf(stderr, "%s: --expert-popularity-decay takes a factor above 0 and at most 1\n", name);
@@ -187,16 +187,24 @@ int take_paged_options(int& argc, char** argv, const std::string& program, Paged
         std::fprintf(stderr, "%s: --draft-confidence-pct and --draft-cumulative-pct take 0 to 100\n", name);
         return 2;
     }
-    if (s.remote_experts != "auto" && s.remote_experts != "on" && s.remote_experts != "off") {
-        std::fprintf(stderr, "%s: --remote-experts takes auto, on or off\n", name);
-        return 2;
-    }
-    for (const auto& [flag, word] : {std::pair{"--drafter", &drafter}, {"--save-on-shutdown", &save_on_shutdown},
-                                     {"--step-profile", &step_profile}})
-        if (*word != "on" && *word != "off") {
-            std::fprintf(stderr, "%s: %s takes on or off\n", name, flag);
+    for (const auto& [flag, word, words] : {std::tuple{"--copy-back", &s.copy_back, "auto|on|off"},
+                                            {"--remote-experts", &s.remote_experts, "auto|on|off"},
+                                            {"--prompt-order", &s.prompt_order, "auto|layer|chunk"},
+                                            {"--drafter", &drafter, "on|off"},
+                                            {"--save-on-shutdown", &save_on_shutdown, "on|off"},
+                                            {"--step-profile", &step_profile, "on|off"}})
+        if (word->find('|') != std::string::npos ||
+            ("|" + std::string(words) + "|").find("|" + *word + "|") == std::string::npos) {
+            std::fprintf(stderr, "%s: %s takes %s\n", name, flag, words);
             return 2;
         }
+    if (strata::kernels::DraftRule rule; !draft_rule.empty()) {
+        if (!strata::kernels::parse_draft_rule(draft_rule, rule)) {
+            std::fprintf(stderr, "%s: --draft-rule takes %s\n", name, strata::kernels::kDraftRuleChoices);
+            return 2;
+        }
+        s.draft_rule = rule;
+    }
     if (std::string err; !gpu_mib.empty() && !parse_i64_list(gpu_mib.c_str(), s.gpu_mib, err)) {
         std::fprintf(stderr, "%s: --gpu-mib takes MiB, one per card of a layer split: %s\n", name, err.c_str());
         return 2;
@@ -217,14 +225,67 @@ void set_paged_runtime_env(const PagedSettings& s, bool hops_possible) {
         strata::platform::set_env("GPU_MAX_HW_QUEUES", "16", false);
         strata::platform::set_env("CUDA_DEVICE_MAX_CONNECTIONS", "32", false);
     }
+    // Each model reads its switch at its first prompt (STRATA_LM_HIP: Qwen3.8's opt-in on AMD); one the user set wins.
+    if (s.prompt_order != "auto")
+        for (const char* name : {"STRATA_PREFILL_LAYER_MAJOR", "DS4_LAYER_MAJOR", "STRATA_LM_HIP"})
+            strata::platform::set_env(name, s.prompt_order == "layer" ? "1" : "0", false);
 }
 
-void measure_card(PagedCard& card, const std::string& program, uint64_t expert_bytes) {
-    const strata::core::LinkSpeed link = card.link = strata::core::measure_host_link(card.dev, kLinkProbeBytes);
+PagedCard& add_paged_card(PagedCards& cards, int dev, int64_t lb, int64_t le, int64_t n_layers, bool trim_weights,
+                          const std::string& program, uint64_t expert_bytes) {
+    PagedCard& card = cards.emplace_back();
+    card.index = cards.size() - 1;
+    card.dev = dev;
+    card.lb = lb;
+    card.le = le;
+    card.weights_lb = trim_weights ? lb : 0;
+    card.weights_le = trim_weights ? le : n_layers;
+    const bool shared = std::any_of(cards.begin(), cards.end() - 1, [&](const PagedCard& c) { return c.dev == dev; });
+    card.id = "gpu" + std::to_string(dev) + (shared ? "." + std::to_string(card.index) : "");
+    const strata::core::LinkSpeed link = card.link = get_host_link(dev);
     card.refill_batch = strata::core::get_refill_batch(link, expert_bytes, kRefillBudgetMs, kRefillBatch);
     std::fprintf(stderr, "%s: %s's link to RAM: %.1f GB/s to the GPU, %.1f GB/s back, %.3f ms a round trip\n",
                  program.c_str(), card.id.c_str(), link.to_gbps, link.from_gbps, link.latency_ms);
-    card.layer_ms = strata::program::split_rules::get_layer_ms(strata::core::get_card_speed(card.dev));
+    card.layer_ms = strata::program::split_rules::get_layer_ms(strata::core::get_card_speed(dev));
+    return card;
+}
+
+CardPoolPlan plan_card_pool(const PagedCard& card, const PagedSettings& s, const strata::core::StateLayout& layout,
+                            int64_t max_context, uint64_t page_bytes, const std::vector<uint64_t>& blob_bytes,
+                            const std::vector<strata::core::ExpertKey>& ranking, int64_t max_experts, uint64_t keep) {
+    uint64_t most = get_conversation_bytes(layout, max_context, page_bytes);
+    for (size_t i = 0; i < ranking.size() && (int64_t) i < max_experts; ++i)
+        most += (blob_bytes[(size_t) ranking[i].layer] + page_bytes - 1) / page_bytes * page_bytes;
+    CardPoolPlan plan;
+    plan.gpu_mib = s.get_gpu_mib(card.index);
+    plan.room = get_gpu_room(card.dev, keep);
+    plan.bytes = plan.gpu_mib >= 0 ? std::min((uint64_t) plan.gpu_mib << 20, plan.room) : std::min(plan.room, most);
+    plan.config.page_bytes = page_bytes;
+    plan.config.chunk_bytes = get_chunk_bytes(plan.bytes, page_bytes);
+    plan.config.tokens_min = std::clamp<int64_t>(s.tokens_min, 0, max_context);
+    return plan;
+}
+
+std::vector<int64_t> plan_start_split(const std::vector<int>& devices, const PagedSettings& s, uint64_t keep,
+                                      const strata::core::LayerSizes& sizes, std::vector<int32_t> ranked_layers,
+                                      const std::string& program) {
+    std::vector<uint64_t> pools;
+    std::vector<double> layer_ms, links;
+    for (size_t i = 0; i < devices.size(); ++i) {
+        const int dev = devices[i];
+        const int64_t mib = s.get_gpu_mib(i);
+        pools.push_back(mib < 0 ? get_gpu_room(dev, keep) / std::count(devices.begin(), devices.end(), dev) :
+                                  (uint64_t) mib << 20);
+        layer_ms.push_back(strata::program::split_rules::get_layer_ms(strata::core::get_card_speed(dev)));
+        links.push_back(get_host_link(dev).to_gbps);
+    }
+    strata::core::SplitProblem problem =
+        strata::core::make_paged_split_problem(sizes, pools, layer_ms, links, 1, s.tokens_min);
+    problem.ranked_layers = std::move(ranked_layers);
+    const std::string prefix = program + ": layer split auto: ";
+    const strata::core::SplitPlan plan = strata::core::plan_layer_split(problem, prefix.c_str());
+    strata::core::print_layer_split(plan, problem.ranked_layers.size(), prefix.c_str());
+    return plan.cuts;
 }
 
 strata::core::ChunkMemory get_gpu_chunk_memory(int dev, uint64_t chunk_bytes, bool zeroed) {
@@ -354,11 +415,6 @@ DedicatedHold::~DedicatedHold() {
         strata::core::gpu_free(piece);
 }
 
-uint64_t get_gpu_pool_bytes(int dev, uint64_t keep, int64_t gpu_mib, uint64_t most, uint64_t& room) {
-    room = get_gpu_room(dev, keep);
-    return gpu_mib >= 0 ? std::min((uint64_t) gpu_mib << 20, room) : std::min(room, most);
-}
-
 uint64_t get_conversation_bytes(const strata::core::StateLayout& layout, int64_t tokens, uint64_t page_bytes) {
     uint64_t bytes = layout.bytes_for(tokens);
     for (const strata::core::StateRegion& r : layout.regions)
@@ -372,19 +428,18 @@ uint64_t get_chunk_bytes(uint64_t pool_bytes, uint64_t page_bytes) {
     return std::max<uint64_t>(std::min(kChunkBytes, pool_bytes) / unit, 1) * unit;
 }
 
-void say_gpu_pool(const std::string& program, const PagedCard& card, uint64_t room, uint64_t chunk_bytes,
-                  int64_t gpu_mib) {
+void say_gpu_pool(const std::string& program, const PagedCard& card, const CardPoolPlan& plan) {
     const strata::core::PagePool& pool = card.experts.pool();
     char capped[128] = "";
-    if (gpu_mib >= 0 && ((uint64_t) gpu_mib << 20) > room)
+    if (plan.gpu_mib >= 0 && ((uint64_t) plan.gpu_mib << 20) > plan.room)
         std::snprintf(capped, sizeof capped, "; --gpu-mib %lld asked for more than the GPU has room for",
-                      (long long) gpu_mib);
+                      (long long) plan.gpu_mib);
     std::fprintf(stderr, "%s: the page pool of %s (layers %lld-%lld): %.2f GiB (of %.2f GiB it could take) in chunks "
                          "of %.0f MiB%s, pages of %llu bytes, for the experts and the conversations, %lld tokens of it "
                          "kept for the conversations%s\n",
                  program.c_str(), card.id.c_str(), (long long) card.lb, (long long) card.le - 1,
-                 (double) pool.report().total.bytes / 1073741824.0, (double) room / 1073741824.0,
-                 (double) chunk_bytes / 1048576.0,
+                 (double) pool.report().total.bytes / 1073741824.0, (double) plan.room / 1073741824.0,
+                 (double) pool.chunk_bytes() / 1048576.0,
                  card.experts.is_contiguous() ? " mapped back to back in one virtual range" : "",
                  (unsigned long long) pool.page_bytes(),
                  (long long) pool.tokens_min(), capped);
@@ -489,6 +544,15 @@ strata::core::ChunkMemory track_outside(strata::core::ChunkMemory memory, TakeCh
     };
     memory.is_outside = [outside](const uint8_t* p) { return outside->count(p) > 0; };
     return memory;
+}
+
+/// Reuses each GPU's first successful probe for the start split and all its cards.
+strata::core::LinkSpeed get_host_link(int dev) {
+    static std::map<int, strata::core::LinkSpeed> measured;
+    strata::core::LinkSpeed& link = measured[dev];
+    if (!link.is_known())
+        link = strata::core::measure_host_link(dev, kLinkProbeBytes);
+    return link;
 }
 
 }  // namespace

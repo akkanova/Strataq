@@ -1,11 +1,17 @@
 // read_expert_profile refuses a profile whose header version is not 1, naming the version it found, the one it
 // reads, and the file - before the geometry check, since the fields after the version are only known to be a
-// version 1 layout.  A version 1 file still loads.  CPU only: no device is touched.
+// version 1 layout.  A version 1 file still loads.  DeepSeek's counts (read_expert_counts, version 2) round-trip,
+// refuse another version, expert count or a truncated file, and still read a headerless file from before version 2.
+// CPU only: no device is touched.
 #include "strata/common/experts/expert_profile.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <thread>
+#include <array>
 #include <string>
 #include <utility>
 #include <vector>
@@ -46,6 +52,16 @@ int main() {
     check(strata::core::read_expert_profile(path, L, E, back, slots, err) && back == ranked && slots == 3,
           "a version 1 profile loads");
 
+    // This fixture is the version 1 wire format, including its reverse-rank table.
+    const std::vector<uint32_t> expected_v1 = {0x50525453, 1, 2, 3, 3, 3,
+                                             0x00020001, 0, 1, 1, UINT32_MAX, UINT32_MAX,
+                                             2, UINT32_MAX, 0};
+    std::ifstream v1(path, std::ios::binary);
+    const std::string v1_bytes((std::istreambuf_iterator<char>(v1)), std::istreambuf_iterator<char>());
+    check(v1_bytes == std::string(reinterpret_cast<const char*>(expected_v1.data()), expected_v1.size() * 4),
+          "version 1 bytes stay unchanged");
+    v1.close();
+
     // the same bytes with the version field at 2: refused, naming 2, 1 and the file
     check(set_version(path, 2), "version field rewritten to 2");
     err.clear();
@@ -66,6 +82,78 @@ int main() {
     // and back to 1: it loads again, so the refusal was the version field and nothing else
     check(set_version(path, 1), "version field rewritten to 1");
     check(strata::core::read_expert_profile(path, L, E, back, slots, err) && back == ranked, "version 1 loads again");
+
+    // version 2: DeepSeek's routing counts, n_rows x n_expert
+    const int64_t rows = 3;
+    std::vector<uint32_t> counts((size_t) (rows * E)), got;
+    for (size_t i = 0; i < counts.size(); ++i)
+        counts[i] = (uint32_t) (i * 7 + 1);
+    const std::string cpath = (dir / "counts.bin").string();
+    using strata::core::read_expert_counts;
+    check(strata::core::write_expert_counts(cpath, rows, E, counts, err), "counts written");
+    check(std::filesystem::file_size(cpath) == 24 + counts.size() * 4, "a counts file is the header and the counts");
+    check(read_expert_counts(cpath, E, rows, got, err) && got == counts, "a version 2 counts file round-trips");
+    check(!read_expert_counts(cpath, E + 1, rows, got, err), "counts of another number of experts a row are refused");
+    check(!read_expert_counts(path, E, rows, got, err) && has(err, "version 1"), "a version 1 profile is not counts");
+    check(!strata::core::write_expert_counts(cpath, rows, E + 1, counts, err), "counts of the wrong size are refused");
+    check(!read_expert_counts(cpath, E, rows - 1, got, err) && has(err, "too many rows"),
+          "the model row limit is checked before allocating");
+    check(!strata::core::read_expert_profile(cpath, rows, E, back, slots, err) && has(err, "version 2"),
+          "version 2 counts cannot load as version 1 rankings");
+    check(set_version(cpath, 7), "counts version rewritten");
+    check(!read_expert_counts(cpath, E, rows, got, err) && has(err, "version 7"),
+          "an unknown counts version cannot load as legacy counts");
+    check(set_version(cpath, 2), "counts version restored");
+    std::filesystem::resize_file(cpath, 24 + counts.size() * 4 - 1);
+    check(!read_expert_counts(cpath, E, rows, got, err) && has(err, "truncated"), "truncated counts are refused");
+    std::filesystem::resize_file(cpath, 8);
+    check(!read_expert_counts(cpath, E, rows, got, err), "a truncated STRP header cannot load as legacy counts");
+    std::FILE* f = std::fopen(cpath.c_str(), "wb");   // headerless, as before version 2, with a partial row after
+    bool wrote_legacy = false;
+    if (f != nullptr) {
+        wrote_legacy = std::fwrite(counts.data(), 4, counts.size(), f) == counts.size() && std::fputc(9, f) == 9;
+        wrote_legacy = (std::fclose(f) == 0) && wrote_legacy;
+    }
+    check(wrote_legacy, "headerless counts written");
+    check(read_expert_counts(cpath, E, rows + 1, got, err) && got == counts,
+          "a headerless counts file reads its whole rows");
+    check(!read_expert_counts(cpath, E, rows - 1, got, err) && has(err, "too many rows"),
+          "legacy counts also respect the allocation limit");
+    check(!strata::core::write_expert_counts(cpath, INT64_MAX, INT64_MAX, counts, err),
+          "writer dimensions cannot overflow or truncate");
+    check(strata::core::write_expert_counts(cpath, rows, E, counts, err), "legacy counts upgrade to STRP");
+
+#if defined(_WIN32)
+    f = std::fopen(cpath.c_str(), "rb");
+    check(f != nullptr, "another engine holds the profile open");
+    if (f != nullptr) {
+        check(!strata::core::write_expert_counts(cpath, rows, E, counts, err) && has(err, "cannot write"),
+              "a Windows reader denying deletion prevents replacement safely");
+        std::fclose(f);
+        check(read_expert_counts(cpath, E, rows, got, err) && got == counts,
+              "failed replacement preserves the existing profile");
+    }
+#endif
+    std::array<std::thread, 4> writers;
+    std::array<bool, 4> saved{};
+    for (size_t i = 0; i < writers.size(); ++i) {
+        writers[i] = std::thread([&, i] {
+            std::string write_err;
+            const std::vector<uint32_t> own(counts.size(), (uint32_t) i);
+            for (int j = 0; j < 16; ++j) {
+                if (strata::core::write_expert_counts(cpath, rows, E, own, write_err))
+                    saved[i] = true;
+            }
+        });
+    }
+    for (auto& writer : writers)
+        writer.join();
+    check(saved[0] && saved[1] && saved[2] && saved[3], "each concurrent writer can publish");
+    check(read_expert_counts(cpath, E, rows, got, err) && got.size() == counts.size() &&
+          got.front() < writers.size() && got == std::vector<uint32_t>(counts.size(), got.front()),
+          "concurrent saves publish one complete writer's profile");
+    check(std::distance(std::filesystem::directory_iterator(dir), std::filesystem::directory_iterator{}) == 2,
+          "saves leave no temporary files");
 
     std::filesystem::remove_all(dir);
     if (fails == 0) std::puts("expert_profile_version_test: OK");

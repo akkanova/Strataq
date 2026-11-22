@@ -256,7 +256,7 @@ test('where the all-cards split engine takes the start, Auto is the MTP in the l
 
 test('the MTP fetch the app makes names the folder of the model own files, so the installer never downloads the model again', () => {
   const source = read('../server/native-control.mjs');
-  assert.match(source, /async function installMtpLayer\(job,args,config\)\{[\s\S]*?const native=\(\(\)=>\{const a=\(config\.args\?\?\[\]\)\.map\(String\),i=a\.indexOf\('--native'\)[\s\S]*?install\(job,\{family:fam\.family,model:size\.model,drafter:'mtp',vision:args\.vision\?\?\(config\.vision\?'yes':'no'\),\.\.\.\(native\?\{gguf_dir:dirname\(native\)\}:\{\}\)\}\)/);
+  assert.match(source, /async function installMtpLayer\(job,args,config\)\{[\s\S]*?const native=\(\(\)=>\{const a=\(config\.args\?\?\[\]\)\.map\(String\),i=a\.findLastIndex\(isModelFlag\)[\s\S]*?install\(job,\{family:fam\.family,model:size\.model,drafter:'mtp',vision:args\.vision\?\?\(config\.vision\?'yes':'no'\),\.\.\.\(native\?\{gguf_dir:dirname\(native\)\}:\{\}\)\}\)/);
 });
 
 test('0.2.10.1: the app plans and fetches like the Terminal (no --no-split), and Auto on a computer where Control says split is the MTP in the label and the fit', async () => {

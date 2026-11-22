@@ -18,6 +18,7 @@
 // This file is compiled for SSE4.2 + AVX with AVX2/FMA/F16C explicitly off (CMakeLists.txt), and the engine
 // calls it only behind cpu_avx1_ok().  No static constructors at namespace scope (#391): the tables below
 // are constexpr, like iq_avx2.cpp's.
+#include "strata/base/platform/env.hpp"
 #include "strata/common/kernels/cpu/iq_avx1.hpp"
 
 #include "ggml.h"
@@ -134,10 +135,7 @@ inline float hsum4(__m128 v) {
 
 // E-2 prefetching, the same knob as the AVX-2/512 kernels: STRATA_IQ_PREFETCH is the distance in bytes.
 int prefetch_distance() {
-    static const int d = [] {
-        const char* v = std::getenv("STRATA_IQ_PREFETCH");
-        return v ? std::atoi(v) : 2048;
-    }();
+    static const int d = strata::platform::env_int("STRATA_IQ_PREFETCH", 2048);
     return d;
 }
 

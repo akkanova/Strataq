@@ -182,7 +182,7 @@ int ExpertPages::refill(int max, uint64_t& wait_ms, std::string& err) {
         keys.push_back(key);
         slots.push_back(slot);
     }
-    if (!keys.empty() && !hooks_.load(keys.data(), slots.data(), keys.size(), err)) {
+    if (!keys.empty() && !load(keys.data(), slots.data(), keys.size(), err)) {
         for (const ExpertKey& key : keys) {
             pool_->remove_expert(key);
             if (cache_ != nullptr)
@@ -220,7 +220,7 @@ int ExpertPages::replace(ExpertKey gone, ExpertKey key, std::string& err) {
     if (pool_->find_expert(key) != no_page)
         return 0;
     if (const int32_t free_slot = admit_free(key); free_slot != kNotResident) {
-        if (!hooks_.load(&key, &free_slot, 1, err)) {
+        if (!load(&key, &free_slot, 1, err)) {
             pool_->remove_expert(key);
             if (cache_ != nullptr)
                 cache_->evict(key.layer, key.expert);
@@ -245,7 +245,7 @@ int ExpertPages::replace(ExpertKey gone, ExpertKey key, std::string& err) {
         ranked_.push_back(key);
     }
     const int32_t slot = get_slot(first);
-    if (!hooks_.load(&key, &slot, 1, err)) {
+    if (!load(&key, &slot, 1, err)) {
         pool_->remove_expert(key);
         if (cache_ != nullptr)
             cache_->evict(gone.layer, gone.expert);
@@ -254,6 +254,7 @@ int ExpertPages::replace(ExpertKey gone, ExpertKey key, std::string& err) {
     if (cache_ != nullptr)
         cache_->replace(key.layer, gone.expert, key.expert);
     hooks_.moved(key, slot);
+    ++traffic_.swaps;
     return 1;
 }
 
@@ -319,6 +320,7 @@ void ExpertPages::on_relocated(ExpertKey key, PageId to) {
 
 /// Forgets an expert whose pages (from `first`) the pool gives to another use, and keeps it for `refill`.
 void ExpertPages::on_evicted(ExpertKey key, PageId first) {
+    ++traffic_.evictions;
     if (hooks_.leaving)
         hooks_.leaving(key, pool_->page_address(first));
     if (cache_ != nullptr)
@@ -327,6 +329,14 @@ void ExpertPages::on_evicted(ExpertKey key, PageId first) {
         evicted_.insert(rank);
     if (hooks_.moved)
         hooks_.moved(key, kNotResident);
+}
+
+/// Copies `n` experts `keys` into their pages from `firsts` through the `load` hook and counts them.
+bool ExpertPages::load(const ExpertKey* keys, const int32_t* firsts, size_t n, std::string& err) {
+    if (!hooks_.load(keys, firsts, n, err))
+        return false;
+    traffic_.loads += n;
+    return true;
 }
 
 }  // namespace strata::core

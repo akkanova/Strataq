@@ -15,11 +15,13 @@
 
 using strata::core::get_restore_point_cap;
 using strata::core::latest_point;
+using strata::core::make_restore_point_room;
 using strata::core::mark_plan;
 using strata::core::mark_victim;
 using strata::core::MarkAt;
 using strata::core::MarkUse;
 using strata::core::TailCost;
+using strata::core::touch_restore_point;
 
 namespace {
 
@@ -40,16 +42,7 @@ struct Conv {
         for (const MarkUse& m : mk) v.push_back(m.pos);
         return v;
     }
-    void mark(bool shared) {
-        for (MarkUse& m : mk)
-            if (m.pos == pos()) {
-                m.shared = m.shared || shared;
-                m.used = ++clock;
-                return;
-            }
-        mk.push_back({pos(), shared, ++clock});
-        if ((int) mk.size() > cap) mk.erase(mk.begin() + mark_victim(mk));
-    }
+    void mark(bool shared) { make_restore_point_room(mk, clock, pos(), shared, cap, mark_victim); }
     bool restore(int64_t limit) {
         const std::vector<int64_t> at = points();
         const int b = latest_point(at, limit, pos());
@@ -58,10 +51,8 @@ struct Conv {
         toks.resize((size_t) p);
         for (int64_t& c : ck)
             if (c > p) c = -1;
-        for (size_t i = mk.size(); i-- > 0;)
-            if (mk[i].pos > p) mk.erase(mk.begin() + (long) i);
-        for (MarkUse& m : mk)
-            if (m.pos == p) m.used = ++clock;
+        std::erase_if(mk, [p](const MarkUse& m) { return m.pos > p; });
+        touch_restore_point(mk, clock, p);
         return true;
     }
     // a request's prompt -> the tokens it reused (prompt_in's `from`)
@@ -182,6 +173,32 @@ int main() {
     assert(mark_victim({{10, true, 1}, {20, true, 2}, {30, false, 3}}) == 2);
     assert(mark_victim({{10, true, 1}, {20, false, 2}, {30, false, 3}}) == 1);
     assert(mark_victim({{10, true, 1}, {20, true, 2}, {30, true, 3}}) == 0);
+
+    {   // make_restore_point_room / touch_restore_point: a chain of points whose payload is a buffer
+        struct Point {
+            int64_t pos = 0;
+            bool shared = false;
+            uint64_t used = 0;
+            std::vector<int> payload;
+        };
+        std::vector<Point> chain;
+        uint64_t clock = 0;
+        const auto room = [&](int64_t at, bool shared, int cap) {
+            return make_restore_point_room(chain, clock, at, shared, cap, mark_victim);
+        };
+        assert(room(10, false, 0) == nullptr && room(0, false, 2) == nullptr && chain.empty());   // (none kept)
+        room(10, true, 3)->payload = {10};
+        room(20, false, 3)->payload = {20};
+        room(25, false, 3)->payload = {25};
+        assert(room(10, false, 3) == nullptr && chain[0].shared && chain[0].used == 4);   // (there already: touched)
+        chain[2].used = 50;   // (a chain taken back from a pause: the clock goes on past its uses)
+        const Point* p = room(30, false, 3);   // (20 gives way: moved last, its buffer kept for the new state)
+        assert(p == &chain[2] && p->pos == 30 && p->payload == std::vector<int>{20} && p->used == 51);
+        assert(chain[1].pos == 25 && touch_restore_point(chain, clock, 27) == nullptr && clock == 51);
+        assert(touch_restore_point(chain, clock, 10) == &chain[0] && chain[0].used == 52);
+        chain.resize(1);
+        assert(room(40, false, 1) == nullptr && chain.size() == 1);   // (refused: the one point held is shared)
+    }
 
     // get_restore_point_cap: Qwen3.8's points (its recurrent state) fit 3 in the budget; DeepSeek's keep their own cap
     assert(get_restore_point_cap(117683200, 16) == 3);

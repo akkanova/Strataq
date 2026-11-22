@@ -11,10 +11,12 @@
 #include "strata/base/gpu/links.hpp"
 #include "strata/common/experts/expert_pages.hpp"
 #include "strata/common/experts/layer_split.hpp"
+#include "strata/common/kernels/draft_rule.hpp"
 #include "strata/common/serve/request.hpp"
 #include "strata/common/spec/step.hpp"
 #include "strata/common/state/conversation_file.hpp"
 #include "strata/common/state/pool_copy.hpp"
+#include "strata/common/state/prompt_checkpoint.hpp"
 
 #include <cstdint>
 #include <deque>
@@ -95,6 +97,8 @@ struct PagedModelFacts {
     int max_rows = 0;                       ///< the most rows one step may run (its verify windows' room)
     std::vector<int64_t> end_tokens;        ///< the tokens that end an answer
     Sampling sampling;                      ///< a request's sampling before its keys (the old engine's defaults)
+    /// which drafts a sampled request's verify rows keep when --draft-rule is not given (its old engine's rule)
+    strata::kernels::DraftRule draft_rule;
     /// a drafter guesses tokens (propose), its state in the conversations' pages; without one the engine never calls
     /// forget_drafts, propose or switch_drafter
     strata::spec::DraftLimits draft_limits; ///< Defaults for the shared confidence and scheduling rules.
@@ -111,6 +115,9 @@ struct PagedModelFacts {
     int max_concurrent = 0;
     /// the most restore points a request's prompt read keeps (marks=, tail=, shared=; keep_restore_point); 0: none
     int restore_points = 0;
+    /// where every prompt read also keeps the model's own checkpoints (keep_restore_point, whatever restore_points
+    /// is); the default keeps none
+    strata::core::CheckpointPlacement checkpoints;
     bool serial_conversations = false;     ///< the model switches shared inputs between conversations
     uint64_t extra_resident_vram = UINT64_MAX; ///< Smallest card VRAM allowing an extra cached conversation by default.
     std::vector<uint64_t> expert_bytes;     ///< per layer: one expert's bytes
@@ -259,10 +266,13 @@ public:
     virtual bool keeps_rewind_branch(const PagedParts&, int64_t) const { return true; }
     /// Keeps the state of the conversation of `parts` at its end, `tokens` of `ids`, as a restore point its request
     /// asked for (strata/common/state/restore_points.hpp; `shared`: the end of a start other conversations share,
-    /// given up last), making room by the model's own cap; false (and `err`) when it cannot.  The engine calls it where
-    /// its prompt read stops for one, only when PagedModelFacts::restore_points is above 0.
+    /// given up last) or as one of PagedModelFacts::checkpoints, making room by the model's own cap; false (and `err`)
+    /// when it cannot.  The engine calls it where its prompt read stops for one: a point the request asked for (when
+    /// PagedModelFacts::restore_points is above 0) or one of the checkpoints (when keeps_checkpoints).
     virtual bool keep_restore_point(const PagedParts& parts, const std::vector<int64_t>& ids, int64_t tokens,
                                     bool shared, std::string& err) = 0;
+    /// Tells whether the current request of `parts` lets its read stop at PagedModelFacts::checkpoints.
+    virtual bool keeps_checkpoints(const PagedParts&) const { return true; }
     /// Gets the positions short of its end that the conversation of `parts` can go back to (rewind), so that a prompt
     /// that leaves it there continues it (strata/common/state/resume_point.hpp); none by default.
     virtual std::vector<int64_t> get_rewind_points(const PagedParts&) const { return {}; }
@@ -279,8 +289,10 @@ public:
 
     // ---- the prompt, the step and the drafter
 
-    /// Gets the maximum tokens per prompt piece between inspection and concurrent decode opportunities.
-    virtual int64_t get_prompt_chunk() const = 0;
+    /// Gets the most tokens the engine reads at a time of a prompt read of `tokens` tokens, `alone` when no other
+    /// conversation decodes meanwhile: a chunk, or more where the model reads faster in one run (Qwen3.8's
+    /// layer-major walk, DeepSeek V4.1's chunk pipeline), a stop in which goes back to a restore point.
+    virtual int64_t get_prompt_chunk(int64_t tokens, bool alone) const = 0;
     /// Gets the largest chunk a prompt is read in (--prefill: a ceiling), or 0 when the prompt path keeps buffers of
     /// its own.  The engine reads each prompt in the largest chunk up to it whose buffers its pools can lend then.
     virtual int64_t get_prompt_ceiling() const { return 0; }
@@ -296,13 +308,23 @@ public:
                                 std::string&) {
         return true;
     }
-    /// Called after each chunk of a prompt read, `n` tokens from `pos0`; false (and `err`) stops the read.
-    using ChunkDone = std::function<bool(int64_t pos0, int64_t n, std::string& err)>;
-    /// Reads `ids[from, from + n)` into the conversation of `parts`, calling `on_chunk` after each chunk; the drafter
-    /// reads it too when `drafting`.  `ids` is the whole prompt; the engine may read it in pieces of
-    /// get_prompt_chunk tokens with inspections and decode steps of other conversations between them.
+    /// Lets the engine steer a prompt read while the model runs it; the model asks where it can.
+    struct PromptControl {
+        /// Called after each chunk (or run of chunks) read, `n` tokens from `pos0`; false (and `err`) stops the read.
+        std::function<bool(int64_t pos0, int64_t n, std::string& err)> on_chunk;
+        /// Asked at the chunk ends after a run's first: true ends the run there, keeping the chunks read.  Null:
+        /// never (a run that may yield keeps fewer chunks in flight).
+        std::function<bool()> should_yield;
+        std::function<bool()> should_stop;       ///< True abandons the run (a STOP): the read fails with "cancelled".
+        std::function<void(int64_t)> progress;   ///< Gets the position a run reached between on_chunk calls.
+    };
+    /// Reads `ids[from, from + n)` into the conversation of `parts`, asking `control` on the way; the drafter reads it
+    /// too when `drafting`.  `took` gets the tokens read: fewer than `n` after a yield, when the engine runs other
+    /// conversations' decode steps before it reads on; -1 after a failure that left the state past the chunks
+    /// on_chunk reported (a stop inside a run), when the engine takes the conversation back to a restore point.
+    /// `ids` is the whole prompt; the engine reads it in spans that end at its restore points.
     virtual bool read_prompt(const PagedParts& parts, const std::vector<int64_t>& ids, int64_t from, int64_t n,
-                             bool drafting, const ChunkDone& on_chunk, std::string& err) = 0;
+                             bool drafting, const PromptControl& control, int64_t& took, std::string& err) = 0;
     /// Supplies the consumed tokens for each row's conversation, valid until run_rows returns.
     virtual void set_step_histories(const std::vector<const std::vector<int32_t>*>&) {}
     /// Runs a step's rows (spec::StepModel::run); picks[r] gets row r's next token, or -1 when its logits were not
@@ -348,6 +370,8 @@ public:
                         std::string& err, strata::spec::DraftContext* draft) = 0;
     /// Loads (`on`) or gives back the drafter's weights; false (and `err`) when loading failed.
     virtual bool switch_drafter(bool on, std::string& err) = 0;
+    /// Sets which drafts the verify rows of sampled requests keep from the next step on (draft_rule.hpp).
+    virtual void set_draft_rule(strata::kernels::DraftRule rule) = 0;
     /// Prints the INFO lines that start the protocol: `slots` batch slots, `spec` rows a conversation's step may run
     /// (0: no drafting).
     virtual void print_info(int slots, int spec) const = 0;

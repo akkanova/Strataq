@@ -5,10 +5,15 @@ export const USER_KEY='user_args',WRITTEN_KEY='args_written';
 /** Options the app or setup choose from their own answers (context, KV type, pictures, draft layer, layer split): never taken from "args" as hand edits. */
 export const CHOICE_FLAGS=new Set(['--max-context','--kv','--vision','--mtp','--spec-min-p','--batch-mtp','--layer-split']);
 
+/** Tests an exact model-file option, leaving --native-* switches separate. */
+export const isModelFlag=arg=>arg==='--model'||arg==='--native';
+/** Splits options from their values and keeps the last model path using the spelling older engines accept. */
 export function groups(args){
  const out=[];
  for(const raw of Array.isArray(args)?args:[]){const a=String(raw);if(a.startsWith('--')||!out.length)out.push([a]);else out[out.length-1].push(a);}
- return out;
+ const lastModel=out.findLastIndex(g=>isModelFlag(g[0]));
+ return out.filter((g,i)=>!isModelFlag(g[0])||i===lastModel)
+  .map(g=>isModelFlag(g[0])?['--native',...g.slice(1)]:g);
 }
 export const flat=gs=>gs.flat();
 export const flagOf=g=>g?.[0]?.startsWith('--')?g[0]:'';
@@ -30,12 +35,13 @@ export function capture(cfg,skip=CHOICE_FLAGS){
  return flat([...mine.values()].flat());
 }
 export function setFlag(user,flag,value){
+ flag=isModelFlag(flag)?'--native':flag;
  const rest=groups(user).filter(g=>flagOf(g)!==flag);
  if(value!==null&&value!==undefined)rest.push([flag,String(value)]);
  return flat(rest);
 }
 export function flagValue(args,flag){
- const list=(Array.isArray(args)?args:[]).map(String),at=list.indexOf(flag);
+ const list=(Array.isArray(args)?args:[]).map(String),at=isModelFlag(flag)?list.findLastIndex(isModelFlag):list.indexOf(flag);
  return at>=0&&at+1<list.length?list[at+1]:null;
 }
 /** `config` with the person's options merged into "args", recorded in "user_args", and "args_written" refreshed (only when the config has one). */

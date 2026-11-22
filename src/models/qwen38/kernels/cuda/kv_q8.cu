@@ -1,4 +1,5 @@
 // src/models/qwen38/kernels/cuda/kv_q8.cu - see include/strata/models/qwen38/kernels/kv_q8.hpp.
+#include "strata/base/platform/env.hpp"
 #include "strata/models/qwen38/kernels/kv_q8.hpp"
 #include "strata/common/kernels/f16_bits.hpp"
 #include "strata/models/qwen38/kernels/kv_units.hpp"
@@ -154,10 +155,7 @@ __global__ void kv_gather_q8_wide_kernel(const int8_t* __restrict__ k_q, const i
 // 8-wide gather off (A/B).  The wide kernel is bitwise identical, so this only decides speed.  Mirrors
 // qsa_decode_attn.cu's pre75_attn.
 bool pre75_q8_gather() {
-    static const bool off = [] {
-        const char* e = std::getenv("STRATA_Q8_GATHER_WIDE");
-        return e != nullptr && e[0] == '0';
-    }();
+    static const bool off = strata::platform::is_env_off("STRATA_Q8_GATHER_WIDE");
     static int cc[64] = {};
     int dev = 0;
     if (off) return false;

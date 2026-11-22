@@ -537,6 +537,28 @@ in the Memory panel of the page-pool engines ([below](#the-memory-panel)).
 | `codex_thread_titles`, `codex_compaction_cache` | off | See [Codex CLI](#the-responses-api-and-codex-cli). |
 | `mcp_servers`, `mcp` | none | See [Tools from MCP servers](#tools-from-mcp-servers). |
 
+### Engine options with an older name
+
+Engines built from `src/` accept both names below wherever they support the setting. Use the first name;
+the older name is deprecated. Aliases do not add settings to engines that lack them. Installed older engines
+and the separate SYCL engine may accept only their original names. Launchers keep those spellings for compatibility.
+
+| Option | Older name, still taken |
+| --- | --- |
+| `--model GGUF` (the model's file, shard 1) | `--native` (the Qwen engines) |
+| `--vram-reserve-mib N` | `--reserve-mib` (the DeepSeek engines) |
+| `--eos-ids LIST` | `--eos` (the DeepSeek engines) |
+| `--batch N` | `--slots` |
+| `--max-new N` | `--n` (strata-dsv41, strata-q36) |
+| `--max-context N` | `--ctx` (strata-q36) |
+| `--prefill N` | `--chunk` (strata-q36) |
+
+Some options look alike but are different settings. Qwen's `--gpu` hides the other cards from the engine; DeepSeek's
+`--gpus` picks cards among all of them. Qwen's `--pool-workers` counts the threads beside the engine's own; DeepSeek's
+`--cpu-threads` counts that one too. Qwen3.8's `--prefill` takes `auto` and `auto:N`; Qwen3.6 takes `auto` or a number.
+EOS lists use comma-separated token IDs. DeepSeek's `--prefill-chunk 0` means
+windows of 16 tokens. strata-dsv41 takes its conversations at once as `--parallel`.
+
 ### Streaming and tool calls
 
 - With `"stream": true` everything arrives as it is made: thinking, answer and tool calls (the tool's name first, then its
@@ -1458,6 +1480,7 @@ them on your own card.
 | `STRATA_FS_SLOTS=N` | CUDA | Foresight swap space: N VRAM slots per layer refilled with missed and predicted experts. | The smaller cache cost more than the slots returned in every box measured. Left off. |
 | `STRATA_MMQ_DIRECT=1` | CUDA, native packs; needs a build with `-DSTRATA_MMQ_TAB=ON` (off by default because it costs 36-38 MiB of VRAM per GPU) | The prompt's MMQ reads resident experts in their cache slots instead of copying them. Same bits. | Faster "read in" time with every expert resident. |
 | `STRATA_IQ4_W4A8=1` | CUDA sm_80..sm_88 (Ampere) and sm_120 (Blackwell, only where the prompt experts run on MMQ: the fused int8 kernels are its default and are faster), IQ4_XS / IQ4_NL experts (`=2`: the IQ4_NL down products only) | The prompt's IQ4 expert products run on a pipelined int8 tensor-core kernel instead of MMQ: the weights stay 4-bit in registers, a cp.async pipeline feeds the K steps. Same bits as MMQ (`prefill_iq4_w4a8_test`); a product it does not cover (another type or GPU, a launch MMQ would split along K) stays on MMQ. | Faster prompts on IQ4 packs; measurements in the pull request. |
+| `--prompt-order auto\|layer\|chunk` | The page-pool engines (strata-q38, strata-ds41) | The order in which a prompt of several chunks is read. `layer` reads one layer across several chunks before the next layer, reducing repeated expert reads; `chunk` reads each chunk through every layer. `auto` (the default) keeps each model's own rule and sets no variables. `layer` and `chunk` set `STRATA_PREFILL_LAYER_MAJOR` (Qwen3.8), `STRATA_LM_HIP` (Qwen3.8 on AMD) and `DS4_LAYER_MAJOR` (DeepSeek) to `1` or `0`; a variable you set yourself wins. Each engine still declines `layer` where it cannot run it (Qwen3.8: an image prompt, a peer GPU, no VRAM for the walk; DeepSeek: more than one GPU, or no RAM for the layer cache). Another summation order, so answers can differ at a near tie. With `layer`, strata-q38 reads a prompt that no other conversation waits on in one run, so a stop goes back to the conversation's latest restore point instead of keeping every chunk read (as a stop in a strata-ds41 prompt does). | Not measured as a setting; the rules behind `auto` are. |
 | `--prefill-head-alias` | `--serve`, one GPU | The output head's VRAM holds the prompt buffers while a prompt is read ([PREFILL_HEAD_ALIAS.md](PREFILL_HEAD_ALIAS.md)). | For 8 GB cards. |
 | `STRATA_EMB_REUSE_ACCOUNT=1` | CUDA | The planner counts the VRAM saved because the half-output buffer `bo` reuses the embedding buffer `emb`, so the auto chunk can grow. Changes prompt rounding. | Prompt about +3.9% on an RTX 3060, no KL measurement yet. |
 | `STRATA_VERIFY_ASYNC_LAUNCH=1` | CUDA, single-request verifier | Runs the CUDA graph launch of a verify window on a separate host thread so the caller keeps serving CPU expert doorbells. A diagnostic for Compute Sanitizer runs. | |
@@ -2265,6 +2288,19 @@ The Memory panel's Drafter list combines the model drafter, the suffix drafter (
 guesses instead of the model's where the planner expects them to pay) and lookup after the model's guesses
 (`--lookup-chain 1`), six choices in all. It sends only the settings a choice changes, so a `--suffix-draft` or
 `--lookup-chain` the engine started with stays unless the choice needs another value.
+
+**Draft acceptance** (`--draft-rule`, the Memory panel's choice of the same name, `CHANGE_SETTINGS draft_rule=`)
+decides which guesses a sampled request keeps. A greedy request always compares its guesses with the most likely
+token. `exact` keeps a guess only when it is the token the model draws without guesses, so the answers are those of
+decoding without drafts. `speculative` keeps a guess with probability min(1, p/q) and otherwise draws from what is
+left of p (Leviathan et al. 2023, Chen et al. 2023): each token is still distributed as the model's own draw, so the
+answers are as good, though their words can differ from `exact`'s. Three rules keep more guesses and change the
+answers: `typical` (Medusa's typical acceptance, ε = 0.09, δ = 0.3) keeps a guess the model finds likely enough,
+`top-<N>` (N from 1 to 99; the panel offers 75, 90 and 98) one inside the top N% of the model's probability or at
+least as likely as the model's own draw, and `lower-temperature` (top-0) only the latter. A guess they reject is
+replaced by the token decoding without guesses writes there. The defaults are each engine's earlier rule: `exact` in
+`strata-q38`, `speculative` in `strata-ds41`. Both engines decide in one shared function, `pick_verified_token` in
+`include/strata/common/kernels/draft_rule.hpp`. How much each rule changes speed has not been measured yet.
 
 In `strata-ds41`, the Memory panel's Drafter switch (`CHANGE_SETTINGS drafter=off|on`) also releases and
 reloads DSpark's dense tensors. `--drafter off` and `--dspark off` start with those tensors released;

@@ -59,10 +59,13 @@ __device__ __forceinline__ float philox_uniform(uint64_t seed, uint64_t counter)
 /// **ONE BLOCK PER ROW.**  The selection is the shared sampler's: the top_k list descending by logit, ties to the
 /// lower index; `top_p`'s cut reads that order in double arithmetic, then min_p, temperature and the Philox draw.
 // MODE 1 = speculative sampling's draft (sample_draft: the draw from the draft block's logits, on a Philox stream of
-// its own, and its kept list in ql[t]); 2 = its verify (sample_verify: the draft draft[t] with probability
-// min(1, p/q), else a draw from max(0, p - q)).
+// its own, and its kept list in ql[t]); 2 = its verify (sample_verify: the draft draft[t] judged under p.draft_rule,
+// speculative by default: kept with probability min(1, p/q), else a draw from max(0, p - q)).
 constexpr uint64_t kSpecDraftKey = 0x5bd1e9955bd1e995ull, kSpecAcceptKey = 0x9e3779b97f4a7c15ull,
                    kSpecResidKey = 0xc2b2ae3d27d4eb4full;
+template <class Uniform>
+__host__ __device__ int verify_row(const SamplerParams& p, int t, const int* ids, const double* w, int n,
+                                   const SpecList& q, int d, Uniform uniform);
 // one block of 1024 threads per row (the launches below): the bound keeps every mode at 64 registers a thread, so a
 // block fits the 64K-register file - unbounded, sm_75 (Turing) compiled the draft mode to 68 and its launch failed
 // ("too many resources requested for launch") wherever the NextN block sat on a Turing card
@@ -318,62 +321,38 @@ __global__ void __launch_bounds__(1024) sampler_kernel(const float* __restrict__
     for (int i = 0; i < n_keep; ++i) sum += exp((double) scaled(i) - (double) smx);
     double w[KMAX];   // the kept list's probabilities, as the plain draw computes them
     for (int i = 0; i < n_keep; ++i) w[i] = exp((double) scaled(i) - (double) smx) / sum;
-    // the plain draw over w with a given uniform (the shared sample_tokens' pick)
-    auto draw = [&](float u) -> int {
-        double cum = 0.0;
-        int pick = sel_ids[n_keep - 1];
-        for (int i = 0; i < n_keep; ++i) {
-            cum += w[i];
-            if ((double) u < cum) { pick = sel_ids[i]; break; }
-        }
-        return pick;
-    };
     if constexpr (MODE == 1) {
         SpecList* q = ql + t;
         q->n = n_keep;
         for (int i = 0; i < n_keep; ++i) { q->ids[i] = sel_ids[i]; q->p[i] = w[i]; }
-        out[t] = draw(philox_uniform(p.seed ^ kSpecDraftKey, p.counter + (uint64_t) t));
+        out[t] = sel_ids[kernels::draw_index(w, n_keep, philox_uniform(p.seed ^ kSpecDraftKey,
+                                                                     p.counter + (uint64_t) t))];
     } else {
-        const SpecList* q = ql + t;
-        const int d = draft[t];
-        const int qn = q->n < KMAX ? q->n : KMAX;
-        auto qof = [&](int id) -> double {
-            for (int j = 0; j < qn; ++j)
-                if (q->ids[j] == id) return q->p[j];
-            return 0.0;
-        };
-        double pd = 0.0;
-        for (int i = 0; i < n_keep; ++i)
-            if (sel_ids[i] == d) { pd = w[i]; break; }
-        const double qd = qof(d);
-        int pick = -1;
-        if (qd <= 0.0) {
-            pick = draw(philox_uniform(p.seed, p.counter + (uint64_t) t));   // not a draft from q: the plain draw
-        } else if ((double) philox_uniform(p.seed ^ kSpecAcceptKey, p.counter + (uint64_t) t) * qd < pd) {
-            pick = d;                                                        // kept: probability min(1, p(d)/q(d))
-        } else {
-            // rejected: a draw from max(0, p - q), renormalised - over p's kept list (p is 0 outside it)
-            double r[KMAX], z = 0.0;
-            for (int i = 0; i < n_keep; ++i) {
-                const double x = w[i] - qof(sel_ids[i]);
-                r[i] = x > 0.0 ? x : 0.0;
-                z += r[i];
-            }
-            const float u = philox_uniform(p.seed ^ kSpecResidKey, p.counter + (uint64_t) t);
-            if (z > 0.0) {
-                double cum = 0.0;
-                for (int i = 0; i < n_keep; ++i) {
-                    if (r[i] <= 0.0) continue;
-                    pick = sel_ids[i];   // the last one with residual mass, if rounding leaves cum below u
-                    cum += r[i] / z;
-                    if ((double) u < cum) break;
-                }
-            } else {
-                pick = draw(u);   // p == q to the last bit: a rejection had probability 0 - never in practice
-            }
-        }
-        out[t] = pick;
+        out[t] = verify_row(p, t, sel_ids, w, n_keep, ql[t], draft[t],
+                            [](uint64_t seed, uint64_t counter) { return philox_uniform(seed, counter); });
     }
+}
+
+/// Gets sample_verify's token for row t: its draft d judged under p.draft_rule against the kept list `ids` / `w`
+/// (n entries), with `q` the drafter's list. A draft absent from q gets the plain draw in speculative mode.
+/// `uniform(seed, counter)` is
+/// the device's or the host's Philox.
+template <class Uniform>
+__host__ __device__ int verify_row(const SamplerParams& p, int t, const int* ids, const double* w, int n,
+                                   const SpecList& q, int d, Uniform uniform) {
+    const int qn = q.n < 64 ? q.n : 64;
+    auto qof = [&](int id) {
+        for (int j = 0; j < qn; ++j)
+            if (q.ids[j] == id) return q.p[j];
+        return 0.0;
+    };
+    const uint64_t c = p.counter + (uint64_t) t;
+    const double qd = qof(d);
+    if (p.draft_rule.kind == kernels::DraftRule::Speculative && qd <= 0.0)
+        return ids[kernels::draw_index(w, n, uniform(p.seed, c))];
+    return kernels::pick_verified_token(p.draft_rule, ids, w, n, d, qd, [&](int i) { return qof(ids[i]); },
+                                        {uniform(p.seed, c), uniform(p.seed ^ kSpecAcceptKey, c),
+                                         uniform(p.seed ^ kSpecResidKey, c)}, true);
 }
 
 #if defined(STRATA_METAL)
@@ -479,61 +458,16 @@ void host_sample(const float* dlogits, int n_tokens, int n_vocab, const int* dhi
         for (int i = 0; i < n_keep; ++i) sum += std::exp((double) scaled(i) - (double) smx);
         double w[64];
         for (int i = 0; i < n_keep; ++i) w[i] = std::exp((double) scaled(i) - (double) smx) / sum;
-        auto draw = [&](float u) -> int {
-            double cum = 0.0;
-            int pick = sel_ids[n_keep - 1];
-            for (int i = 0; i < n_keep; ++i) {
-                cum += w[i];
-                if ((double) u < cum) { pick = sel_ids[i]; break; }
-            }
-            return pick;
-        };
+        const uint64_t c = p.counter + (uint64_t) t;
         if (MODE == 0) {
-            out[t] = draw(host_philox_uniform(p.seed, p.counter + (uint64_t) t));
+            out[t] = sel_ids[kernels::draw_index(w, n_keep, host_philox_uniform(p.seed, c))];
         } else if (MODE == 1) {
             SpecList* q = ql + t;
             q->n = n_keep;
             for (int i = 0; i < n_keep; ++i) { q->ids[i] = sel_ids[i]; q->p[i] = w[i]; }
-            out[t] = draw(host_philox_uniform(p.seed ^ kSpecDraftKey, p.counter + (uint64_t) t));
+            out[t] = sel_ids[kernels::draw_index(w, n_keep, host_philox_uniform(p.seed ^ kSpecDraftKey, c))];
         } else {
-            const SpecList* q = ql + t;
-            const int d = draft[t];
-            const int qn = q->n < KMAX ? q->n : KMAX;
-            auto qof = [&](int id) -> double {
-                for (int j = 0; j < qn; ++j)
-                    if (q->ids[j] == id) return q->p[j];
-                return 0.0;
-            };
-            double pd = 0.0;
-            for (int i = 0; i < n_keep; ++i)
-                if (sel_ids[i] == d) { pd = w[i]; break; }
-            const double qd = qof(d);
-            int pick = -1;
-            if (qd <= 0.0) {
-                pick = draw(host_philox_uniform(p.seed, p.counter + (uint64_t) t));
-            } else if ((double) host_philox_uniform(p.seed ^ kSpecAcceptKey, p.counter + (uint64_t) t) * qd < pd) {
-                pick = d;
-            } else {
-                double r[64], z = 0.0;
-                for (int i = 0; i < n_keep; ++i) {
-                    const double x = w[i] - qof(sel_ids[i]);
-                    r[i] = x > 0.0 ? x : 0.0;
-                    z += r[i];
-                }
-                const float u = host_philox_uniform(p.seed ^ kSpecResidKey, p.counter + (uint64_t) t);
-                if (z > 0.0) {
-                    double cum = 0.0;
-                    for (int i = 0; i < n_keep; ++i) {
-                        if (r[i] <= 0.0) continue;
-                        pick = sel_ids[i];
-                        cum += r[i] / z;
-                        if ((double) u < cum) break;
-                    }
-                } else {
-                    pick = draw(u);
-                }
-            }
-            out[t] = pick;
+            out[t] = verify_row(p, t, sel_ids, w, n_keep, ql[t], draft[t], host_philox_uniform);
         }
     }
 }

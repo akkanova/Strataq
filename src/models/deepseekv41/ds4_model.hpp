@@ -13,6 +13,7 @@
 // compressed KV and index keys included, which a checkpoint leaves in place - through a file or a host buffer.
 #pragma once
 
+#include "strata/common/kernels/draft_rule.hpp"
 #include "strata/common/serve/memory_report.hpp"
 #include "strata/common/serve/request.hpp"
 #include "strata/models/deepseekv41/conversation_layout.hpp"
@@ -274,6 +275,8 @@ public:
     int poll_group(int stage, std::string& err);
     /// Restores the group's logits and retains its DSpark inputs after every stage drains.
     bool finish_group(int group, const std::function<void(int)>& select, std::string& err);
+    /// Sets which drafts a sampled request's verify rows keep (verify_rows, pick_joint_rows); speculative by default.
+    void set_draft_rule(strata::kernels::DraftRule rule);
     /// Samples one row of the last shared pass with the request's sampling settings.
     int sample_row(int row, float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter);
     /// Feeds `token` at pos(); with logits, leaves the next token's scores on the head's device.

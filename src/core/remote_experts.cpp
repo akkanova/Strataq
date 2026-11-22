@@ -1,4 +1,5 @@
 #include "strata/base/gpu/managed_memory.hpp"
+#include "strata/base/platform/env.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/base/gpu/device.hpp"   // primary_device() (STRATA_PRIMARY_DEVICE)
 #include "strata/core/remote_expert_opt.hpp"
@@ -382,10 +383,7 @@ bool RemoteExperts::finish(float* out, std::string& err) {
     // device keeps its default policy.  STRATA_REMOTE_SPIN=0 keeps the blocking sync (the same switch the CUDA
     // branch reads).
 #if defined(STRATA_USE_HIP)   // HIP only: the CUDA branch's cudaInitDevice(ScheduleSpin) already makes the sync spin
-    static const bool spin = [] {
-        const char* v = std::getenv("STRATA_REMOTE_SPIN");
-        return !(v != nullptr && v[0] == '0');
-    }();
+    static const bool spin = !strata::platform::is_env_off("STRATA_REMOTE_SPIN");
     if (spin) {
         cudaError_t e;
         while ((e = cudaStreamQuery(stream_)) == cudaErrorNotReady) {

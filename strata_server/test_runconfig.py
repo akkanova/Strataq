@@ -104,6 +104,16 @@ class Apply(unittest.TestCase):
         self.assertEqual(values, {"memory_mib.gpu0": 30720, "shared_memory": "on"})
         new, changed = runconfig.apply_live({"args": []}, values, {"memory_mib.gpu0": 30208})
         self.assertEqual((new["args"], changed), (["--gpu-mib", "30720"], ["memory_mib.gpu0"]))
+    def test_draft_rule_is_saved_as_its_text_and_refuses_other_words(self):
+        values = runconfig.check_live({"draft_rule": "top-90"}, True)
+        new, changed = runconfig.apply_live({"args": ["--draft-rule", "exact"]}, values)
+        self.assertEqual(new["args"], ["--draft-rule", "top-90"])
+        self.assertEqual(changed, ["draft_rule"])
+        for name in ("exact", "speculative", "typical", "lower-temperature", "top-1", "top-99"):
+            self.assertEqual(runconfig.check_live({"draft_rule": name}, False), {"draft_rule": name})
+        for bad in ("top-0", "top-100", "top-05", "Exact", "", 90, True):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                runconfig.check_live({"draft_rule": bad}, False)
 
     def test_live_residency_default_survives_a_restart_without_changing_concurrency(self):
         values = runconfig.check_live({"vram_conversations": 3}, True)

@@ -62,10 +62,8 @@ target_include_directories(strata_gpu_metal SYSTEM PUBLIC ${METAL_CPP_DIR})
 target_compile_definitions(strata_gpu_metal PUBLIC STRATA_GPU_METAL=1)
 target_link_libraries(strata_gpu_metal PUBLIC "-framework Metal" "-framework Foundation" "-framework QuartzCore")
 
-add_library(strata_core_metal STATIC ${STRATA_ROOT}/src/base/gpu/graph.cpp)
-target_link_libraries(strata_core_metal PUBLIC strata_gpu_metal)
 add_executable(runtime_hello tests/runtime_hello.cpp)
-target_link_libraries(runtime_hello PRIVATE strata_core_metal)
+target_link_libraries(runtime_hello PRIVATE strata_gpu_metal)
 enable_testing()
 add_test(NAME runtime_hello COMMAND runtime_hello)
 
@@ -90,8 +88,8 @@ target_link_libraries(dsu_ref_vs_ggml PRIVATE mtl_rt ggml-base ggml-cpu)
 
 set(S ${STRATA_ROOT}/src)
 set(STRATA_METAL_HOST_SOURCES
-  ${S}/base/gpu/device.cu ${S}/base/gpu/pinned.cu ${S}/base/gpu/runtime.cu ${S}/base/gpu/graph.cpp ${S}/base/gpu/vmm.cpp
-  ${S}/base/platform/memory.cpp ${S}/base/platform/io_priority.cpp
+  ${S}/base/gpu/device.cu ${S}/base/gpu/pinned.cu ${S}/base/gpu/runtime.cu ${S}/base/gpu/vmm.cpp
+  ${S}/base/platform/memory.cpp ${S}/base/platform/io_priority.cpp ${S}/base/platform/piece_reads.cpp
   ${S}/common/state/conversation_memory.cpp ${S}/common/state/conversation_file.cpp
   ${S}/common/experts/expert_profile.cpp ${S}/common/experts/ram_tier.cpp
   ${S}/core/weights.cpp ${S}/core/layout.cpp ${S}/core/expert_source.cpp ${S}/core/remote_experts.cpp
@@ -101,7 +99,7 @@ set(STRATA_METAL_HOST_SOURCES
   ${S}/models/qwen38/conversation_snapshot.cpp ${S}/models/qwen38/conversation_state.cpp
   ${S}/models/qwen38/kernels/ngram.cpp ${S}/models/qwen38/ngram/ple_reader.cpp ${S}/base/platform/direct_file.cpp
   ${S}/models/qwen38/prefill/prefill.cpp
-  ${S}/common/spec/suffix_drafter.cpp ${S}/common/spec/controller.cpp ${S}/common/spec/draft_policy.cpp
+  ${S}/common/spec/suffix_drafter.cpp ${S}/common/spec/draft_policy.cpp
   ${S}/common/spec/draft_source.cpp ${S}/common/serve/loop.cpp ${S}/common/serve/request.cpp
   ${S}/common/serve/request_output.cpp
   ${S}/common/kernels/cpu/pool.cpp ${S}/common/kernels/cpu/expert_layout.cpp ${S}/common/kernels/cpu/native_expert.cpp

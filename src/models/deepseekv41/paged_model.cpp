@@ -12,17 +12,21 @@
 #include "strata/base/platform/os.hpp"
 #include "strata/common/experts/ram_experts.hpp"
 #include "strata/common/experts/card_rules.hpp"
-#include "strata/common/experts/split_rules.hpp"
+#include "strata/common/sample/row_runs.hpp"
+#include "strata/common/serve/option_names.hpp"
 #include "strata/common/serve/paged_engine.hpp"
 #include "strata/common/serve/paged_model.hpp"
+#include "strata/common/state/conversation_block_tables.hpp"
 #include "strata/common/state/restore_points.hpp"
 #include "strata/common/state/state_bytes.hpp"
+#include "strata/models/common/adapt_decay.hpp"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cstdio>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -32,6 +36,7 @@ using strata::serve::print_response;
 namespace strata::ds4 {
 namespace {
 
+using strata::sample::get_row_counter;
 using strata::serve::PagedCard;
 using strata::serve::PagedCards;
 using strata::serve::PagedParts;
@@ -79,13 +84,9 @@ struct Part final : strata::serve::PagedPart {
     std::vector<Part*> peers;                  ///< The lead reconnects every stage when it takes the seat.
     const bool has_drafter;                    ///< Only the last stage keeps DSpark's rings.
     Part*& seated;                             ///< Owns the host side currently in Model, or null.
-    strata::core::PagePool* pool = nullptr;     ///< null before init
-    strata::core::ConversationId cid = 0;
-    /// per region of the layout (empty for a fixed one): the first address of each of its blocks, on the host, and
-    /// the device copy the kernels read; sized once for the whole context, so that KvRows may point at them
-    std::vector<std::vector<uint8_t*>> blocks;
-    std::vector<uint8_t**> tables;
-    std::vector<size_t> zeroed;                 ///< per region: its blocks that are zeroed and in the table
+    /// its place in the card's pool and, per growing region, the table of its blocks' first addresses that KvRows
+    /// point at
+    strata::core::ConversationBlockTables tables;
     ConversationState state;                    ///< On the lead: its host side while not seated (take_seat).
     strata::serve::Sampling smp;                ///< its request's sampling
     /// the prompt's last token when the prompt's read took it along (feed_mark): its position (-1: none), the token
@@ -103,43 +104,24 @@ struct Part final : strata::serve::PagedPart {
     ~Part() override {
         if (seated == this)
             seated = nullptr;
-        const strata::core::OnDevice on(dev);
-        for (uint8_t** t : tables)
-            strata::core::gpu_free(t);
     }
 
-    bool is_ready() const override { return pool != nullptr; }
+    bool is_ready() const override { return tables.is_ready(); }
     bool init(strata::core::PagePool& p, strata::core::ConversationId id, std::string& err) override {
-        if (const std::string why = p.grow_conversation(id, 0); !why.empty()) {
-            err = "the page pool: " + why;
+        if (!tables.attach(p, id, dev, get_table_sizes(p), 0, err))
             return false;
-        }
         p.set_conversation_label(id, "Conversation " + std::to_string(id));
-        pool = &p;
-        cid = id;
-        return alloc_tables(err) && write_tables(err);
+        return point_model_if_seated(tables.grow(0, err));
     }
-    bool reserve(int64_t tokens, std::string& err) override {
-        if (const std::string why = pool->grow_conversation(cid, tokens); !why.empty()) {
-            err = "the conversation's memory is full: " + why;
-            return false;
-        }
-        return write_tables(err);
-    }
-    void truncate(int64_t tokens) override {
-        pool->truncate_conversation(cid, tokens);
-        for (size_t r = 0; r < blocks.size(); ++r)
-            zeroed[r] = std::min(zeroed[r], pool->conversation_blocks(cid, r).size());
-    }
+    bool reserve(int64_t tokens, std::string& err) override { return point_model_if_seated(tables.grow(tokens, err)); }
+    void truncate(int64_t tokens) override { tables.truncate(tokens); }
     void release() override {
         leave_seat();
         state = {};
         primed_pos = -1;
-        pool->remove_conversation(cid);
-        pool = nullptr;
-        std::fill(zeroed.begin(), zeroed.end(), 0);
+        tables.release();
     }
-    bool refresh(std::string& err) override { return write_tables(err, false); }
+    bool refresh(std::string& err) override { return point_model_if_seated(tables.refresh(err)); }
     void clear_state() override {
         if (lead != this)
             return;
@@ -149,23 +131,12 @@ struct Part final : strata::serve::PagedPart {
         pin_next = true;
     }
     void set_layers(int64_t lb, int64_t le) override {
-        const strata::core::OnDevice on(dev);
-        for (uint8_t** table : tables)
-            strata::core::gpu_free(table);
-        tables.clear();
-        blocks.clear();
-        zeroed.clear();
         strata::core::StateLayout layout;
         std::string err;
         describe_conversation(m.geometry(), (int) lb, (int) le, has_drafter, layout, at, err);
     }
-    uint64_t bytes() const override {
-        uint64_t bytes = 0;
-        for (size_t r = 0; is_ready() && r < blocks.size(); ++r)
-            bytes += pool->conversation_blocks(cid, r).size() * pool->block_bytes(r);
-        return bytes;
-    }
-    strata::core::ConversationId id() const override { return cid; }
+    uint64_t bytes() const override { return tables.bytes(); }
+    strata::core::ConversationId id() const override { return tables.id(); }
     int64_t get_pool_tokens(int64_t tokens) const override { return tokens; }
 
     /// Makes the model compute this conversation: the seated one's host side goes back to it, this one's into the
@@ -196,57 +167,27 @@ struct Part final : strata::serve::PagedPart {
     /// Gets the tokens its state holds.
     int64_t get_pos() const { return seated == this ? m.pos() : (int64_t) state.tokens.size(); }
 
-    /// Sizes the host and device tables of the growing regions for a conversation of the whole context.
-    bool alloc_tables(std::string& err) {
-        if (!tables.empty())
-            return true;
-        const strata::core::StateLayout& layout = pool->layout();
-        const strata::core::OnDevice on(dev);
-        blocks.resize(layout.regions.size());
-        tables.assign(layout.regions.size(), nullptr);
-        zeroed.assign(layout.regions.size(), 0);
+    using TableSize = strata::core::ConversationBlockTables::TableSize;
+    /// Gets the size of each region's table for a conversation of the whole context: a block's first row's address
+    /// (as KvRows::blocks holds it) per block of a growing region.
+    std::vector<TableSize> get_table_sizes(const strata::core::PagePool& p) const {
+        const strata::core::StateLayout& layout = p.layout();
+        std::vector<TableSize> sizes(layout.regions.size());
         for (size_t r = 0; r < layout.regions.size(); ++r) {
             const strata::core::StateRegion& region = layout.regions[r];
             if (region.kind == strata::core::RegionKind::fixed)
                 continue;
-            const uint64_t rows = region.units_for(m.max_context()), per_block = get_rows_per_block(r);
-            const size_t most = (size_t) ((rows + per_block - 1) / per_block + 1);
-            blocks[r].reserve(most);
-            tables[r] = (uint8_t**) strata::core::gpu_alloc_zeroed(most * sizeof(uint8_t*));
-            if (tables[r] == nullptr) {
-                for (uint8_t** table : tables)
-                    strata::core::gpu_free(table);
-                tables.clear();
-                err = "no room for the conversation's block tables";
-                return false;
-            }
+            const uint64_t rows = region.units_for(m.max_context()), per_block = p.block_bytes(r) / region.unit_bytes;
+            sizes[r].entries = (int64_t) ((rows + per_block - 1) / per_block + 1);
         }
-        return true;
+        return sizes;
     }
 
-    /// Writes the blocks the pool gives the conversation into the tables, zeroing the new ones first with
-    /// `zero_new` (their pages held other data), and points the model at them when it is seated.
-    bool write_tables(std::string& err, bool zero_new = true) {
-        const strata::core::OnDevice on(dev);
-        const strata::core::StateLayout& layout = pool->layout();
-        for (size_t r = 0; r < layout.regions.size(); ++r) {
-            if (tables[r] == nullptr)
-                continue;
-            const std::vector<strata::core::PageId>& runs = pool->conversation_blocks(cid, r);
-            blocks[r].clear();
-            for (const strata::core::PageId page : runs)
-                blocks[r].push_back(pool->page_address(page));
-            for (size_t i = zeroed[r]; zero_new && i < blocks[r].size(); ++i)
-                if (!strata::core::gpu_memset_async(blocks[r][i], 0, pool->block_bytes(r), nullptr))
-                    return fail("zeroing the conversation's new pages", err);
-            zeroed[r] = blocks[r].size();
-            if (!blocks[r].empty() &&
-                !strata::core::gpu_copy(tables[r], blocks[r].data(), blocks[r].size() * sizeof(uint8_t*)))
-                return fail("writing the conversation's block tables", err);
-        }
-        if (seated == lead)
+    /// Points the model at the conversation's blocks when it is seated, after `ok` (a change of its blocks).
+    bool point_model_if_seated(bool ok) {
+        if (ok && seated == lead)
             point_model();
-        return true;
+        return ok;
     }
 
     /// Points the model at its fixed region and its rows.
@@ -261,7 +202,7 @@ struct Part final : strata::serve::PagedPart {
 
     /// Gets the address of fixed region `r`; null for kNoRegion.
     uint8_t* get_fixed(size_t r) const {
-        return r != kNoRegion ? pool->page_address(pool->conversation_blocks(cid, r).at(0)) : nullptr;
+        return r != kNoRegion ? tables.get_fixed_address(r) : nullptr;
     }
 
     /// Gets how region `r`'s rows lie in its blocks; none for kNoRegion.
@@ -269,16 +210,12 @@ struct Part final : strata::serve::PagedPart {
         KvRows rows;
         if (r == kNoRegion)
             return rows;
-        rows.blocks = tables[r];
-        rows.host_blocks = blocks[r].data();
-        rows.per_block = (uint32_t) get_rows_per_block(r);
-        rows.bytes = (uint32_t) pool->layout().regions[r].unit_bytes;
+        const strata::core::PagePool& p = tables.pool();
+        rows.blocks = (uint8_t* const*) tables.table(r);
+        rows.host_blocks = tables.blocks(r).data();
+        rows.bytes = (uint32_t) p.layout().regions[r].unit_bytes;
+        rows.per_block = (uint32_t) (p.block_bytes(r) / rows.bytes);
         return rows;
-    }
-    uint64_t get_rows_per_block(size_t r) const { return pool->block_bytes(r) / pool->layout().regions[r].unit_bytes; }
-    static bool fail(const char* what, std::string& err) {
-        err = std::string(what) + " failed";
-        return false;
     }
 };
 
@@ -373,7 +310,7 @@ public:
     uint64_t get_host_state_bytes(const PagedParts& parts) const override;
     bool rewind(const PagedParts& parts, int64_t tokens, std::string& err) override;
     void forget_drafts(int) override {}
-    int64_t get_prompt_chunk() const override { return m_.feed_unit(); }
+    int64_t get_prompt_chunk(int64_t, bool) const override { return m_.feed_unit(); }
     int64_t get_prompt_ceiling() const override { return prompt_ceiling_; }
     strata::serve::PromptBuffers get_prompt_buffers(const PagedCard& card, int64_t chunk,
                                                     int64_t tokens) const override {
@@ -387,7 +324,7 @@ public:
         return m_.lay_out_prompt((int) card.index, get_lent_rows(chunk), device, host, err);
     }
     bool read_prompt(const PagedParts& parts, const std::vector<int64_t>& ids, int64_t from, int64_t n, bool drafting,
-                     const ChunkDone& on_chunk, std::string& err) override;
+                     const PromptControl& control, int64_t& took, std::string& err) override;
     bool wait_state(std::string& err) override { return m_.wait_state(err); }
     int get_pipeline_stages() const override {
         // Speculative windows share rollback scratch until the step commits all participants.
@@ -404,7 +341,12 @@ public:
     bool keep_group(int, const std::vector<strata::spec::StepRow>&, const std::vector<int>&,
                     bool, std::string&) override { return true; }
     bool run_rows(const std::vector<strata::spec::StepRow>& rows, std::vector<int32_t>& picks,
-                  std::string& err) override;
+                  std::string& err) override {
+        if (!run_rows_core(rows, picks, err))
+            return false;
+        drop_picks_if_router_bad(picks);
+        return true;
+    }
     bool keep_rows(const std::vector<strata::spec::StepRow>& rows, const std::vector<int>& kept, bool,
                    std::string& err) override;
     int propose(strata::serve::PagedPart& last, int session, int32_t token, int64_t pos, int n, int32_t* out,
@@ -412,6 +354,7 @@ public:
     bool has_batched_drafter() const override { return true; }
     bool propose_batch(std::vector<strata::spec::DraftRequest>& requests, std::string& err) override;
     bool switch_drafter(bool on, std::string& err) override;
+    void set_draft_rule(strata::kernels::DraftRule rule) override { m_.set_draft_rule(rule); }
     void print_info(int slots, int) const override {
         for (const std::string& line : m_.info_lines())
             std::printf("%s\n", line.c_str());
@@ -424,6 +367,7 @@ public:
                     (long long) d.resumed);
     }
     void end_request() override { m_.save_profile(); }
+    void begin_step(int) override { router_bad_.reset(); }
 
 private:
     /// Gets the experts of trunk layers [lb, le) in the order the GPU's pool takes them (get_ranking), the drafter's
@@ -432,9 +376,21 @@ private:
     /// Gets 1 when a proposal can run, 0 when it should be skipped, or -1 on state failure.
     int prepare_draft(Part& part, int session, int64_t pos, int n, std::string& err);
     bool is_drafter_ready() const;
+    /// Runs and samples the rows of one step for run_rows, which then checks the router.
+    bool run_rows_core(const std::vector<strata::spec::StepRow>& rows, std::vector<int32_t>& picks,
+                       std::string& err);
+    /// Ends the step's requests through spec::Step's -1 contract; the device flag cannot identify a row.
+    /// Pipeline finishes run after every stage drains, so one read covers all groups without waiting on live stages.
+    void drop_picks_if_router_bad(std::vector<int32_t>& picks) {
+        // TODO: Latch a yielded prompt's failure on its conversation before another decode clears the device flag.
+        if (!router_bad_.has_value())
+            router_bad_ = m_.router_nonfinite();
+        if (*router_bad_)
+            std::fill(picks.begin(), picks.end(), -1);
+    }
     bool go_to(int64_t pos, std::string& err);
     void end_prompt(Part& p);
-    int32_t sample(const Part& p);
+    int32_t sample(const Part& p, int64_t pos);
     /// Notes the LP line of `pick`, the token after `row`, from the head's logit row `logit_row`
     /// (Model::copy_logits_row; note_logprobs).
     void note_row_logprobs(const strata::spec::StepRow& row, int32_t pick, int logit_row) {
@@ -468,7 +424,6 @@ private:
     std::vector<PagedCard*> cards_;           ///< Stages in execution order.
     PagedCard* drafter_card_ = nullptr; ///< The last stage, which owns DSpark and its experts.
     Part* seated_ = nullptr;           ///< the conversation the model computes (Part::take_seat), or null
-    uint64_t counter_ = 0;             ///< the sampler's draw count, which the old engine keeps across requests
     uint64_t drafter_epoch_ = 0; ///< Increases when DSpark dense weights return.
     /// The largest chunk a prompt is read in: the load's (--prefill-chunk, else the old engine's rule; 0: windows).
     int64_t prompt_ceiling_ = 0;
@@ -479,6 +434,8 @@ private:
     struct JointWindow { int session, first, count; };
     std::vector<JointWindow> joint_windows_;
     int verified_ = 0; ///< Counts sampled rows in a standalone verify window; joint_windows_ tracks joint passes.
+    /// Caches the take-and-clear device result for all groups; begin_step resets it during group preparation.
+    std::optional<bool> router_bad_;
 };
 
 /// Gets the Part a PagedPart of this model is.
@@ -555,27 +512,14 @@ int run_paged_engine(int argc, char** argv) {
                                   std::vector<int64_t>& chosen, std::string& why) {
             chosen = cuts;
             if (x.layer_split == "auto") {
-                const uint64_t page = strata::core::choose_expert_page_bytes(blobs);
-                const auto sizes = get_split_sizes(g, blobs, page);
-                std::vector<uint64_t> pools;
-                for (size_t i = 0; i < stage_devices.size(); ++i) {
-                    const auto copies = std::count(stage_devices.begin(), stage_devices.end(), stage_devices[i]);
-                    const int64_t mib = settings.gpu_mib.empty() ? -1 :
-                        settings.gpu_mib[std::min(i, settings.gpu_mib.size() - 1)];
-                    pools.push_back(mib < 0 ?
-                        strata::serve::get_gpu_room(stage_devices[i], settings.get_vram_reserve_bytes()) / copies :
-                        (uint64_t) mib << 20);
-                }
-                auto problem = strata::core::make_paged_split_problem(sizes, pools, 1, settings.tokens_min);
-                for (size_t i = 0; i < stage_devices.size(); ++i)
-                    problem.cards[i].layer_ms = strata::program::split_rules::get_layer_ms(
-                        strata::core::get_card_speed(stage_devices[i]));
+                std::vector<int32_t> ranked_layers;
                 const int64_t n = x.gpu_experts < 0 ? (int64_t) g.nl * g.n_exp : x.gpu_experts;
                 for (int64_t i = 0; i < n; ++i)
-                    problem.ranked_layers.push_back((int32_t) (i % g.nl));
-                const auto plan = strata::core::plan_layer_split(problem, "strata-ds41: layer split auto: ");
-                strata::core::print_layer_split(plan, problem.ranked_layers.size(), "strata-ds41: layer split auto: ");
-                chosen = plan.cuts;
+                    ranked_layers.push_back((int32_t) (i % g.nl));
+                chosen = strata::serve::plan_start_split(
+                    stage_devices, settings, settings.get_vram_reserve_bytes(),
+                    get_split_sizes(g, blobs, strata::core::choose_expert_page_bytes(blobs)), std::move(ranked_layers),
+                    kProgram);
             }
             int64_t previous = 0;
             for (int64_t cut : chosen) {
@@ -634,19 +578,10 @@ int run_paged_engine(int argc, char** argv) {
         std::fprintf(stderr, "%s: %s\n", kProgram.c_str(), err.c_str());
         return 1;
     }
-    for (size_t i = 0; i < devices.size(); ++i) {
-        PagedCard& card = cards.emplace_back();
-        card.index = i;
-        card.dev = devices[i];
-        card.lb = i == 0 ? 0 : cuts[i - 1];
-        card.le = i == cuts.size() ? g.nl : cuts[i];
-        card.weights_lb = !x.trim_stage_weights ? 0 : card.lb;
-        card.weights_le = !x.trim_stage_weights ? g.nl : card.le;
-        card.id = "gpu" + std::to_string(card.dev);
-        if (std::find(devices.begin(), devices.begin() + i, card.dev) != devices.begin() + i)
-            card.id += "." + std::to_string(i);
-        strata::serve::measure_card(card, kProgram, *std::max_element(blobs.begin(), blobs.end()));
-    }
+    for (size_t i = 0; i < devices.size(); ++i)
+        strata::serve::add_paged_card(cards, devices[i], i == 0 ? 0 : cuts[i - 1], i == cuts.size() ? g.nl : cuts[i],
+                                      g.nl, x.trim_stage_weights, kProgram,
+                                      *std::max_element(blobs.begin(), blobs.end()));
     if (has_drafter && !settings.drafter && !m.switch_drafter_weights(false, err)) {
         std::fprintf(stderr, "%s: %s\n", kProgram.c_str(), err.c_str());
         return 1;
@@ -891,12 +826,19 @@ strata::core::LayerSizes PagedDeepSeek::get_layer_sizes(uint64_t page) const {
 }
 
 bool PagedDeepSeek::read_prompt(const PagedParts& parts, const std::vector<int64_t>& ids, int64_t from, int64_t n,
-                                bool, const ChunkDone& on_chunk, std::string& err) {
-    /// Keeps another conversation's decode positions from selecting this prompt's image rows.
-    struct ClearPromptImages {
+                                bool, const PromptControl& control, int64_t& took, std::string& err) {
+    took = 0;
+    /// Keeps another conversation's decode positions from selecting this prompt's image rows, and the model from
+    /// calling `control` after the read.
+    struct EndPromptRead {
         Model& model;
-        ~ClearPromptImages() { model.set_images({}); }
-    } clear{m_};
+        ~EndPromptRead() {
+            model.set_images({});
+            model.set_progress(nullptr);
+            model.set_cancel(nullptr);
+            model.set_yield(nullptr);
+        }
+    } end_read{m_};
     m_.set_images(pending_images_);
     Part& p = get_part(*parts[0]);
     p.take_seat();
@@ -912,18 +854,38 @@ bool PagedDeepSeek::read_prompt(const PagedParts& parts, const std::vector<int64
             if (!part->reserve(end + 1, err))
                 return false;
     const std::vector<int> tokens(ids.begin() + from, ids.begin() + end + (last ? 1 : 0));
-    if (!(last ? m_.feed_mark(tokens.data(), (int) tokens.size(), 1, kBeforeLastCheck, err)
-               : m_.feed(tokens.data(), (int) tokens.size(), 0, err)))
+    bool moved = false;   // (a yield before the run's first chunk would read nothing)
+    m_.set_progress([&](int64_t done) {
+        moved = true;
+        control.progress(from + std::min(done, n));
+    });
+    m_.set_cancel(control.should_stop);
+    if (control.should_yield)
+        m_.set_yield([&] { return moved && control.should_yield(); });
+    bool ok = last ? m_.feed_mark(tokens.data(), (int) tokens.size(), 1, kBeforeLastCheck, err)
+                   : m_.feed(tokens.data(), (int) tokens.size(), 0, err);
+    took = std::min<int64_t>(m_.fed(), n);
+    // A yield can leave only the final token, outside the engine's prompt spans. Keep its checkpoint here.
+    if (ok && last && m_.fed() == n)
+        ok = m_.feed_mark(tokens.data() + n, 1, 1, kBeforeLastCheck, err);
+    else if (ok && m_.fed() < (int) tokens.size())
+        return control.on_chunk(from, took, err);
+    if (!ok) {
+        if (m_.cancelled()) {   // Model::set_cancel leaves partially computed layers past the restore point.
+            err = "cancelled";
+            took = -1;
+        }
         return false;
+    }
 
     if (last) {
         end_prompt(p);
         p.primed_pos = end;
         p.primed_token = tokens.back();
-        p.primed_pick = sample(p);
+        p.primed_pick = sample(p, end);
         note_row_logprobs({(int) p.id() - 1, p.primed_token, end}, p.primed_pick, -1);
     }
-    return on_chunk(from, n, err);
+    return control.on_chunk(from, n, err);
 }
 
 bool PagedDeepSeek::prepare_group(int group, const std::vector<strata::spec::StepRow>& rows, std::string& err) {
@@ -954,11 +916,12 @@ bool PagedDeepSeek::finish_group(int group, std::vector<int32_t>& picks, std::st
         return false;
     sample_pending_rows(g);
     picks = g.picks;
+    drop_picks_if_router_bad(picks);
     return true;
 }
 
-bool PagedDeepSeek::run_rows(const std::vector<strata::spec::StepRow>& rows, std::vector<int32_t>& picks,
-                             std::string& err) {
+bool PagedDeepSeek::run_rows_core(const std::vector<strata::spec::StepRow>& rows, std::vector<int32_t>& picks,
+                                 std::string& err) {
     joint_windows_.clear();
     if (rows.front().session != rows.back().session) {
         verified_ = 0;
@@ -968,16 +931,12 @@ bool PagedDeepSeek::run_rows(const std::vector<strata::spec::StepRow>& rows, std
             return false;
         picks = g.picks;
         const auto& pending = g.pending;
-        for (size_t first = 0; first < pending.size();) {
-            size_t end = first + 1;
-            const int session = rows[pending[first]].session;
-            while (end < pending.size() && rows[pending[end]].session == session)
-                ++end;
+        strata::spec::for_each_window(pending.size(), [&](size_t i) { return rows[pending[i]].session; },
+                                      [&](size_t first, size_t end) {
             const int count = (int) (end - first);
-            joint_windows_.push_back({session, (int) first, count});
+            joint_windows_.push_back({rows[pending[first]].session, (int) first, count});
             counts.push_back(count);
-            first = end;
-        }
+        });
         if (!pending.empty() && !m_.step_conversations(tokens, [&](int r) {
                 leads_[(size_t) rows[pending[(size_t) r]].session]->take_seat();
             }, [&](int r) {
@@ -991,18 +950,18 @@ bool PagedDeepSeek::run_rows(const std::vector<strata::spec::StepRow>& rows, std
             if (p.prompt_open)
                 end_prompt(p);
             const auto& s = p.smp;
+            const uint64_t counter = get_row_counter(rows[pending[(size_t) window.first]].pos);
             if (window.count == 1) {
                 picks[pending[(size_t) window.first]] = m_.sample_row(window.first, s.temperature, s.top_p,
-                    s.top_k, s.min_p, s.seed, counter_++);
+                    s.top_k, s.min_p, s.seed, counter);
                 continue;
             }
             std::vector<int> drafts, got;
             for (int i = 1; i < window.count; ++i)
                 drafts.push_back(tokens[(size_t) window.first + i]);
             if (!m_.pick_joint_rows(window.session, window.first, drafts, s.temperature, s.top_p, s.top_k,
-                                    s.min_p, s.seed, counter_, got, err))
+                                    s.min_p, s.seed, counter, got, err))
                 return false;
-            counter_ += got.size();
             for (size_t i = 0; i < got.size(); ++i)
                 picks[pending[(size_t) window.first + i]] = got[i];
         }
@@ -1020,7 +979,7 @@ bool PagedDeepSeek::run_rows(const std::vector<strata::spec::StepRow>& rows, std
         p.take_seat();
         const strata::serve::Sampling& s = p.smp;
         if (!go_to(row.pos, err) || !m_.verify_rows(row.token, drafts, s.temperature, s.top_p, s.top_k, s.min_p,
-                                                    s.seed, counter_, got, err))
+                                                    s.seed, get_row_counter(row.pos), got, err))
             return false;
         std::copy(got.begin(), got.end(), picks.begin());
         verified_ = (int) got.size();
@@ -1046,7 +1005,7 @@ bool PagedDeepSeek::run_rows(const std::vector<strata::spec::StepRow>& rows, std
         return false;
     if (closes)
         end_prompt(p);
-    picks[0] = sample(p);
+    picks[0] = sample(p, row.pos);
     note_row_logprobs(row, picks[0], -1);
     return true;
 }
@@ -1057,30 +1016,26 @@ bool PagedDeepSeek::prepare_inputs(GroupRows& g, const std::vector<strata::spec:
     g.rows = rows;
     g.pending.clear();
     g.picks.assign(rows.size(), -1);
-    for (size_t r = 0; r < rows.size();) {
-        size_t end = r + 1;
-        while (end < rows.size() && rows[end].session == rows[r].session)
-            ++end;
-        Part& p = *leads_[(size_t) rows[r].session];
-        const bool primed = end == r + 1 && p.primed_pos == rows[r].pos &&
-                            p.primed_token == rows[r].token && p.get_pos() == rows[r].pos + 1;
+    return strata::spec::for_each_window(rows, [&](size_t first, size_t end) {
+        Part& p = *leads_[(size_t) rows[first].session];
+        const bool primed = end == first + 1 && p.primed_pos == rows[first].pos &&
+                            p.primed_token == rows[first].token && p.get_pos() == rows[first].pos + 1;
         p.primed_pos = -1;
         if (primed) {
-            g.picks[r] = p.primed_pick;
-            r = end;
-            continue;
+            g.picks[first] = p.primed_pick;
+            return true;
         }
         p.take_seat();
-        if (!go_to(rows[r].pos, err))
+        if (!go_to(rows[first].pos, err))
             return false;
         if (p.prompt_open)
             m_.checkpoint(kBeforeLastCheck);
-        for (; r < end; ++r) {
+        for (size_t r = first; r < end; ++r) {
             g.pending.push_back(r);
             tokens.push_back(rows[r].token);
         }
-    }
-    return true;
+        return true;
+    });
 }
 
 /// Samples in row order after every stage has finished writing retained logits.
@@ -1091,33 +1046,28 @@ void PagedDeepSeek::sample_pending_rows(GroupRows& g) {
         if (p.prompt_open)
             end_prompt(p);
         const auto& s = p.smp;
-        g.picks[g.pending[r]] = m_.sample_row((int) r, s.temperature, s.top_p, s.top_k, s.min_p, s.seed, counter_++);
+        g.picks[g.pending[r]] = m_.sample_row((int) r, s.temperature, s.top_p, s.top_k, s.min_p, s.seed,
+                                              get_row_counter(g.rows[g.pending[r]].pos));
         note_row_logprobs(g.rows[g.pending[r]], g.picks[g.pending[r]], (int) r);
     }
 }
 
-// A verify window keeps the rows the step accepted; the sampler's draw count moves past every row with a pick, as the
-// old engine's does.
+// A verify window keeps the rows the step accepted.
 bool PagedDeepSeek::keep_rows(const std::vector<strata::spec::StepRow>& rows, const std::vector<int>& kept, bool,
                               std::string& err) {
     if (!joint_windows_.empty()) {
-        size_t row = 0, group = 0;
-        for (const JointWindow& window : joint_windows_) {
-            while (rows[row].session != window.session) {
-                const int session = rows[row].session;
-                while (row < rows.size() && rows[row].session == session)
-                    ++row;
-                ++group;
-            }
+        size_t joint = 0, group = 0;
+        return strata::spec::for_each_window(rows, [&](size_t first, size_t) {
+            const int k = kept[group++];
+            if (joint == joint_windows_.size() || joint_windows_[joint].session != rows[first].session)
+                return true;
+            const JointWindow& window = joint_windows_[joint++];
             leads_[(size_t) window.session]->take_seat();
-            if (!m_.keep_joint_rows(window.first, window.count, kept[group], err))
-                return false;
-        }
-        return true;
+            return m_.keep_joint_rows(window.first, window.count, k, err);
+        });
     }
     if (verified_ == 0)
         return true;
-    counter_ += (uint64_t) verified_;
     return m_.keep_verified(kept[0], err);
 }
 
@@ -1131,7 +1081,7 @@ int PagedDeepSeek::propose(strata::serve::PagedPart& last, int session, int32_t 
     std::vector<int> drafts;
     std::vector<float> conf;
     const strata::serve::Sampling& s = p.smp;
-    if (!m_.draft(token, drafts, conf, err, s.temperature, s.top_p, s.top_k, s.min_p, s.seed, counter_))
+    if (!m_.draft(token, drafts, conf, err, s.temperature, s.top_p, s.top_k, s.min_p, s.seed, get_row_counter(pos)))
         return -1;
     const int keep = std::min({n, (int) drafts.size(), (int) conf.size()});
     if (!m_.save_joint_draft(session, keep, err))
@@ -1157,7 +1107,7 @@ bool PagedDeepSeek::propose_batch(std::vector<strata::spec::DraftRequest>& reque
             continue;
         const auto& sampling = p.smp;
         batch.push_back({r.session, r.token, r.limit, r.pos, sampling.temperature, sampling.top_p,
-                         sampling.min_p, sampling.top_k, sampling.seed, counter_, {}, {}});
+                         sampling.min_p, sampling.top_k, sampling.seed, get_row_counter(r.pos), {}, {}});
         pending.push_back(i);
     }
     if (!m_.draft_conversations(batch, [&](int i) {
@@ -1241,10 +1191,10 @@ void PagedDeepSeek::end_prompt(Part& p) {
     p.pin_next = p.prompt_open = false;
 }
 
-/// Gets the token after the model's last logits by `p`'s request's sampling.
-int32_t PagedDeepSeek::sample(const Part& p) {
+/// Draws the token after the model's last logits, which read the token at `pos`, by `p`'s request's sampling.
+int32_t PagedDeepSeek::sample(const Part& p, int64_t pos) {
     const strata::serve::Sampling& s = p.smp;
-    return m_.sample(s.temperature, s.top_p, s.top_k, s.min_p, s.seed, counter_++);
+    return m_.sample(s.temperature, s.top_p, s.top_k, s.min_p, s.seed, get_row_counter(pos));
 }
 
 /// Makes the model's state the seated conversation's at `pos` tokens: it is there, or one past it when the prompt's
@@ -1260,11 +1210,11 @@ bool PagedDeepSeek::go_to(int64_t pos, std::string& err) {
     return false;
 }
 
-/// Reads the model's own options, strata-ds41's (`x`) and --eos from `argv` (the paged engine's are gone) into `o`, `x`
-/// and `eos`.  -1: go on, else the exit status.
+/// Reads the model's own options, strata-ds41's (`x`) and --eos-ids from `argv` (the paged engine's are gone) into `o`,
+/// `x` and `eos`.  -1: go on, else the exit status.
 int read_model_options(int argc, char** argv, Options& o, ProgramOptions& x, std::string& eos) {
     for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
+        const std::string a = strata::serve::get_primary_option(argv[i]);
         const auto val = [&](const char* what) -> std::string {
             if (i + 1 >= argc) {
                 std::fprintf(stderr, "%s: %s needs a value\n", kProgram.c_str(), what);
@@ -1274,8 +1224,8 @@ int read_model_options(int argc, char** argv, Options& o, ProgramOptions& x, std
         };
         if (read_option(a, val, o, x.drafting))
             continue;
-        if (a == "--eos")
-            eos = val("--eos");
+        if (a == "--eos-ids")
+            eos = val("--eos-ids");
         else if (a == "--batch")
             x.batch = std::max(0, std::atoi(val("--batch").c_str()));
         else if (a == "--expert-cache") {
@@ -1288,7 +1238,7 @@ int read_model_options(int argc, char** argv, Options& o, ProgramOptions& x, std
         else if (a == "--adapt-min-gain")
             x.adapt_min_gain = (float) std::atof(val("--adapt-min-gain").c_str());
         else if (a == "--adapt-decay")
-            x.adapt_decay = (float) std::atof(val("--adapt-decay").c_str());
+            x.adapt_decay = strata::program::adapt_decay_checked(std::atof(val("--adapt-decay").c_str()));
         else if (a == "--layer-split")
             x.layer_split = val("--layer-split");
         else if (a == "--split-device")
@@ -1348,31 +1298,22 @@ bool open_card_pool(const Model& m, const PagedSettings& s, const strata::core::
                     std::string& err) {
     const uint64_t keep = s.get_vram_reserve_bytes();
     const std::vector<uint64_t> blobs = m.get_expert_bytes();
-    const uint64_t page =
-        strata::core::choose_expert_page_bytes({blobs.begin(), blobs.begin() + m.geometry().nl});
     if (max_experts < 0)
         max_experts = (int64_t) ranking.size();
-    uint64_t most = strata::serve::get_conversation_bytes(layout, m.max_context(), page), room = 0;
-    for (size_t i = 0; i < ranking.size() && (int64_t) i < max_experts; ++i)
-        most += (blobs[(size_t) ranking[i].layer] + page - 1) / page * page;
-    const int64_t mib = s.gpu_mib.empty() ? -1 : s.gpu_mib[std::min(card.index, s.gpu_mib.size() - 1)];
-    const uint64_t bytes = strata::serve::get_gpu_pool_bytes(card.dev, keep, mib, most, room);
-    strata::core::PagePoolConfig config;
-    config.page_bytes = page;
-    config.chunk_bytes = strata::serve::get_chunk_bytes(bytes, page);
-    config.tokens_min = std::clamp<int64_t>(s.tokens_min, 0, m.max_context());
-    config.label = "Expert and conversation pool";
-    config.label_expert = [layers = m.geometry().nl](strata::core::ExpertKey key, uint64_t bytes) {
+    strata::serve::CardPoolPlan plan = strata::serve::plan_card_pool(
+        card, s, layout, m.max_context(),
+        strata::core::choose_expert_page_bytes({blobs.begin(), blobs.begin() + m.geometry().nl}), blobs, ranking,
+        max_experts, keep);
+    plan.config.label_expert = [layers = m.geometry().nl](strata::core::ExpertKey key, uint64_t bytes) {
         return strata::core::MemoryLabel{"experts", "", (key.layer >= layers ? "Drafter / " : "") +
             strata::core::get_expert_memory_label(key.layer, bytes)};
     };
     const strata::core::OnDevice on(card.dev);
-    if (!card.experts.open(strata::serve::get_gpu_chunk_memory(card.dev, config.chunk_bytes), bytes, layout, config,
-                           blobs,
-                           m.geometry().n_exp, max_experts, ranking, {false, keep}, err))
+    if (!card.experts.open(strata::serve::get_gpu_chunk_memory(card.dev, plan.config.chunk_bytes), plan.bytes,
+                           layout, plan.config, blobs, m.geometry().n_exp, max_experts, ranking, {false, keep}, err))
         return false;
     card.experts.set_ranking(ranking, max_experts);   // (opened without a cache, it wants none of them until then)
-    strata::serve::say_gpu_pool(kProgram, card, room, config.chunk_bytes, mib);
+    strata::serve::say_gpu_pool(kProgram, card, plan);
     return true;
 }
 

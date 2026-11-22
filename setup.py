@@ -1469,10 +1469,8 @@ def model_shards(fam: dict, model: str) -> int:
 
 
 def budget_model(cfg: dict) -> str:
-    """The Unsloth model a config with a RAM budget runs, from its --native shard's name (UD-Q4_K_XL by default)."""
-    a = cfg.get("args", [])
-    native = Path(a[a.index("--native") + 1]).name.upper() if "--native" in a and a.index("--native") + 1 < len(a) \
-        else ""
+    """The Unsloth model a config with a RAM budget runs, from its model shard's name (UD-Q4_K_XL by default)."""
+    native = Path(user_args.find_model_file(cfg.get("args")) or "").name.upper()
     mine = [m for m, d in MODELS.items() if d.get("budget") and f"-{model_quant(m).upper()}-" in native]
     if len(mine) > 1:                                  # the pinned UD-IQ4_XS (three shards) and the v3.1 one (four): the shard count in the name tells them apart
         count = re.search(r"-OF-(\d{5})\.GGUF$", native)
@@ -6852,10 +6850,10 @@ def _start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open
     if browser:
         cmd.append("--open")
     gb = 0.0
-    if "--native" in cfg["args"]:
+    if model := user_args.find_model_file(cfg["args"]):
         try:
-            gb = Path(cfg["args"][cfg["args"].index("--native") + 1]).stat().st_size / 1e9
-        except (OSError, IndexError):
+            gb = Path(model).stat().st_size / 1e9
+        except OSError:
             pass
     say()
     say("  " + "-" * 100)

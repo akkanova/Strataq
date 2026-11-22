@@ -36,6 +36,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import setup as S  # noqa: E402
 from strata_common import intel_spec, vram_fit  # noqa: E402
+from strata_common.user_args import MODEL_FLAGS, find_model_file, flat, groups  # noqa: E402
 
 SYCL_WRAPPER = ROOT / "sycl" / "serve" / "strata-sycl.sh"
 SYCL_IMAGE = "strata-sycl-dev"
@@ -267,7 +268,7 @@ def recommended_prefill(vram_gb: float, ctx: int, driver: str = "xe", devid: str
 
 def _model_title(model: str, args: list) -> str:
     """The plain name for the fit line: Gyro-M / Gyro-S from the catalog name or the GGUF's file name, else the catalog name."""
-    low = (model + " " + (flag(args, "--native") or "")).lower()
+    low = (model + " " + (find_model_file(args) or "")).lower()
     for key, title in (("gyro-m", "Gyro-M"), ("gyro-s", "Gyro-S")):
         if key in low:
             return title
@@ -295,7 +296,7 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
     chunks so DG2's >3 GiB single pinned-host allocation limit is not hit, and the build passes
     -ze-opt-greater-than-4GB-buffer-required so the prompt path is correct past the cache's 4 GiB (docs/INTEL.md,
     "Kernels misread memory more than 4 GiB into an allocation")."""
-    args = list(cfg["args"])
+    args = flat(groups(cfg["args"]))
     for f in ("--resident-experts", "--mmap-experts"):  # setup's low-RAM mode is the CUDA engine's
         drop(args, f)
     drop(args, "--kv-resident", True)                   # decided below on the real RAM
@@ -309,7 +310,7 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
         i = args.index("--expert-profile") + 1
         if args[i].replace("\\", "/").rsplit("/", 1)[-1] == "expert-profile.bin":
             args[i] = args[i][:-len("expert-profile.bin")] + SYCL_PROFILE
-    for f in ("--pack", "--native", "--ple-gguf", "--expert-profile", "--mtp", "--control-vector-scaled"):
+    for f in ("--pack", *MODEL_FLAGS, "--ple-gguf", "--expert-profile", "--mtp", "--control-vector-scaled"):
         if f in args:
             v = args[args.index(f) + 1]
             path, _, scale = v.rpartition(":") if f == "--control-vector-scaled" else (v, "", "")
@@ -323,7 +324,7 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
     new_prefill = None
     if fit and vram_gb:
         pf = flag(args, "--prefill")
-        fr = vram_fit.plan(model or (flag(args, "--native") or ""), vram_gb, ctx, kv, int(reserve), pf or "auto", "intel",
+        fr = vram_fit.plan(model or find_model_file(args) or "", vram_gb, ctx, kv, int(reserve), pf or "auto", "intel",
                            title=_model_title(model, args), ctx_fixed=ctx_asked,
                            reserve_fixed=bool(asked_reserve) and not auto_reserve,
                            prefill_fixed=pf not in (None, "auto"))
@@ -347,7 +348,7 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
         # the card does not hold; the n-gram table is kept in RAM (setup's rotational-disk rule) and no mirror is built.
         # Gyro: its n-gram table is half of the 58-92 GB file and stays on the SSD (read row by row); the RAM holds the
         # experts' arena (24 GB for Gyro-S) and the CPU's work, so a table in RAM would not fit beside them on a 64 GB PC
-        gyro = "gyro" in (flag(args, "--native") or "").lower()
+        gyro = "gyro" in (find_model_file(args) or "").lower()
         if "--ple-io" not in args and not gyro:
             args += ["--ple-io", "ram"]
         args += ["--vram-reserve-mib", reserve]

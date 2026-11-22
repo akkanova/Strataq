@@ -221,6 +221,9 @@ public:
     /// Gets the first page of each block of one region of a conversation, in order; a block is block_bytes(region)
     /// of consecutive pages.
     const std::vector<PageId>& conversation_blocks(ConversationId id, size_t region) const;
+    /// Gets how many blocks region `region` of a conversation of `tokens` tokens takes: a fixed region one (none when
+    /// it is empty).
+    uint64_t region_blocks(size_t region, int64_t tokens) const;
 
     /// Gets the first of an expert's `pages` consecutive pages: the ones it has, the free run nearest its size's home
     /// point (open to experts, and above the token minimum's reserve; in the reserve's pages only past the reserve's
@@ -311,7 +314,6 @@ private:
     PoolResize shrink(size_t chunks);
     std::string check_limits(uint64_t pages, int64_t min, int64_t max) const;
     std::string check_growth(const Conversation& c, int64_t tokens) const;
-    uint64_t region_blocks(size_t region, int64_t tokens) const;
     PageId get_minimum_pages() const;
     uint64_t reserved_pages() const;
     void open_due();

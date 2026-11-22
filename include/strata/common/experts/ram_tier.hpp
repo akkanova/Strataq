@@ -68,6 +68,12 @@ bool wait_for_ram(uint64_t need, double max_wait_s, double step_s, double note_s
 /// Pass UINT64_MAX for commit when the platform does not report it.
 uint64_t clamp_resident_budget(uint64_t requested, uint64_t physical, uint64_t commit, uint64_t headroom);
 
+/// Gets the memory an integrated GPU (one memory shared with the CPU) may count on: `gpu_free`, the GPU runtime's
+/// figure, or more when `host_available` less a headroom kept for the OS and other programs is larger.  The headroom
+/// is STRATA_UMA_HEADROOM_GIB, a whole number of GiB from 0 to 1024 (default 6; an invalid value is reported once and
+/// ignored).  Used by core::device_free_bytes and the DeepSeek engine's uma_free.
+size_t get_uma_free_bytes(size_t gpu_free, uint64_t host_available);
+
 /// #1250: one cudaHostAlloc of the whole page-locked complement has no way back when the kernel does not give the
 /// pages as fast as the driver takes them (the process is OOM-killed, even with MemAvailable high: clean file cache
 /// that cannot be reclaimed at that moment).  `free_now` is MemFree (pages that are really free), `bytes` the

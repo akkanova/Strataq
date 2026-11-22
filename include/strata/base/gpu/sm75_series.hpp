@@ -16,6 +16,7 @@
 #pragma once
 
 #include "strata/base/gpu/emulate.hpp"
+#include "strata/base/platform/env.hpp"
 
 #include <cstdlib>
 
@@ -23,10 +24,7 @@ namespace strata {
 
 /// STRATA_SM75_PERF=1 (read once)
 inline bool sm75_series() {
-    static const bool on = [] {
-        const char* e = std::getenv("STRATA_SM75_PERF");
-        return e != nullptr && std::atoi(e) != 0;
-    }();
+    static const bool on = strata::platform::env_tri("STRATA_SM75_PERF") == 1;
     return on;
 }
 

@@ -28,7 +28,7 @@ bool read_option(const std::string& a, const std::function<std::string(const cha
     else if (a == "--gpus") {
         for (int g : parse_ids(val("--gpus"))) o.gpus.push_back(g);
     } else if (a == "--max-context") o.max_context = std::atoll(val("--max-context").c_str());
-    else if (a == "--reserve-mib") o.reserve_mib = std::atoll(val("--reserve-mib").c_str());
+    else if (a == "--vram-reserve-mib") o.reserve_mib = std::atoll(val("--vram-reserve-mib").c_str());
     else if (a == "--vram-experts") {
         o.vram_experts = std::atof(val("--vram-experts").c_str());
         o.vram_experts_auto = false;

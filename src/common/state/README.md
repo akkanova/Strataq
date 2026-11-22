@@ -94,6 +94,10 @@ GPU runtime and its test (`page_pool_test.cpp`) runs on host memory.
 
 The pool is not thread-safe: the engine's step loop is its only caller.
 
+`ConversationBlockTables` keeps one conversation's place in a pool and, per growing region, the device table through
+which the kernels find its blocks (DeepSeek V4.1: an entry per block; Qwen3.8: per K/V unit). A grow zeroes the new
+blocks and uploads only their entries. Its test needs a GPU.
+
 `pool_copy` (step M5) pauses and resumes a conversation: its blocks copied from one pool to another of the same layout
 and page size (a GPU's and the RAM's), or to a file on the SSD and back. A place with fewer blocks (the conversation's
 tokens without the cells its guesses had) takes the first ones. A file's name carries its engine's process id, so

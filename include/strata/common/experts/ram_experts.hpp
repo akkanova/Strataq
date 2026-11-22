@@ -48,7 +48,8 @@ public:
     /// Gives `use` the bytes of `n` experts for GPU loading, keys[i] being bytes[i] long. Held experts use the
     /// pool's pages; others use one batch of SSD reads, including layers past the pool's (DeepSeek's drafter).
     /// Keeps the pages and staging buffer stable until `use` returns; `use` must not call this pool again or keep
-    /// the pointers. Returns false on allocation, read or consumer failure.
+    /// the pointers. Counts each expert as a hit or a miss, as blob does. Returns false on allocation, read or
+    /// consumer failure.
     bool use_blobs(const ExpertKey* keys, const uint64_t* bytes, size_t n,
                    const std::function<bool(const uint8_t* const*)>& use);
     /// Takes or gives back chunks so that the pool and the staging ring hold `bytes` (ExpertPages::resize).

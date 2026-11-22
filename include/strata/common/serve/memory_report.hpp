@@ -12,6 +12,8 @@
 //     [CONVERSATION <id> <place> <state> <tokens> <capacity> <bytes> <used>]     with per_conversation: one per
 //                                                                                conversation (LIST_CONVERSATIONS')
 //     [EXPERT_FILL loaded=<0|1> pending=<n>]                                     paged engines: experts' fill
+//     [EXPERT_TRAFFIC <memory-id> hits=<n> misses=<n> loads=<n> evictions=<n> swaps=<n>
+//                     [ssd_reads=<n> ssd_bytes=<B> ssd_wait_us=<us>]]            paged engines: per expert pool
 //     SETTINGS [context=<tokens>] [concurrent=<n>] [rows=<n>] [lookahead=<n>] [tokens_min=<tokens>]
 //     [SHORTFALL <text>]                                                         CHANGE_SETTINGS' answer only
 //     END_MEMORY
@@ -44,8 +46,13 @@
 // a step, the conversation tokens kept free of experts, and what else the engine can change.  EXPERT_FILL (the paged
 // engines, which fill their expert pools after READY): loaded=1 when no pool can take more experts now, which an
 // eviction or a grown pool turns back to 0; pending: the experts the pools should hold and do not, counting those that
-// wait for pages conversations hold.  A value the engine does not know is left out, not guessed.  The command changes
-// nothing.
+// wait for pages conversations hold.  EXPERT_TRAFFIC (the paged engines): counts since the engine started for
+// the expert pool in memory <memory-id> (ExpertTraffic): its hits and misses (uses of experts it held and did not;
+// a GPU's are decode routings, each expert once per step; misses include CPU computation and PCIe reads),
+// loads (experts copied in), evictions,
+// swaps (an expert taking a colder one's pages), and, for a pool that reads the SSD, its batches of reads, their bytes
+// and the microseconds spent waiting for them.  A value the engine does not know is left out, not guessed.  The
+// command changes nothing.
 //
 //   CHANGE_SETTINGS <name>=<value> [...]      -> the GET_MEMORY_USE answer once changed, or ERR <why>, changing
 //                                                nothing of the line
@@ -92,6 +99,8 @@ struct Memory {
     uint64_t kept_free = 0;          ///< the bytes the pools leave unallocated on the GPU for other programs
     /// Bytes below the measured dedicated-memory limit minus all programs' use; absent until that limit is found.
     std::optional<uint64_t> dedicated_room;
+    /// The expert pool's counters here (ExpertTraffic::get_counts), for an EXPERT_TRAFFIC line; empty: no line.
+    std::vector<std::pair<std::string, uint64_t>> traffic;
 
     /// Adds `bytes` to use `use`; a zero adds nothing.
     void add(const std::string& use, uint64_t bytes) {
@@ -239,6 +248,14 @@ inline std::string format_memory_report(MemoryReport report, const std::vector<c
     if (report.experts_loaded)
         s += std::string("EXPERT_FILL loaded=") + (*report.experts_loaded ? "1" : "0") +
              " pending=" + std::to_string(report.experts_pending) + "\n";
+    for (const Memory& m : report.memories) {
+        if (m.traffic.empty())
+            continue;
+        s += "EXPERT_TRAFFIC " + m.id;
+        for (const auto& [key, v] : m.traffic)
+            put(key, v);
+        s += '\n';
+    }
     s += "SETTINGS";
     for (const auto& [key, v] : report.settings)
         s += " " + key + "=" + std::to_string(v);

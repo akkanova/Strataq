@@ -9,22 +9,16 @@
 // Pure (no GPU, no environment read): generate.cpp passes in what it knows.
 #pragma once
 
-#include <cstdlib>
-
 namespace strata::program::draft_kv {
-
-/// `STRATA_SPLIT_MTP_BATCH`'s value: any whole number other than 0 turns it on; unset, empty, `0` and text
-/// that is not a number leave it off.
-inline bool split_env_on(const char* value) { return value != nullptr && std::atoi(value) != 0; }
 
 struct Plan {
     bool try_batched = false;      ///< call Prefill::draft_kv for this chunk
     const char* why = nullptr;     ///< when `try_batched` is false only because of a missing prerequisite: what is missing
 };
 
-/// `use_mtp`: the engine runs a draft layer. `multi_gpu`: a layer split. `split_env`: split_env_on(...) of the
-/// variable. `has_native_embed`: the GGUF-form token embedding table exists (a --native pack): the split's
-/// last stage reads it, a single GPU's path can also gather from its own weights.
+/// `use_mtp`: the engine runs a draft layer. `multi_gpu`: a layer split. `split_env`: `STRATA_SPLIT_MTP_BATCH` is a
+/// whole number other than 0. `has_native_embed`: the GGUF-form token embedding table exists (a --native pack): the
+/// split's last stage reads it, a single GPU's path can also gather from its own weights.
 inline Plan plan(bool use_mtp, bool multi_gpu, bool split_env, bool has_native_embed) {
     Plan p;
     if (!use_mtp) return p;

@@ -599,8 +599,6 @@ std::string PagePool::check_growth(const Conversation& c, int64_t tokens) const 
     return {};
 }
 
-/// Gets how many blocks region `region` of a conversation of `tokens` tokens takes: a fixed region one (none when
-/// it is empty).
 uint64_t PagePool::region_blocks(size_t region, int64_t tokens) const {
     if (is_fixed(region))
         return block_pages_[region] > 0 ? 1 : 0;

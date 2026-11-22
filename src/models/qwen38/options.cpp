@@ -6,13 +6,15 @@
 
 #include "strata/base/gpu/emulate.hpp"
 #include "strata/base/gpu/gfx_arch.hpp"
+#include "strata/base/gpu/gpu_set.hpp"
 #include "strata/base/gpu/pinned.hpp"
 #include "strata/base/platform/aux_cpus.hpp"
 #include "strata/base/platform/host_limits.hpp"
 #include "strata/common/kernels/cpu/pool.hpp"
+#include "strata/common/serve/option_names.hpp"
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/nv_defaults.hpp"
-#include "strata/models/qwen38/adapt_decay.hpp"
+#include "strata/models/common/adapt_decay.hpp"
 #include "strata/models/qwen38/logits_selection.hpp"
 #include "strata/core/defaults_026.hpp"
 #include "strata/core/gfx12_chunk.hpp"
@@ -21,6 +23,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <charconv>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +31,7 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <numeric>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -44,7 +48,7 @@ void print_usage() {
                  "  --gpu LIST           run on these GPUs, comma-separated nvidia-smi/PCI indices (default: every\n"
                  "                       visible one); sets CUDA_VISIBLE_DEVICES/CUDA_DEVICE_ORDER inside the engine,\n"
                  "                       so a caller never has to export environment variables\n"
-                 "  --ple-gguf PATH      required PLE table (original second GGUF shard); with --native, the model's\n"
+                 "  --ple-gguf PATH      required PLE table (original second GGUF shard); with --model, the model's\n"
                  "                       shard that holds per_layer_token_embd.weight when not given\n"
                  "  --no-ple             explicit diagnostic ablation of the PLE layer\n"
                  "  --ple-io direct|mmap|ram  n-gram table reads (plan v0.3 P2). direct (default): unbuffered SSD\n"
@@ -84,12 +88,12 @@ void print_usage() {
                  "  --native-ple-postops  experimental pinned PLE postprojection arithmetic\n"
                  "  --native-router       experimental pinned CUDA 512-expert top-10 routing\n"
                  "  --cpu-oracle-q8-0     experimental pinned CPU expert quantization and dot reduction\n"
-                 "  --native SHARD1      every full-context native path at once (plan v0.3 P1): stream-token,\n"
+                 "  --model SHARD1       every full-context native path at once (plan v0.3 P1): stream-token,\n"
                  "                       GR MMVF, BF16, head, dense + PLE key, MoE combine, GDN, router, QSA,\n"
                  "                       indexer, RoPE, PLE postops, and the CPU q8_0 contract unless the\n"
                  "                       expert cache is on. Individual --native-* flags stay for A/B.\n"
                  "  --native-head-gguf PATH  native Q5_K head from model shard 1; requires --stream-token\n"
-                 "  --embd-gguf PATH     the token embedding from this GGUF instead of --native's (tools/embd_bf16_pack.py:\n"
+                 "  --embd-gguf PATH     the token embedding from this GGUF instead of --model's (tools/embd_bf16_pack.py:\n"
                  "                       BF16 as the checkpoint ships it; mapped host memory, no VRAM)\n"
                  "  --native-dense-gguf PATH native GDN/QSA/shared projections; repeat for each source model shard\n"
                  "  --expert-cache-cpu-order  experimental GPU expert reduction matching CPU order\n"
@@ -138,7 +142,7 @@ void print_usage() {
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
                  "                       give VRAM back to other programs between requests and take it back later\n"
-                 "  --batch N / --slots N  --serve (opt-in): up to N requests decode together in batch slots (2..8\n"
+                 "  --batch N            --serve (opt-in): up to N requests decode together in batch slots (2..8\n"
                  "                       normally; --batch-mtp waves more through eight-row windows),\n"
                  "                       each slot with its own session (VRAM like the main one); docs/BATCHING.md\n"
                  "  --batch-mtp          --batch (opt-in, needs --mtp and --spec): each slot also verifies one MTP proposal per\n"
@@ -196,7 +200,7 @@ void print_usage() {
                  "  --cvec-dir per-layer|single:L  each layer's own direction (default) or layer L's everywhere (project)\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
-                 "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
+                 "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --model); auto =\n"
                  "                       the largest chunk up to 8192 whose buffers the expert cache can lend;\n"
                  "                       auto:16384 / auto:32768 (or STRATA_PREFILL_AUTO_MAX) allow bigger ones.\n"
                  "                       strata-q38: the largest chunk; each prompt reads in the largest chunk up to\n"
@@ -357,7 +361,7 @@ int parse_options(int argc, char** argv, Options& o, bool& have_tokens) {
     bool have_logits_stride = false;
     bool ram_keep_by_flag = false;
     for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
+        const std::string a = strata::serve::get_primary_option(argv[i]);
         auto next = [&](const char* what) -> const char* {
             if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", what); std::exit(2); }
             return argv[++i];
@@ -440,7 +444,7 @@ int parse_options(int argc, char** argv, Options& o, bool& have_tokens) {
         else if (a == "--native-ple-postops") o.native_ple_postops = true;
         else if (a == "--native-router") o.native_router = true;
         else if (a == "--cpu-oracle-q8-0") o.cpu_oracle_q8_0 = true;
-        else if (a == "--native") o.native_preset = next("--native");
+        else if (a == "--model") o.native_preset = next("--model");
         else if (a == "--native-head-gguf") o.native_head_gguf = next("--native-head-gguf");
         else if (a == "--embd-gguf") o.embd_gguf = next("--embd-gguf");
         else if (a == "--native-dense-gguf") o.native_dense_gguf.push_back(next("--native-dense-gguf"));
@@ -547,7 +551,6 @@ int parse_options(int argc, char** argv, Options& o, bool& have_tokens) {
         else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
         else if (a == "--spec") o.spec = std::atoi(next("--spec"));
         else if (a == "--batch") o.batch = std::atoi(next("--batch"));
-        else if (a == "--slots") o.batch = std::atoi(next("--slots"));   // the same as --batch
         else if (a == "--trim-stage-weights") o.trim_stage_weights = true;
         else if (a == "--batch-groups") {
             const char* bgv = next("--batch-groups");
@@ -763,32 +766,22 @@ int apply_device_defaults(Options& o, bool paged) {
         // any engine code reads its switches (they are read at first use), and the user's own settings are kept
         cudaDeviceProp ad{};
         if (cudaGetDeviceProperties(&ad, 0) == cudaSuccess) {
+            int ndev = 0;
+            const bool count_known = cudaGetDeviceCount(&ndev) == cudaSuccess;
+            std::vector<int> visible(count_known ? std::clamp(ndev, 0, 64) : 0);
+            std::iota(visible.begin(), visible.end(), 0);
+            const strata::core::GpuSetFacts gpus = strata::core::read_gpu_set_facts(visible);
             // an integrated Radeon (UMA / APU: the device property, not the name): the matrix-core prompt set is on by
             // default.  Only when EVERY visible GPU is integrated and of the same architecture, so a box that also holds a
             // discrete card (whichever the engine ends up using) keeps the old defaults.
-            bool all_igpu = ad.integrated != 0;
-            int ndev = 0;
-            if (all_igpu && cudaGetDeviceCount(&ndev) == cudaSuccess) {
-                for (int d = 1; d < ndev && d < 64; ++d) {
-                    cudaDeviceProp od{};
-                    if (cudaGetDeviceProperties(&od, d) != cudaSuccess || od.integrated == 0 ||
-                        std::strncmp(od.gcnArchName, ad.gcnArchName, 7) != 0) { all_igpu = false; (void) cudaGetLastError(); break; }
-                }
-            }
+            const bool all_igpu = !count_known || ndev < 1 ? ad.integrated != 0 :
+                                 gpus.all_integrated && gpus.same_arch;
             if (!paged) {   // Linux, every visible card gfx12: the chunked GDN scan from the first chunk (owner yes 2026-11-07; was the launcher's GDN_STACK_GFX12).
                 // Before apply_arch_defaults, so its "30,000+ tokens" line is not printed when the variable is set.
-                bool all_gfx12 = true;
-                int nd12 = 0;
-                if (cudaGetDeviceCount(&nd12) != cudaSuccess || nd12 < 1) all_gfx12 = false;
-                for (int d = 0; all_gfx12 && d < nd12 && d < 64; ++d) {
-                    cudaDeviceProp od{};
-                    if (cudaGetDeviceProperties(&od, d) != cudaSuccess || !strata::kernels::gfx_arch_is_gfx12(od.gcnArchName)) all_gfx12 = false;
-                }
-                (void) cudaGetLastError();
 #if defined(_WIN32)
-                strata::core::apply_gdn_chunked_default(false, all_gfx12);
+                strata::core::apply_gdn_chunked_default(false, gpus.all_gfx12);
 #else
-                strata::core::apply_gdn_chunked_default(true, all_gfx12);
+                strata::core::apply_gdn_chunked_default(true, gpus.all_gfx12);
 #endif
             }
             strata::core::apply_arch_defaults(ad.gcnArchName, all_igpu, paged ? 0 : o.batch);
@@ -889,7 +882,7 @@ int apply_device_defaults(Options& o, bool paged) {
         // auto:N or STRATA_PREFILL_AUTO_MAX is never touched (prefill_auto_bare is false then).  STRATA_NV_CHUNK=0 or STRATA_DEFAULTS=026 keeps 8192,
         // STRATA_NV_CHUNK=16 keeps 16384.  A layer split takes 8192 back (like gfx12; STRATA_SPLIT_CHUNK16K=1 keeps the raised ceiling).
         // A6000 UD-Q4_K_XL (13.1K of 24.6K experts in VRAM): 20K +43.4%, 32K +22.5%, 64K +21.3%, 8K 0.0%; cards that hold every expert: flat.
-        const int64_t top = strata::core::nv_chunk_ceiling(std::getenv("STRATA_NV_CHUNK"), strata::qwen_defaults_026());
+        const int64_t top = strata::core::nv_chunk_ceiling(std::getenv("STRATA_NV_CHUNK"), strata::defaults_026());
         int nd = 0, lo_major = 99;
         if (top > 0 && cudaGetDeviceCount(&nd) == cudaSuccess && nd > 0) {
             for (int d = 0; d < nd; ++d) {

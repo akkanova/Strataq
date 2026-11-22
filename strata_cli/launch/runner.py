@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 from strata_base import atomic as _atomic_mod
-from strata_common import vram_fit
+from strata_common import user_args, vram_fit
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -1596,7 +1596,7 @@ class Runner:
                     shards = sorted(p.glob("*-00001-of-*.gguf")) or sorted(p.glob("*.gguf")) if p.is_dir() else [p]
                     native = str(shards[0]) if shards else None
                 else:
-                    native = next((str(a2) for a1, a2 in zip(base.get("args") or [], (base.get("args") or [])[1:]) if a1 == "--native"), None)
+                    native = user_args.find_model_file(base.get("args"))
                 if native is None and s.family not in ("qwen", "unsloth"):
                     got = False                              # no file to look at and no reason to assume a Flash-Next shape
                 else:

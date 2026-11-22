@@ -7,6 +7,7 @@
 // CPU one (ggml-impl.h ggml_ue4m3_to_fp32): halved for the doubled table, 0x7F read as 0.
 //
 // Needs AVX512F/BW/VL and VNNI - what cpu_avx512_ok() checks before anything here is called.
+#include "strata/base/platform/env.hpp"
 #include "strata/common/kernels/cpu/nvfp4_avx512.hpp"
 
 #define GGML_COMMON_DECL_CPP
@@ -48,10 +49,7 @@ constexpr Ue4m3Table kUe4m3;
 // pages, where the hardware prefetchers stop at every page boundary; the IQ kernel's E-2 knob, same default
 // (read on first use, behind the CPU check: a static initialiser here would run on every CPU, see above)
 inline int prefetch_distance() {
-    static const int v = [] {
-        const char* e = std::getenv("STRATA_NVFP4_PREFETCH");
-        return e ? std::atoi(e) : 2048;
-    }();
+    static const int v = strata::platform::env_int("STRATA_NVFP4_PREFETCH", 2048);
     return v;
 }
 

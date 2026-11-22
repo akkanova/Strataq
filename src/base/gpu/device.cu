@@ -1,6 +1,7 @@
 // src/base/gpu/device.cu - P2.S1: the CUDA side of the runtime core.
 #include "strata/base/gpu/managed_memory.hpp"
 #include "strata/base/gpu/device.hpp"
+#include "strata/base/platform/env.hpp"
 
 #include <cuda_runtime.h>
 
@@ -192,10 +193,7 @@ static hipError_t first_mem_get_info(size_t* free_bytes, size_t* total_bytes) {
 hipError_t mem_get_info(size_t* free_bytes, size_t* total_bytes) {
     if (free_bytes == nullptr || total_bytes == nullptr) return hipMemGetInfo(free_bytes, total_bytes);
     const hipError_t e = first_mem_get_info(free_bytes, total_bytes);
-    static const bool off = [] {
-        const char* v = std::getenv("STRATA_WDDM_BUDGET");
-        return v != nullptr && std::atoi(v) == 0;
-    }();
+    static const bool off = strata::platform::env_tri("STRATA_WDDM_BUDGET") == 0;
     if (e != hipSuccess || off || free_bytes == nullptr || total_bytes == nullptr) return e;
     int device = 0;
     if (hipGetDevice(&device) != hipSuccess) {

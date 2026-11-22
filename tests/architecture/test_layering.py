@@ -34,7 +34,7 @@ KNOWN_UPWARD_INCLUDES = {
 # is added here.
 CPP_LAYERS = {"base": 0, "base/gpu": 0, "base/platform": 0, "common": 1, "models/common": 2,
               "models/deepseekv41": 3, "models/qwen36": 3, "models/qwen38": 3, "program": 4}
-CPP_SAME_LAYER_USES = {"base/gpu": {"base/platform"}}
+CPP_SAME_LAYER_USES = {"base/gpu": {"base", "base/platform"}}
 # Python packages and scripts by layer; packages in one layer must not import each other
 PY_LAYERS = {"strata_base": 0, "strata_common": 1, "strata_server": 2, "strata_control": 2, "strata_cli": 3,
              "setup": 4, "tools": 4}
@@ -109,6 +109,8 @@ def test_rules_catch_violations():
     assert find_cpp_problem("common/state/pool.cpp", "models/qwen38/session.hpp")
     assert find_cpp_problem("base/gpu/device.cu", "common/state/pool.hpp")
     assert find_cpp_problem("models/qwen36/engine.cu", "models/qwen38/session.hpp")
+    assert find_cpp_problem("base/gpu/device.cu", "base/hash.hpp") is None
+    assert find_cpp_problem("base/platform/numa.cpp", "base/hash.hpp")
     assert find_cpp_problem("base/gpu/device.cu", "base/platform/numa.hpp") is None
     assert find_cpp_problem("base/platform/numa.cpp", "base/gpu/device.hpp")
     assert find_cpp_problem("common/state/pool.cpp", "common/spec/draft.hpp") is None
