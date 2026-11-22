@@ -627,6 +627,42 @@ test('the route tail skip, draft cuts and expert half-life are number boxes the 
   assert.deepEqual(calls, [[{route_tail_skip: 0}, 'session']]);
 });
 
+test('preferring experts on the GPU warns before it is switched on, and not when it is switched off', async () => {
+  const run = async (now, value, answer) => {
+    const asked = [], {calls, onChange} = recorder();
+    const {element, fire} = mount({...live, settings: {...live.settings, route_prior_tenths: now}}, onChange);
+    assert.match(element.innerHTML, /data-setting="route_prior_tenths" value="\d+" min="0" max="100"/);
+    assert.match(element.querySelector('[data-setting="route_prior_tenths"]').title, /answers can get worse/);
+    fire('change', {target: control('[data-setting]', {dataset: {setting: 'route_prior_tenths'}, value})});
+    globalThis.confirm = text => { asked.push(text); return answer; };
+    try {
+      apply(fire);
+      await settle();
+    } finally {
+      delete globalThis.confirm;
+    }
+    return [asked.length, calls];
+  };
+  assert.deepEqual(await run(0, '15', false), [1, []]);
+  assert.deepEqual(await run(0, '15', true), [1, [[{route_prior_tenths: 15}, 'session']]]);
+  assert.deepEqual(await run(15, '0', false), [0, [[{route_prior_tenths: 0}, 'session']]]);
+});
+
+test('saving an enabled route prior as default warns even when it is already enabled for this session', async () => {
+  const asked = [], {calls, onChange} = recorder();
+  const {fire} = mount({...live, settings: {...live.settings, route_prior_tenths: 15}}, onChange);
+  globalThis.confirm = text => { asked.push(text); return false; };
+  try {
+    apply(fire, 'default');
+    await settle();
+  } finally {
+    delete globalThis.confirm;
+  }
+  assert.equal(asked.length, 1);
+  assert.match(asked[0], /Save it as the default/);
+  assert.deepEqual(calls, []);
+});
+
 test('copying evicted experts back is a list the engine reports by index and takes as a word', async () => {
   const view = {...live, settings: {...live.settings, copy_back: 2}};
   const {calls, onChange} = recorder(), {element, fire} = mount(view, onChange);

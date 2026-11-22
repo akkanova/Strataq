@@ -78,6 +78,7 @@ const SETTINGS = {context: "Per-conversation token limit", concurrent: "Conversa
                   vram_reserve_mib: "VRAM kept free for other programs (MiB)",
                   slots: "Maximum conversations at once", batch_groups: "Batch groups (0: auto)",
                   route_tail_skip: "Skip rarely routed missing experts from rank (0: off)",
+                  route_prior_tenths: "⚠ Prefer experts already on the GPU (tenths; 0: off)",
                   draft_confidence_pct: "Least confidence of a drafted token (%)",
                   draft_cumulative_pct: "Least confidence of a draft (%)",
                   expert_half_life: "Expert popularity half-life (steps, 0: never)",
@@ -124,9 +125,16 @@ const CONTROLS = [["concurrent", () => 1, (s) => Math.min(s.slots ?? 8, s.rows ?
                   ["context", () => 1, (s) => s.context_capacity ?? s.context ?? Infinity],
                   ["vram_reserve_mib", () => 0, () => Infinity],
                   ["route_tail_skip", () => 0, () => 9],
+                  ["route_prior_tenths", () => 0, () => 100],
                   ["draft_confidence_pct", () => 0, () => 100],
                   ["draft_cumulative_pct", () => 0, () => 100],
                   ["expert_half_life", () => 0, () => 2147483647]];
+/** What preferring experts already on the GPU does, and why it is risky: the route_prior_tenths tooltip and the
+ *  question asked before it is switched on. */
+const ROUTE_PRIOR_WARNING = "When the model picks the experts for each word, it prefers those already in the GPU's " +
+  "memory, so fewer are read from RAM or the SSD. This may speed up a card that holds few experts " +
+  "(RTX 3060 12 GB, IQ3_XXS, bonus 1.5: story +15%, code +37% decode), but answers can get worse. " +
+  "Long agent sessions repeated themselves and solved fewer tasks in our checks.";
 /** HTML entities for the characters esc replaces. @type {Record<string, string>} */
 const ESCAPES = {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"};
 /** Names shown for where a conversation is held (its `place`). */
@@ -378,6 +386,9 @@ async function applyControls(element, panel, save) {
       error: true, until: Infinity};
     return render(element, panel);
   }
+  if (s.route_prior_tenths > 0 && (save === "default" || !panel.view.settings.route_prior_tenths) &&
+      !confirm(`${ROUTE_PRIOR_WARNING} ${save === "default" ? "Save it as the default?" : "Turn it on?"}`))
+    return;
   const editable = new Set(getEditableControls(s).map(([key]) => key));
   const set = save === "default" ? Object.fromEntries(Object.entries(s).filter(([key]) =>
     editable.has(key) || key.startsWith("memory_mib.") ||
@@ -580,6 +591,8 @@ function getControlHelp(key, settings, details = {}) {
       "experts is left out: it is neither read nor computed. This speeds up decoding when experts are missing " +
       "from the GPU, and changes the answers slightly. Lower ranks skip more. It does nothing while every expert " +
       "is in the GPU. 0 turns it off.";
+  if (key === "route_prior_tenths")
+    return ROUTE_PRIOR_WARNING + " 15 (a bonus of 1.5) is the value that was tested; 0 turns it off.";
   if (key === "draft_confidence_pct" || key === "draft_cumulative_pct")
     return (key === "draft_confidence_pct" ?
       "The drafter's guesses stop at the first one it is less sure of than this. " :

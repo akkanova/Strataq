@@ -55,6 +55,7 @@ LIVE_FLAGS = {"memory_mib.gpu0": "--gpu-mib", "memory_mib.ram": "--ram-mib", "to
               "lookahead": "--lookahead", "concurrent": "--concurrent", "drafter": "--drafter",
               "save_on_shutdown": "--save-on-shutdown", "vram_reserve_mib": "--vram-reserve-mib",
               "batch_groups": "--batch-groups", "route_tail_skip": "--route-tail-skip",
+              "route_prior_tenths": "--route-prior-tenths",
               "draft_confidence_pct": "--draft-confidence-pct", "draft_cumulative_pct": "--draft-cumulative-pct",
               "expert_half_life": "--expert-half-life", "copy_back": "--copy-back",
               "step_profile": "--step-profile"}
@@ -68,7 +69,8 @@ _ONE_CHANGE = ("shared_memory",)
 # The numeric live settings whose range is not "at least 0": (least, most); the engine checks the rest (concurrent
 # against its batch slots, lookahead against rows, rows against its verify windows: 8, or 16 in a wide build).
 _LIVE_RANGE = {"rows": (1, 16), "concurrent": (1, None), "context": (1, None), "vram_conversations": (1, None),
-               "route_tail_skip": (0, 9), "draft_confidence_pct": (0, 100), "draft_cumulative_pct": (0, 100),
+               "route_tail_skip": (0, 9), "route_prior_tenths": (0, 100),
+               "draft_confidence_pct": (0, 100), "draft_cumulative_pct": (0, 100),
                "expert_half_life": (0, 2147483647)}
 # Alternate spellings accepted by the page-pool engines, removed when their canonical flag is saved.
 _LIVE_ALIASES = {"--vram-reserve-mib": ("--reserve-mib",)}

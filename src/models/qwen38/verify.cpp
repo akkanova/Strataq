@@ -287,11 +287,11 @@ inline int g_side_mixer() {
 // app's Expert-settings row writes): 0.2.7 turned 1.5 on by itself on a discrete NVIDIA card of 13 GiB or less, and the owner took that default
 // back on 2026-10-29 (#4402: repetition loops and weaker results in long agent sessions).  With nothing set this is 0.2.6's behaviour, exactly.
 // Measured on an RTX 3060 12 GB only (IQ3_XXS; at 1.5 story +15%, code +37% decode against off).  Any value in the variable wins on every card.
-// The value is read once.
-inline float g_route_prior() {
-    static const char* const env_s = std::getenv("STRATA_ROUTE_PRIOR");
-    static const float lambda = strata::route_prior_resolve(env_s, false, false, 0.0);
-    return lambda;
+/// Shares the verifier's live bonus with the legacy engine's environment-based startup.
+std::atomic<float>& get_route_prior_setting() {
+    static std::atomic<float> value{
+        std::max(strata::route_prior_resolve(std::getenv("STRATA_ROUTE_PRIOR"), false, false, 0.0), 0.0f)};
+    return value;
 }
 inline bool g_qfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_QFUSE"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
 #define VDBG(...) do { if (g_dbg) { std::fprintf(stderr, "verify dbg: " __VA_ARGS__); std::fflush(stderr); } } while (0)
@@ -537,6 +537,12 @@ bool native_of(const WeightRef* w, const std::string& name, std::string& err) {
 }
 
 }  // namespace
+
+float get_route_prior() { return get_route_prior_setting().load(std::memory_order_relaxed); }
+
+void set_route_prior(float lambda) {
+    get_route_prior_setting().store(std::max(lambda, 0.0f), std::memory_order_relaxed);
+}
 
 namespace {
 std::atomic<const Verifier*> g_diag_verifier{nullptr};
@@ -2281,12 +2287,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
-        strata::dispatch::notef("router layer: batched native router=%ld, shared-expert gate in the router launch=%ld, route_prior=%ld", (long) (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10), (long) sg_ready, (long) (g_route_prior() > 0.0f));
+        strata::dispatch::notef("router layer: batched native router=%ld, shared-expert gate in the router launch=%ld, route_prior=%ld", (long) (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10), (long) sg_ready, (long) (get_route_prior() > 0.0f));
         // STRATA_ROUTE_PRIOR=lambda (changes the output): the top-10 picked again with a logit bonus for the resident
-        // experts; the weights stay the router's (route_prior.cu).  g_route_prior() above: off unless STRATA_ROUTE_PRIOR is set
+        // experts; the weights stay the router's (route_prior.cu).  get_route_prior(): off unless asked for
         // (measured on an RTX 3060 12 GB at 2.0: story +37.6%, code +35.2%; on an RTX PRO 5000 72 GB -1.9% / -0.5%, on 2x RTX A4000
         // -4.2% / +11.0%, so it only helps a card that streams most experts).
-        const float route_prior = g_route_prior();
+        const float route_prior = get_route_prior();
         if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
             route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
         if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {

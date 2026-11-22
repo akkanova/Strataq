@@ -19,7 +19,7 @@ def translate_args(cfg: dict, args: list[str]) -> list[str]:
     # Both paged families use the shared stage scheduler, including live batch-group sizing.
     common = set("""pack max-context batch batch-groups expert-cache expert-profile layer-split split-device
         adapt-every adapt-swaps adapt-min-gain adapt-decay expert-popularity-decay expert-half-life
-        route-tail-skip draft-confidence-pct draft-cumulative-pct
+        route-tail-skip route-prior-tenths draft-confidence-pct draft-cumulative-pct
         tokens-min tokens-max conversation-tokens vram-conversations gpu-mib ram-mib ssd-pause-mib
         rows lookahead concurrent pause-dir copy-back conversation-idle-seconds decode-share-percent prompt-turn-ms
         drafter remote-experts save-on-shutdown step-profile

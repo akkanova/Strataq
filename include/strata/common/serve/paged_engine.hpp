@@ -118,6 +118,10 @@ struct PagedSettings {
     /// skipped when every token of a verify window ranks it that low (PagedModel::set_route_tail_skip); 0: never;
     /// -1: the model's default.
     int64_t route_tail_skip = -1;
+    /// --route-prior-tenths (live: route_prior_tenths): the bonus, in tenths of a logit, that picking a token's experts
+    /// gives those already on the GPU (PagedModel::set_route_prior; changes the answers); 0: none; -1: the model's
+    /// default.
+    int64_t route_prior_tenths = -1;
     /// --draft-confidence-pct and --draft-cumulative-pct (live: draft_confidence_pct, draft_cumulative_pct): the
     /// least confidence, in percent, of each drafted token and of the drafted tokens together for the step to verify
     /// them (spec::DraftLimits); -1: the model's.  A change applies from the next request.

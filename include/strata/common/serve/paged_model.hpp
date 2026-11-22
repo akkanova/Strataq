@@ -316,6 +316,11 @@ public:
     virtual int get_route_tail_skip() const { return -1; }
     /// Changes get_route_tail_skip's rank (0 to 9) for the steps after this; only for a model that has the skip.
     virtual void set_route_tail_skip(int) {}
+    /// Gets the logit bonus that picking a token's experts gives those already on the GPU (0: none), or -1 when the
+    /// model has no such bonus.
+    virtual float get_route_prior() const { return -1; }
+    /// Changes get_route_prior's bonus for the steps after this; only for a model that has it.
+    virtual void set_route_prior(float) {}
     /// Captures a group's graphs and stores its immutable row inputs before any stage launches.
     virtual bool prepare_group(int, const std::vector<strata::spec::StepRow>&, std::string&) { return false; }
     /// Starts one prepared group on an idle stage without waiting for its GPU.

@@ -37,10 +37,16 @@
 #include <functional>
 #include <map>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
 namespace strata::core {
+
+/// Gets the logit bonus verify windows give GPU-resident experts (0: the router's own choice).
+float get_route_prior();
+/// Changes the bonus for subsequent windows; negative values turn it off.
+void set_route_prior(float lambda);
 
 /// 0.1.43 (STRATA_ADAPT_OVERLAP): the adaptive tier's copies still landing while a decode window runs.  The window's
 /// residency tables are the baseline's (the swapped-in experts are resident from the window's first layer), but their
@@ -512,6 +518,12 @@ private:
     std::vector<int> bkey(const int* rows, int S, int hbase) const {   // #871: the doorbell variant has its own graphs
         std::vector<int> k = batch_key(rows, S, hbase);
         k.push_back(ar_off_ ? 1 : 0);
+        // Kernel scalar arguments are captured in the graph, so each bonus needs its own decode graph.
+        const float prior = get_route_prior();
+        int prior_bits = 0;
+        static_assert(sizeof(prior_bits) == sizeof(prior));
+        std::memcpy(&prior_bits, &prior, sizeof(prior));
+        k.push_back(prior_bits);
         return k;
     }
     static std::vector<int> batch_key(const int* rows, int S, int hbase) {
