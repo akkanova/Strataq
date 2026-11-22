@@ -153,14 +153,15 @@ void measure_card(PagedCard& card, const std::string& program, uint64_t expert_b
 /// Gets GPU `dev`'s allocator of chunks of `chunk_bytes` (get_chunk_bytes).  On a GPU with virtual memory (vmm.hpp)
 /// the chunks are mapped back to back in one address range as large as the GPU's memory (ChunkMemory::contiguous), so
 /// that a pool's runs may cross them; else each is an allocation of its own.  On Windows, an integrated GPU's chunks
-/// tell whether they went to shared memory instead of the dedicated memory (ChunkMemory::is_outside).  Disable
+/// tell whether they went to shared memory instead of the dedicated memory (ChunkMemory::is_outside), and with virtual
+/// memory a chunk that does not fit there whole is mapped from smaller pieces (take_chunk_in_pieces).  Disable
 /// `zeroed` only when the adapter initializes every page before use.
 strata::core::ChunkMemory get_gpu_chunk_memory(int dev, uint64_t chunk_bytes, bool zeroed = true);
 /// Gets how full integrated GPU `dev`'s dedicated memory (the share the BIOS gives it) was, every program's bytes in
 /// it together, when one of get_gpu_chunk_memory's chunks last went to shared memory instead; before any did, the
 /// share's size.  No figure Windows reports gives the real level, and it depends on the allocations' sizes: on the
-/// Strix Halo (a 63.8 GiB share) a test program filled it to 55.6 GiB in chunks of 256 MiB, 58.7 in 64 MiB and 61.0
-/// in 16 MiB.  No value for another GPU, or on Linux.
+/// Strix Halo (Windows 11, a 63.83 GiB share, 2026-11-21, two rounds) a test program held 54.50 GiB with 256 MiB
+/// pieces and 58.06-58.08 GiB with 256 then 16 MiB pieces. No value for another GPU, or on Linux.
 std::optional<uint64_t> get_share_top(int dev);
 /// Gets the bytes of integrated GPU `dev`'s dedicated memory that no program used when one of get_gpu_chunk_memory's
 /// chunks last went to shared memory instead: the share's size less get_share_top.  0 before any chunk did, for another

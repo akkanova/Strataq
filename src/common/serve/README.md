@@ -28,6 +28,8 @@ engine).
   own options, the runtime's environment, the cards' links, the pools' sizes and their GPU memory, and the RAM's pool
   and the copy-back rule (`open_ram_pool`). The pools open empty: the engine says `READY` and then fills them while
   it serves, the GPUs' first, and the RAM's with the experts no GPU holds.
+- `chunk_pieces.hpp`: on an integrated GPU under Windows, a GPU pool's chunk that lands in shared memory as one
+  physical piece is taken again in 16 MiB pieces (`take_chunk_in_pieces`), which fill more of the dedicated memory.
 - `decode_selection.hpp`: selects the highest-priority requests for a paged decode step. Equal priorities keep
   request order until completion or preemption; requests waiting for a turn do not rotate into the selected set.
   Cancellations drain first without generating rows. `concurrent` limits this selected set, not admitted requests

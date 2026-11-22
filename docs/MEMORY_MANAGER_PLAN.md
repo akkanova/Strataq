@@ -274,7 +274,10 @@ The boundaries between a bar's segments can be dragged (step M6).
   started changes nothing. Only the engine refuses a size: the panel sends it even when it shows red (owner,
   2026-11-21).
 - On a PC whose graphics memory is the system RAM (Windows), a GPU pool grows until a chunk lands in shared memory,
-  gives that chunk back, and keeps the room the model leaves free (`--vram-reserve-mib`). The panel then asks: "29.0
+  gives that chunk back, and keeps the room the model leaves free (`--vram-reserve-mib`). Each 256 MiB chunk is
+  first one piece; when that lands in shared memory, the chunk is made of 16 MiB pieces instead, and it is shared when
+  any of them is. On the Strix Halo (a 63.83 GiB share, 2026-11-21) a test program held 58.07 GiB in dedicated memory
+  this way, 3.56 GiB more than in 256 MiB pieces only, and 0.2-0.3 s slower (owner's choice). The panel then asks: "29.0
   of 30.0 GiB is available as dedicated memory. If you wish, you can allocate the remainder as shared memory, which may
   be slower." Yes sends the change again with `shared_memory=on`, for that change only. Prompt buffers are lent from
   below the first shared chunk. A shrink frees top chunks first, normally the shared ones; dedicated chunks can

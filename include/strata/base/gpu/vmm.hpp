@@ -3,10 +3,13 @@
 // unmapped in chunks of a whole number of the device's granularity (2 MiB by default).  The elastic K/V (--kv-grow)
 // grows with the context by taking chunks the expert cache gives up, and the paged engines' page pools grow and shrink
 // at the top of one range, so that a pool's chunks are back to back (get_gpu_chunk_memory); nothing moves, so every
-// captured graph and stored pointer stays valid.  CUDA's driver calls are reached through the runtime's entry-point
-// query, so nothing links the driver library.
+// captured graph and stored pointer stays valid.  A chunk is one physical chunk, or several mapped back to back
+// (map_pieces).  CUDA's driver calls are reached through the runtime's entry-point query, so nothing links the driver
+// library.
 
 #include <cstdint>
+#include <functional>
+#include <map>
 #include <vector>
 
 namespace strata::core {
@@ -56,19 +59,42 @@ public:
     /// Maps chunks [lo, hi) that are not mapped yet, each to `take()` or, when that returns 0, to a new chunk.
     /// Readable and writable when it returns; false: out of memory (what was mapped stays mapped).
     template <class Take> bool map_range(int64_t lo, int64_t hi, Take take);
-    /// Unmaps chunk i and hands back its physical chunk (0 when it was not mapped).
+    /// Unmaps chunk i and hands back its physical chunk (0 when it was not mapped, or when it was mapped from several
+    /// pieces, which then stays mapped: see free_chunk).
     VmmChunk unmap(int64_t i);
+    /// Maps chunk i, not mapped yet, from new physical chunks of `piece_bytes` (a whole number of vmm_min_granularity;
+    /// the last one takes the rest of the chunk) back to back, and calls `on_piece` with each once it is readable and
+    /// writable.  False when out of memory or when `on_piece` returns false; rolls back the mappings.  The paged
+    /// engines' GPU pools map a chunk in pieces on an integrated GPU (get_gpu_chunk_memory).
+    bool map_pieces(int64_t i, uint64_t piece_bytes,
+                    const std::function<bool(uint8_t* piece, uint64_t bytes)>& on_piece = {});
+    /// Unmaps chunk i and frees every physical chunk behind it; retains failed unmaps for a later retry.
+    void free_chunk(int64_t i);
 
 private:
+    /// Keeps ownership during map_pieces, and afterward for multi-piece chunks or incomplete rollbacks.
+    struct Pieces {
+        uint64_t bytes = 0;            ///< the size of each but the last, which takes the rest of the chunk
+        std::vector<VmmChunk> h;       ///< in address order
+    };
     bool map_one(int64_t i, VmmChunk h);
     bool set_access(int64_t lo, int64_t hi);
     /// Readable and writable [lo, hi) (all newly mapped); when that fails they are unmapped and freed again, so no
     /// chunk counts as mapped without access.
     bool commit_run(int64_t lo, int64_t hi);
+    /// Releases consecutive mappings from the start of chunk i; the final piece may be shorter than `piece_bytes`.
+    /// Returns false with failed unmaps retained for a later retry.
+    bool free_pieces(int64_t i, uint64_t piece_bytes, std::vector<VmmChunk>& pieces);
+    // The backend's calls, on `bytes` of the range from byte `offset` (vmm.cpp has one implementation per backend).
+    bool map_at(uint64_t offset, uint64_t bytes, VmmChunk h);
+    bool set_access_at(uint64_t offset, uint64_t bytes);
+    bool unmap_at(uint64_t offset, uint64_t bytes);
     unsigned long long base_ = 0;
     uint64_t chunk_ = 0;        ///< the bytes of each chunk
     int dev_ = 0;               ///< the device the range was reserved on, which gets access to its chunks
-    std::vector<VmmChunk> h_;   // per chunk: its physical chunk, 0 = unmapped
+    // Nonzero also blocks reuse while a failed rollback still owns mappings.
+    std::vector<VmmChunk> h_;   // per chunk: its physical chunk (map_pieces': the first), 0 = unmapped
+    std::map<int64_t, Pieces> pieces_;
 };
 
 template <class Take> bool VmmRange::map_range(int64_t lo, int64_t hi, Take take) {

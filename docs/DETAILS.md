@@ -1047,11 +1047,16 @@ share, Windows 11) strata-q38 at start held 58.3 GiB in the share and Windows co
 20.9 GiB was its page-locked RAM pool.
 
 How much of the BIOS share a program can really use is not a figure Windows reports. It depends on the size of the
-pieces it takes and on the other programs: a test program on the Strix Halo filled the 63.8 GiB share to 55.6 GiB in
-pieces of 256 MiB, 58.7 in 64 MiB and 61.0 in 16 MiB. So the new engines (strata-q38, strata-ds41) find out each time
-a GPU pool grows, at start too: they take its 256 MiB chunks one at a time and stop at the first one Windows puts in
-shared memory, which is slower (with the pool's top there, strata-ds41 read 4K to 32K prompts 21-24% slower). That
-chunk goes back, and so does the room the model leaves free (`--vram-reserve-mib`). The Memory panel says how much
+pieces it takes and on the other programs. The owner's test program on the Strix Halo (Windows 11, a 63.83 GiB share,
+2026-11-21, two rounds each) mapped pieces into one HIP virtual range and stopped at the first spill. It held
+54.50 GiB in dedicated memory in pieces of 256 MiB, in 2.8-2.9 s. It held 58.06-58.08 GiB
+(3.56 more) in pieces of 256 MiB and then of 16 MiB once one landed in shared memory, in 3.1 s; in pieces of 16 MiB
+only it held the same but took 4.7-9.9 s. Using 256 then 8 MiB pieces held 0.23 GiB more, but 8 MiB pieces as a
+program's first allocation looked shared when they were not. So the new engines (strata-q38, strata-ds41) find out
+each time a GPU pool grows, at start too: they take its 256 MiB chunks one at a time, each first as one piece. When Windows puts that piece in shared
+memory, which is slower (with the pool's top there, strata-ds41 read 4K to 32K prompts 21-24% slower), it goes back
+and the chunk is made of 16 MiB pieces instead. The growth stops at the first chunk with a piece in shared memory.
+That chunk goes back, and so does the room the model leaves free (`--vram-reserve-mib`). The Memory panel says how much
 fits in dedicated memory and asks whether to take the rest as shared memory; yes sends the same size with
 `shared_memory=on`.
 A GPU's `largest` estimates the pool size that fits in dedicated memory, using the last measured edge (before that,

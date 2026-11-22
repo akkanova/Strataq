@@ -11,6 +11,7 @@
 #include "strata/base/platform/memory_manager.hpp"
 #include "strata/common/experts/card_rules.hpp"
 #include "strata/common/experts/split_rules.hpp"
+#include "strata/common/serve/chunk_pieces.hpp"
 #include "strata/common/serve/request.hpp"
 
 #include <algorithm>
@@ -19,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -33,10 +35,51 @@ namespace strata::serve {
 constexpr size_t kLinkProbeBytes = 256ull << 20;
 
 namespace {
-strata::core::ChunkMemory watch_share(int dev, strata::core::ChunkMemory memory);
+/// Gets a GPU pool's chunk of the bytes asked for and sets `outside` when Windows put (some of) it outside an
+/// integrated GPU's dedicated memory (ChunkMemory::is_outside); null on allocation or watched-reading failure.
+using TakeChunk = std::function<uint8_t*(uint64_t bytes, bool& outside)>;
+strata::core::ChunkMemory track_outside(strata::core::ChunkMemory memory, TakeChunk take);
 /// Per integrated GPU: every program's bytes in its dedicated memory when a pool's chunk last landed outside it.
 std::map<int, uint64_t> share_tops;
 std::mutex share_tops_mutex;   ///< guards share_tops
+
+/// Tells whether the memory a GPU pool takes lands outside integrated GPU `dev`'s dedicated memory: Windows puts what
+/// no longer fits there in the system RAM the GPU shares, where it is slower.  Memory did when this process's bytes in
+/// the GPU's apertures (read_share_use) grew by half its size or more with it. Lagging counters or concurrent frees
+/// can hide a spill, and unrelated aperture allocations can look like one;
+/// get_share_top then gets what every program held in the dedicated memory before it.  How full the dedicated memory
+/// gets depends on the allocations' sizes and on the other programs, so each growth finds it anew.  Used by
+/// get_gpu_chunk_memory.
+class ShareWatch {
+public:
+    /// Starts watching integrated GPU `dev`; other GPUs need no landing check.
+    ShareWatch(int dev, bool watched)
+        : dev_(dev), watched_(watched), reading_(!watched || strata::core::read_share_use(dev, last_)) {}
+
+    /// Sets `outside` for the bytes taken since the previous reading; false when a watched reading fails.
+    bool read_landing(uint64_t bytes, bool& outside) {
+        outside = false;
+        if (!watched_)
+            return true;
+        strata::platform::GpuLocalMemory now;
+        if (!reading_ || !(reading_ = strata::core::read_share_use(dev_, now)))
+            return false;
+        outside = now.mine_elsewhere >= last_.mine_elsewhere &&
+                  now.mine_elsewhere - last_.mine_elsewhere >= (bytes + 1) / 2;
+        if (outside) {   // the latest spill: a growth's last one is where its smallest pieces stopped fitting
+            const std::lock_guard<std::mutex> lock(share_tops_mutex);
+            share_tops[dev_] = last_.all;
+        }
+        last_ = now;
+        return true;
+    }
+
+private:
+    int dev_;
+    strata::platform::GpuLocalMemory last_;   ///< the reading before the next physical piece
+    bool watched_;
+    bool reading_;
+};
 }  // namespace
 
 int take_paged_options(int& argc, char** argv, const std::string& program, PagedSettings& s) {
@@ -170,46 +213,67 @@ strata::core::ChunkMemory get_gpu_chunk_memory(int dev, uint64_t chunk_bytes, bo
     uint64_t total = 0, free = 0;
     bool unified = false;
     strata::core::read_gpu_memory(dev, name, total, free, unified);
+    strata::platform::GpuLocalMemory share;
+    const bool watched = strata::core::read_share_use(dev, share);
     auto range = std::make_shared<strata::core::VmmRange>();
     const uint64_t granularity = strata::core::vmm_min_granularity();
     if (granularity > 0 && chunk_bytes % granularity == 0 && range->reserve(total, chunk_bytes)) {
         memory.contiguous = true;
-        memory.alloc = [dev, zeroed, range](uint64_t n) -> uint8_t* {   // the lowest chunk of the range not mapped
+        memory.free = [dev, range](uint8_t* p) {
+            const strata::core::OnDevice on(dev);
+            strata::core::get_memory_manager().remove(p);
+            range->free_chunk((int64_t) ((uint64_t) (p - range->base()) / range->chunk_bytes()));
+        };
+        // the lowest chunk not mapped; on an integrated GPU under Windows, in pieces (take_chunk_in_pieces)
+        return track_outside(std::move(memory), [dev, zeroed, watched, range](uint64_t n, bool& outside) -> uint8_t* {
             const strata::core::OnDevice on(dev);
             int64_t i = 0;
             while (i < range->chunks() && range->mapped(i))
                 ++i;
-            if (n != range->chunk_bytes() || i == range->chunks() ||
-                !range->map_range(i, i + 1, [] { return (strata::core::VmmChunk) 0; }))
+            if (n != range->chunk_bytes() || i == range->chunks())
                 return nullptr;
+            const auto take = [&](uint64_t piece_bytes) {
+                ShareWatch watch(dev, watched);
+                bool any_outside = false;
+                if (!range->map_pieces(i, piece_bytes, [&](uint8_t* piece, uint64_t bytes) {
+                        if (zeroed && !(strata::core::gpu_memset_async(piece, 0, (size_t) bytes, nullptr) &&
+                                        strata::core::gpu_stream_synchronize(nullptr)))
+                            return false;
+                        bool piece_outside = false;
+                        if (!watch.read_landing(bytes, piece_outside))
+                            return false;
+                        any_outside |= piece_outside;
+                        return true;
+                    }))
+                    return ChunkLanding::none;
+                return any_outside ? ChunkLanding::outside : ChunkLanding::inside;
+            };
+            const ChunkLanding landing =
+                watched ? take_chunk_in_pieces(n, take, [&] { range->free_chunk(i); }) : take(n);
+            if (landing == ChunkLanding::none)
+                return nullptr;
+            outside = landing == ChunkLanding::outside;
             uint8_t* p = range->base() + (uint64_t) i * n;
-            if (zeroed && !(strata::core::gpu_memset_async(p, 0, (size_t) n, nullptr) &&
-                            strata::core::gpu_stream_synchronize(nullptr))) {
-                strata::core::vmm_chunk_free(range->unmap(i));
-                return nullptr;
-            }
             strata::core::get_memory_manager().add(p, n, "gpu" + std::to_string(dev), {});
             return p;
-        };
-        memory.free = [dev, range](uint8_t* p) {
-            const strata::core::OnDevice on(dev);
-            strata::core::get_memory_manager().remove(p);
-            const auto i = (int64_t) ((uint64_t) (p - range->base()) / range->chunk_bytes());
-            strata::core::vmm_chunk_free(range->unmap(i));
-        };
-        return watch_share(dev, std::move(memory));
+        });
     }
-    memory.alloc = [dev, zeroed](uint64_t n) {
-        const strata::core::OnDevice on(dev);
-        // Adapters initialize pages on use; touching free runs can page active weights out under WDDM.
-        return (uint8_t*) (zeroed ? strata::core::gpu_alloc_zeroed((size_t) n) :
-                                   strata::core::gpu_alloc((size_t) n));
-    };
     memory.free = [dev](uint8_t* p) {
         const strata::core::OnDevice on(dev);
         strata::core::gpu_free(p);
     };
-    return watch_share(dev, std::move(memory));
+    return track_outside(std::move(memory), [dev, zeroed, watched](uint64_t n, bool& outside) {
+        const strata::core::OnDevice on(dev);
+        ShareWatch watch(dev, watched);
+        // Adapters initialize pages on use; touching free runs can page active weights out under WDDM.
+        auto* p = (uint8_t*) (zeroed ? strata::core::gpu_alloc_zeroed((size_t) n) :
+                                      strata::core::gpu_alloc((size_t) n));
+        if (p != nullptr && !watch.read_landing(n, outside)) {
+            strata::core::gpu_free(p);
+            return (uint8_t*) nullptr;
+        }
+        return p;
+    });
 }
 
 std::optional<uint64_t> get_share_top(int dev) {
@@ -334,27 +398,15 @@ bool open_ram_pool(const std::string& program, const PagedSettings& s, strata::c
 
 namespace {
 
-/// Gets `memory` with chunks that tell whether they landed outside integrated GPU `dev`'s dedicated memory
-/// (ChunkMemory::is_outside): Windows puts a chunk that no longer fits there in the system RAM the GPU shares, where
-/// it is slower.  A chunk did when this process's bytes in the GPU's apertures (read_share_use) grew by half a chunk or
-/// more with it (concurrent frees there can hide one); get_share_top then gets what every program held in the
-/// dedicated memory before it.  How full the dedicated memory gets depends on the allocations' sizes and on the other
-/// programs, so each growth finds it anew.  `memory` as it is for another GPU.
-strata::core::ChunkMemory watch_share(int dev, strata::core::ChunkMemory memory) {
-    strata::platform::GpuLocalMemory share;
-    if (!strata::core::read_share_use(dev, share))
-        return memory;
+/// Gets `memory` with `take` as its alloc and chunks that tell whether they landed outside an integrated GPU's
+/// dedicated memory (ChunkMemory::is_outside).
+strata::core::ChunkMemory track_outside(strata::core::ChunkMemory memory, TakeChunk take) {
     auto outside = std::make_shared<std::set<const uint8_t*>>();
-    memory.alloc = [dev, alloc = std::move(memory.alloc), outside](uint64_t n) -> uint8_t* {
-        strata::platform::GpuLocalMemory before, after;
-        const bool read = strata::core::read_share_use(dev, before);
-        uint8_t* p = alloc(n);
-        if (p != nullptr && read && strata::core::read_share_use(dev, after) &&
-            after.mine_elsewhere >= before.mine_elsewhere + n / 2) {
+    memory.alloc = [take = std::move(take), outside](uint64_t n) {
+        bool out = false;
+        uint8_t* p = take(n, out);
+        if (out)
             outside->insert(p);
-            const std::lock_guard<std::mutex> lock(share_tops_mutex);
-            share_tops[dev] = before.all;
-        }
         return p;
     };
     memory.free = [free = std::move(memory.free), outside](uint8_t* p) {

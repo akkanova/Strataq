@@ -1,5 +1,7 @@
 #include "strata/base/gpu/vmm.hpp"
 
+#include <algorithm>
+
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -93,6 +95,8 @@ void vmm_chunk_free(VmmChunk h) {
 
 bool VmmRange::reserve(uint64_t bytes, uint64_t chunk_bytes) {
     release();
+    if (base_ != 0)
+        return false;
     const Api& a = api();
     chunk_ = chunk_bytes != 0 ? chunk_bytes : a.gran;
     if (!a.ok || bytes == 0 || chunk_ % a.gran != 0 || cudaGetDevice(&dev_) != cudaSuccess) return false;
@@ -107,51 +111,30 @@ bool VmmRange::reserve(uint64_t bytes, uint64_t chunk_bytes) {
 void VmmRange::release() {
     if (base_ == 0) return;
     const Api& a = api();
-    for (int64_t i = 0; i < chunks(); ++i) vmm_chunk_free(unmap(i));
+    for (int64_t i = 0; i < chunks(); ++i)
+        free_chunk(i);
+    if (mapped_count() != 0)
+        return;
     a.free_va((CUdeviceptr) base_, (size_t) ((uint64_t) h_.size() * chunk_));
     base_ = 0;
     h_.clear();
 }
 
-int64_t VmmRange::mapped_count() const {
-    int64_t n = 0;
-    for (const VmmChunk h : h_) n += h != 0;
-    return n;
+bool VmmRange::map_at(uint64_t offset, uint64_t bytes, VmmChunk h) {
+    return api().map((CUdeviceptr) (base_ + offset), (size_t) bytes, 0, (CUmemGenericAllocationHandle) h, 0) ==
+           CUDA_SUCCESS;
 }
 
-bool VmmRange::map_one(int64_t i, VmmChunk h) {
-    const Api& a = api();
-    if (a.map((CUdeviceptr) (base_ + (uint64_t) i * chunk_), (size_t) chunk_, 0, (CUmemGenericAllocationHandle) h, 0) !=
-        CUDA_SUCCESS)
-        return false;
-    h_[(size_t) i] = h;
-    return true;
-}
-
-bool VmmRange::set_access(int64_t lo, int64_t hi) {
-    if (hi <= lo) return true;
-    const Api& a = api();
+bool VmmRange::set_access_at(uint64_t offset, uint64_t bytes) {
     CUmemAccessDesc d{};
     d.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     d.location.id = dev_;
     d.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    return a.access((CUdeviceptr) (base_ + (uint64_t) lo * chunk_), (size_t) ((uint64_t) (hi - lo) * chunk_), &d, 1) ==
-           CUDA_SUCCESS;
+    return api().access((CUdeviceptr) (base_ + offset), (size_t) bytes, &d, 1) == CUDA_SUCCESS;
 }
 
-bool VmmRange::commit_run(int64_t lo, int64_t hi) {
-    if (set_access(lo, hi)) return true;
-    for (int64_t c = lo; c < hi; ++c) vmm_chunk_free(unmap(c));
-    return false;
-}
-
-VmmChunk VmmRange::unmap(int64_t i) {
-    if (!mapped(i)) return 0;
-    const Api& a = api();
-    const VmmChunk h = h_[(size_t) i];
-    if (a.unmap((CUdeviceptr) (base_ + (uint64_t) i * chunk_), (size_t) chunk_) != CUDA_SUCCESS) return 0;
-    h_[(size_t) i] = 0;
-    return h;
+bool VmmRange::unmap_at(uint64_t offset, uint64_t bytes) {
+    return api().unmap((CUdeviceptr) (base_ + offset), (size_t) bytes) == CUDA_SUCCESS;
 }
 
 }  // namespace strata::core
@@ -241,6 +224,8 @@ void vmm_chunk_free(VmmChunk h) {
 
 bool VmmRange::reserve(uint64_t bytes, uint64_t chunk_bytes) {
     release();
+    if (base_ != 0)
+        return false;
     const Api& a = api();
     chunk_ = chunk_bytes != 0 ? chunk_bytes : a.gran;
     if (!a.ok || bytes == 0 || chunk_ % a.min_gran != 0 || hipGetDevice(&dev_) != hipSuccess) return false;
@@ -254,58 +239,42 @@ bool VmmRange::reserve(uint64_t bytes, uint64_t chunk_bytes) {
 
 void VmmRange::release() {
     if (base_ == 0) return;
-    const Api& a = api();
-    for (int64_t i = 0; i < chunks(); ++i) vmm_chunk_free(unmap(i));
+    for (int64_t i = 0; i < chunks(); ++i)
+        free_chunk(i);
+    if (mapped_count() != 0)
+        return;
     (void) hipMemAddressFree((void*) (uintptr_t) base_, (size_t) ((uint64_t) h_.size() * chunk_));
     base_ = 0;
     h_.clear();
 }
 
-int64_t VmmRange::mapped_count() const {
-    int64_t n = 0;
-    for (const VmmChunk h : h_) n += h != 0;
-    return n;
-}
-
-bool VmmRange::map_one(int64_t i, VmmChunk h) {
-    const Api& a = api();
-    if (const hipError_t e = hipMemMap((void*) (uintptr_t) (base_ + (uint64_t) i * chunk_), (size_t) chunk_, 0,
+bool VmmRange::map_at(uint64_t offset, uint64_t bytes, VmmChunk h) {
+    if (const hipError_t e = hipMemMap((void*) (uintptr_t) (base_ + offset), (size_t) bytes, 0,
                                       (hipMemGenericAllocationHandle_t) (uintptr_t) h, 0);
         e != hipSuccess) {
         fail("hipMemMap", e);
         return false;
     }
-    h_[(size_t) i] = h;
     return true;
 }
 
-bool VmmRange::set_access(int64_t lo, int64_t hi) {
-    if (hi <= lo) return true;
-    const Api& a = api();
+bool VmmRange::set_access_at(uint64_t offset, uint64_t bytes) {
     hipMemAccessDesc d{};
     d.location.type = hipMemLocationTypeDevice;
     d.location.id = dev_;
     d.flags = hipMemAccessFlagsProtReadWrite;
-    const hipError_t e = hipMemSetAccess((void*) (uintptr_t) (base_ + (uint64_t) lo * chunk_), (size_t) ((uint64_t) (hi - lo) * chunk_),
-                                         &d, 1);
+    const hipError_t e = hipMemSetAccess((void*) (uintptr_t) (base_ + offset), (size_t) bytes, &d, 1);
     const bool ok = e == hipSuccess;
     if (!ok) fail("hipMemSetAccess", e);
     return ok;
 }
 
-bool VmmRange::commit_run(int64_t lo, int64_t hi) {
-    if (set_access(lo, hi)) return true;
-    for (int64_t c = lo; c < hi; ++c) vmm_chunk_free(unmap(c));
-    return false;
-}
-
-VmmChunk VmmRange::unmap(int64_t i) {
-    if (!mapped(i)) return 0;
-    const Api& a = api();
-    const VmmChunk h = h_[(size_t) i];
-    if (hipMemUnmap((void*) (uintptr_t) (base_ + (uint64_t) i * chunk_), (size_t) chunk_) != hipSuccess) { (void) hipGetLastError(); return 0; }
-    h_[(size_t) i] = 0;
-    return h;
+bool VmmRange::unmap_at(uint64_t offset, uint64_t bytes) {
+    if (hipMemUnmap((void*) (uintptr_t) (base_ + offset), (size_t) bytes) != hipSuccess) {
+        (void) hipGetLastError();
+        return false;
+    }
+    return true;
 }
 }  // namespace strata::core
 #else
@@ -319,12 +288,110 @@ VmmChunk vmm_chunk_new(uint64_t) { return 0; }
 void vmm_chunk_free(VmmChunk) {}
 bool VmmRange::reserve(uint64_t, uint64_t) { return false; }
 void VmmRange::release() {}
-int64_t VmmRange::mapped_count() const { return 0; }
-bool VmmRange::map_one(int64_t, VmmChunk) { return false; }
-bool VmmRange::set_access(int64_t, int64_t) { return false; }
-bool VmmRange::commit_run(int64_t, int64_t) { return false; }
-VmmChunk VmmRange::unmap(int64_t) { return 0; }
+bool VmmRange::map_at(uint64_t, uint64_t, VmmChunk) { return false; }
+bool VmmRange::set_access_at(uint64_t, uint64_t) { return false; }
+bool VmmRange::unmap_at(uint64_t, uint64_t) { return false; }
 }  // namespace strata::core
 
 #endif
 #endif
+
+// Every backend: the chunks, over its map_at, set_access_at and unmap_at.
+namespace strata::core {
+
+int64_t VmmRange::mapped_count() const {
+    int64_t n = 0;
+    for (const VmmChunk h : h_) n += h != 0;
+    return n;
+}
+
+bool VmmRange::map_one(int64_t i, VmmChunk h) {
+    if (!map_at((uint64_t) i * chunk_, chunk_, h))
+        return false;
+    h_[(size_t) i] = h;
+    return true;
+}
+
+bool VmmRange::set_access(int64_t lo, int64_t hi) {
+    return hi <= lo || set_access_at((uint64_t) lo * chunk_, (uint64_t) (hi - lo) * chunk_);
+}
+
+bool VmmRange::commit_run(int64_t lo, int64_t hi) {
+    if (set_access(lo, hi)) return true;
+    for (int64_t c = lo; c < hi; ++c) vmm_chunk_free(unmap(c));
+    return false;
+}
+
+VmmChunk VmmRange::unmap(int64_t i) {
+    if (!mapped(i) || pieces_.count(i) > 0)
+        return 0;
+    const VmmChunk h = h_[(size_t) i];
+    if (!unmap_at((uint64_t) i * chunk_, chunk_))
+        return 0;
+    h_[(size_t) i] = 0;
+    return h;
+}
+
+bool VmmRange::map_pieces(int64_t i, uint64_t piece_bytes, const std::function<bool(uint8_t*, uint64_t)>& on_piece) {
+    const uint64_t granularity = vmm_min_granularity();
+    if (i < 0 || i >= chunks() || mapped(i) || granularity == 0 || piece_bytes == 0 || piece_bytes % granularity != 0)
+        return false;
+    auto& pieces = pieces_[i];
+    pieces.bytes = piece_bytes;
+    try {
+        pieces.h.reserve((size_t) (1 + (chunk_ - 1) / piece_bytes));
+        for (uint64_t at = 0; at < chunk_;) {
+            const uint64_t offset = (uint64_t) i * chunk_ + at, bytes = std::min(piece_bytes, chunk_ - at);
+            const VmmChunk h = vmm_chunk_new(bytes);
+            if (h == 0 || !map_at(offset, bytes, h)) {
+                vmm_chunk_free(h);
+                free_chunk(i);
+                return false;
+            }
+            pieces.h.push_back(h);
+            h_[(size_t) i] = pieces.h.front();
+            if (!set_access_at(offset, bytes) || (on_piece && !on_piece(base() + offset, bytes))) {
+                free_chunk(i);
+                return false;
+            }
+            at += bytes;
+        }
+    } catch (...) {
+        free_chunk(i);
+        throw;
+    }
+    if (pieces.h.size() == 1)
+        pieces_.erase(i);
+    return true;
+}
+
+void VmmRange::free_chunk(int64_t i) {
+    const auto it = pieces_.find(i);
+    if (it == pieces_.end()) {
+        vmm_chunk_free(unmap(i));
+        return;
+    }
+    if (free_pieces(i, it->second.bytes, it->second.h)) {
+        pieces_.erase(it);
+        h_[(size_t) i] = 0;
+    }
+}
+
+bool VmmRange::free_pieces(int64_t i, uint64_t piece_bytes, std::vector<VmmChunk>& pieces) {
+    bool freed = true;
+    for (size_t k = 0; k < pieces.size(); ++k) {
+        if (pieces[k] == 0)
+            continue;
+        const uint64_t at = (uint64_t) k * piece_bytes;
+        if (unmap_at((uint64_t) i * chunk_ + at, std::min(piece_bytes, chunk_ - at))) {
+            vmm_chunk_free(pieces[k]);
+            pieces[k] = 0;
+        } else {
+            // Keep ownership so a later free_chunk or release can retry the driver's failed unmap.
+            freed = false;
+        }
+    }
+    return freed;
+}
+
+}  // namespace strata::core

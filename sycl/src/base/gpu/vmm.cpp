@@ -24,5 +24,7 @@ VmmChunk VmmRange::unmap(int64_t) { return 0; }
 bool VmmRange::map_one(int64_t, VmmChunk) { return false; }
 bool VmmRange::set_access(int64_t, int64_t) { return false; }
 bool VmmRange::commit_run(int64_t, int64_t) { return false; }
+bool VmmRange::map_pieces(int64_t, uint64_t, const std::function<bool(uint8_t*, uint64_t)>&) { return false; }
+void VmmRange::free_chunk(int64_t) {}
 
 }  // namespace strata::core
