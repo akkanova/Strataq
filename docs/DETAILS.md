@@ -1083,9 +1083,17 @@ grow until the runtime has no more.
 
 The new engines leave `--vram-reserve-mib` free on each GPU for other programs. The default is 256 MiB, one pool
 chunk, less than the old engines' 700 (strata-dsv41's 600, which it calls `--reserve-mib`; the new engines take both
-names). The 256 is a choice, not a hardware measurement. The old engines allocated prompt buffers after the expert
-cache; the new engines lend them from their pools. The old engine's Windows paging at 323 MiB free on a 20 GB card
-(#1376) does not establish a safe reserve for the new engines.
+names). The old engines allocated prompt buffers after the expert cache; the new engines lend them from their pools.
+The old engine's Windows paging at 323 MiB free on a 20 GB card (#1376) does not establish a safe reserve for the new
+engines, and a discrete card under Windows is not measured yet.
+
+Measured on the Strix Halo (strata-q38, IQ3_S, Windows, the GPU also drawing the desktop, the pool grown to the end of
+dedicated memory, three greedy 256-token answers per run, 2026-11-22): with reserves of 700, 512, 256 and 128 MiB
+(2-3 alternating runs each), decode was 37.8-38.7 tok/s at every reserve, and none of the engine's memory moved to
+shared memory (its shared use stayed at 4.11 GiB). Each 256 MiB less reserve gave the pool one more chunk (56,031 MiB
+at 700 and 512, 56,286 at 256, 56,541 at 128). During the first answer the engine's own dedicated use grew by about
+95 MiB outside the pools, at every reserve, so at 128 MiB the free dedicated memory fell to 102 MiB. The desktop's
+responsiveness at so little free memory was not measured, which is why the default is 256 and not 128.
 
 For strata-q38, the desktop app's Performance profile keeps at least 512 MiB on a display card, or 2,048 when its
 picture reader runs on the GPU. A headless card keeps 256 MiB, or 2,048 with the GPU reader. Work also keeps a fifth
