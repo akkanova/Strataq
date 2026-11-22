@@ -215,6 +215,8 @@ public:
     /// (Options::expert_pages) Gets each trunk expert's routings in windows since the caller last changed them (layer
     /// * n_exp + expert), counted once the caller sized it to that.
     std::vector<float>& get_usage();
+    /// Gets the experts the CPU lane has computed so far (cpu_experts' calls), each counted once a call.
+    int64_t get_cpu_experts() const;
     /// Gets the GPU memory of the weights on GPU `dev` (an index into get_devices).
     uint64_t get_weight_bytes(int dev) const;
     /// Gets DSpark's reloadable dense allocation size on a stage, including while unloaded.

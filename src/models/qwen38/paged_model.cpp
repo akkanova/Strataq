@@ -190,6 +190,7 @@ public:
     std::vector<int32_t>& get_residency() override { return m_.host_res; }
     bool publish_residency(const PagedCard& card, std::string& err) override;
     std::vector<float>& get_usage() override { return m_.drive.d.usage; }
+    int64_t get_cpu_experts() const override { return m_.drive.d.multi_misses; }
     bool set_card_layers(const PagedCard& card, std::string& err) override;
     strata::core::LayerSizes get_layer_sizes(uint64_t page_bytes) const override;
     bool can_run_layers(int64_t lb, int64_t le) const override;

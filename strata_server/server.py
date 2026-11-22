@@ -2487,11 +2487,14 @@ class Service:
                 "prompt_read": None, "prompt_total": None, "generated": s.get("generated") if s.get("busy") else None,
                 "max_tokens": s.get("max_tokens") if s.get("busy") else None,
                 "elapsed_s": round(now - s["started"], 1) if s.get("busy") and s.get("started") else None,
-                "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
-                "tok_s_mean": round(self._tok_s_mean(), 1) if state == "generating" else None,
+                "tok_s": None, "tok_s_mean": None, "tok_s_window_s": None,
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
-                "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
-        if state == "reading" and progress:
+                # a paged engine's running totals (contracts/requests.md, STATS), from which the Monitor takes rates
+                "engine_stats": getattr(self.engine, "live_stats", None)}
+        if live["phases"]:                              # decoding, also beside a prompt that is read
+            live.update(tok_s=round(self._tok_s(), 1), tok_s_mean=round(self._tok_s_mean(), 1),
+                        tok_s_window_s=RATE_WINDOW_S)
+        if (state == "reading" or reading) and progress:
             live["prompt_read"], live["prompt_total"] = progress
         if par:                                         # #465: the requests running together, slot by slot
             with self.status_lock:
@@ -2507,7 +2510,7 @@ class Service:
                         admitting=int(getattr(self.engine, "admitting", 0) or 0))
             if running and state == "idle":
                 live["state"] = "generating"
-        if live["state"] == "reading":
+        if live["state"] == "reading" or reading:
             live.update(self._find_reading_request(s, running_st, live.get("slots")))
         live["error"] = last_error
         if hasattr(self.engine, "replica_view"):        # opt-in replicas: each one's state and requests routed to it

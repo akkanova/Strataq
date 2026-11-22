@@ -24,6 +24,7 @@
 #include "strata/common/state/resume_point.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -535,6 +536,18 @@ private:
     /// Since the last report: the decode steps that routed on the CPU's side (not every expert on the GPU), their
     /// rows, and the experts they routed to, each counted once a step (docs/DETAILS.md, rows and guesses)
     int64_t routed_steps_ = 0, routed_rows_ = 0, routed_experts_ = 0;
+    /// Totals since the engine started, which the STATS lines report (send_live_stats reads them from its thread).
+    struct LiveTotals {
+        std::atomic<int64_t> steps{0}, rows{0};   ///< decode steps, and the rows (tokens, guesses too) they ran
+        /// Of the steps whose routings the model counted (get_usage; not when every expert is on the GPU): their
+        /// rows, their (row, expert) routings, and the experts those routed to, each counted once a step
+        std::atomic<int64_t> routed_rows{0}, routings{0}, experts{0};
+        std::atomic<int64_t> cpu_experts{0};      ///< of get_cpu_experts, the decode steps' part
+        /// All guesses the steps verified (drafter and suffix lookup), and those accepted.
+        std::atomic<int64_t> guesses{0}, kept{0};
+        /// prompt tokens read, and the time reading them (read_prompt's, less the turns it gives decoding)
+        std::atomic<int64_t> prompt_tokens{0}, prompt_us{0};
+    } totals_;
     /// Sends the STATS lines (send_live_stats) while the engine serves.  Last, so that it stops before the members it
     /// reads are destroyed.
     std::jthread live_stats_;
@@ -1303,13 +1316,18 @@ bool PagedEngine::read_prompt(Held& h, const std::vector<int64_t>& ids, int64_t 
                               int64_t& read_to, bool& fatal, std::string& err) {
     reading_ = &h;
     h.live.assign(ids.begin(), ids.begin() + from);
+    double decode_ms = 0;                       // the turns given to decoding conversations since t0
+    Clock::time_point counted = Clock::now();   // where totals_.prompt_us stops
     const PagedModel::ChunkDone on_chunk = [&](int64_t pos0, int64_t T, std::string& e) -> bool {
+        totals_.prompt_tokens += pos0 + T - read_to;
+        totals_.prompt_us += std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - counted).count();
+        counted = Clock::now();
         read_to = pos0 + T;
         h.live.insert(h.live.end(), ids.begin() + h.live.size(), ids.begin() + read_to);
         h.last_tokens_at = (uint64_t) std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-        const double ms = get_ms_since(t0);
+        const double ms = get_ms_since(t0), reading_ms = ms - decode_ms;
         print_response("PP %lld %lld %.0f %.1f\n", (long long) read_to, (long long) ids.size(), ms,
-                    ms > 0 ? 1000.0 * (double) (read_to - from) / ms : 0.0);
+                    reading_ms > 0 ? 1000.0 * (double) (read_to - from) / reading_ms : 0.0);
         strata::core::progress_beat();
         if (command_loop_)
             command_loop_->poll_inspections();
@@ -1360,7 +1378,8 @@ bool PagedEngine::read_prompt(Held& h, const std::vector<int64_t>& ids, int64_t 
             fatal = !decode_step();
             ok = !fatal;
         }
-        turn = Clock::now();
+        decode_ms += get_ms_since(td);
+        turn = counted = Clock::now();
     }
     if (ok && measure_tail)
         tail_cost_.measure_tail(facts_.name.c_str(), read_ms[0], (size_t) (tail - from), read_ms[1],
@@ -1395,19 +1414,40 @@ bool PagedEngine::decode_step() {
         active.push_back(&h->dec);
     const std::vector<float>& usage = model_.get_usage();
     routed_before_.assign(usage.begin(), usage.end());
+    const auto count_guesses = [&](int64_t strata::spec::Decoding::*count) {
+        int64_t n = 0;
+        for (Held* h : going)
+            n += h->dec.*count;
+        return n;
+    };
+    const int64_t cpu_before = model_.get_cpu_experts(),
+                  guessed_before = count_guesses(&strata::spec::Decoding::guessed),
+                  kept_before = count_guesses(&strata::spec::Decoding::guessed_right);
     std::string err;
     exit_if_gpu_fatal("");   // (the test hook counts steps here)
+    step_rows_ = 0;
     if (!step_.run(active, err)) {
         print_error_or_exit(err);
         return false;
     }
+    // The usage table merges pipeline groups; shared experts across groups count once for the whole wave.
     if (const int64_t routed = std::inner_product(usage.begin(), usage.end(), routed_before_.begin(), (int64_t) 0,
                                                   std::plus<>(), std::greater<>());
         routed > 0) {
         routed_experts_ += routed;
         routed_rows_ += step_rows_;
         ++routed_steps_;
+        totals_.experts += routed;
+        totals_.routed_rows += step_rows_;
+        totals_.routings += std::inner_product(usage.begin(), usage.end(), routed_before_.begin(), (int64_t) 0,
+            std::plus<>(), [](float now, float before) { return (int64_t) std::lround(now - before); });
     }
+    if (step_rows_ > 0)
+        ++totals_.steps;
+    totals_.rows += step_rows_;
+    totals_.cpu_experts += model_.get_cpu_experts() - cpu_before;
+    totals_.guesses += count_guesses(&strata::spec::Decoding::guessed) - guessed_before;
+    totals_.kept += count_guesses(&strata::spec::Decoding::guessed_right) - kept_before;
     for (Held* h : going) {
         const strata::serve::RequestOutput output(h->request_id);
         strata::spec::Decoding& d = h->dec;
@@ -2276,7 +2316,14 @@ void PagedEngine::send_live_stats(std::stop_token stop) const {
                            (unsigned long long) t.to_gpu, (unsigned long long) t.from_gpu);
             first = false;
         }
-        print_response("]}\n");
+        const LiveTotals& t = totals_;
+        print_response("],\"decode\":{\"steps\":%lld,\"rows\":%lld,\"routed_rows\":%lld,\"routings\":%lld,"
+                       "\"experts\":%lld,\"cpu_experts\":%lld,\"guesses\":%lld,\"kept\":%lld},"
+                       "\"prefill\":{\"tokens\":%lld,\"ms\":%.3f}}\n",
+                       (long long) t.steps.load(), (long long) t.rows.load(), (long long) t.routed_rows.load(),
+                       (long long) t.routings.load(), (long long) t.experts.load(), (long long) t.cpu_experts.load(),
+                       (long long) t.guesses.load(), (long long) t.kept.load(), (long long) t.prompt_tokens.load(),
+                       (double) t.prompt_us.load() / 1000.0);
     }
 }
 

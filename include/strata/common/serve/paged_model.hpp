@@ -211,6 +211,9 @@ public:
     /// in the decode steps, which the adaptive tier counts and decays; empty when the tier is off.  A card's ranking
     /// may hold experts past them (a drafter's), which have no count.
     virtual std::vector<float>& get_usage() = 0;
+    /// Gets how many experts the CPU has computed since the model loaded, each (layer, expert) counted once a step;
+    /// the engine's STATS line reports the decode steps' share of it.
+    virtual int64_t get_cpu_experts() const = 0;
     /// Makes the model run layers [card.lb, card.le) on `card` (the layer cut moved); false (and `err`) when its
     /// dense tensors could not reload or its windows could not discard the old layers. The engine calls it
     /// with the card's new range while every conversation is paused, before updating its parts' ranges.

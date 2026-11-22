@@ -311,6 +311,7 @@ public:
     std::vector<int32_t>& get_residency() override { return residency_; }
     bool publish_residency(const PagedCard& card, std::string& err) override;
     std::vector<float>& get_usage() override { return m_.get_usage(); }
+    int64_t get_cpu_experts() const override { return m_.get_cpu_experts(); }
     bool set_card_layers(const PagedCard& card, std::string& err) override {
         return m_.set_stage_layers((int) card.index, (int) card.lb, (int) card.le, err);
     }

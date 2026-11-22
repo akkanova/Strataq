@@ -1460,6 +1460,7 @@ struct Model::Impl {
     // (cpu_experts_paged); and each expert's routings in windows ([layer][expert], count_usage; empty: not counted)
     std::vector<const uint8_t*> held;
     std::vector<float> usage;
+    std::atomic<int64_t> cpu_expert_count{0};   // get_cpu_experts; the CPU lane's threads add to it
     uint8_t* zc_stage_buf = nullptr;   // device: k staging slots for the store's experts of a decode token
     size_t zc_stride = 0;
     bool zc_copy = true;               // DS4_STORE_STAGE=0: the expert kernels read the arena over PCIe themselves
@@ -8871,6 +8872,11 @@ struct Model::Impl {
     void cpu_experts(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx = 0,
                      const int* ord = nullptr) {
         if (ldx == 0) ldx = (size_t) g.dim;
+        // an expert with more tokens than an entry holds takes adjacent entries (ent_cap)
+        int64_t count = 0;
+        for (size_t i = 0; i < ents.size(); ++i)
+            count += i == 0 || ents[i].e != ents[i - 1].e;
+        cpu_expert_count += count;
         if (o.expert_pages != nullptr)
             return cpu_experts_paged(l, x, ents, ldx);
         if (l.lay.fmt == gg::kFmtMXFP4) {
@@ -16175,6 +16181,7 @@ void Model::report_hops() const {
                          hop->d.id, (long long) hop->experts, (long long) hop->rows, hop->ms);
 }
 std::vector<float>& Model::get_usage() { return p_->usage; }
+int64_t Model::get_cpu_experts() const { return p_->cpu_expert_count; }
 uint64_t Model::get_drafter_weight_bytes(int stage) const {
     return p_->devs[(size_t) stage].drafter_bytes;
 }

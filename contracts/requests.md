@@ -90,7 +90,7 @@ own thread, so the lines keep coming during a long prompt chunk. The rest of
 the line is one JSON object:
 
 ```text
-STATS {"seconds":12.004,"gpus":[{"id":"gpu0","to_gpu":81920,"from_gpu":4096}]}
+STATS {"seconds":12.004,"gpus":[{"id":"gpu0","to_gpu":81920,"from_gpu":4096}],"decode":{"steps":310,"rows":806,"routed_rows":806,"routings":425568,"experts":382900,"cpu_experts":0,"guesses":496,"kept":278},"prefill":{"tokens":40960,"ms":38211.500}}
 ```
 
 `seconds` is the time since the engine became ready. Each of `gpus` is one card
@@ -98,7 +98,20 @@ STATS {"seconds":12.004,"gpus":[{"id":"gpu0","to_gpu":81920,"from_gpu":4096}]}
 from host memory to the card and back since the engine started: copies, and the card's reads
 and writes of host memory in place. They are totals, so the difference between
 two lines over the difference of their `seconds` is the rate, even when a line
-is late. Readers ignore keys they do not know, so that more statistics can be
+is late.
+
+`decode` and `prefill` are totals too. `decode.steps` counts the decode steps
+(one pass through the model each) and `rows` the rows they ran: a row is one
+token of a conversation, or one guessed token checked. `routings` counts each
+row's trip to each routed expert (the shared expert is not counted), and
+`experts` the experts those trips reached, each counted once per layer and
+step, so rows that share an expert count it once. Both are counted only in steps
+whose routings the model counts on the host (not while every expert is in VRAM);
+`routed_rows` is the rows of those steps. `cpu_experts` is the experts the CPU
+computed in the steps, counted the same way. `guesses` is the guessed tokens
+checked (from the drafter and suffix lookup) and `kept` those the model kept. `prefill.tokens` is the prompt
+tokens read and `prefill.ms` the time spent reading them, without the turns the
+prompt gives to conversations that decode meanwhile. Readers ignore keys they do not know, so that more statistics can be
 added.
 
 Python retains its old protocol client for installed engines that do not

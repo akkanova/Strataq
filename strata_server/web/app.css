@@ -104,11 +104,10 @@ main { flex: 1; min-height: 0; display: flex; }
 .metric-row { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--st-s-3); }
 .metric-side { font-size: var(--st-fs-xs); color: var(--st-ink-muted); text-align: right;
                font-variant-numeric: tabular-nums; }
-.speed-values { display: flex; justify-content: space-between; gap: var(--st-s-3); }
-.speed-values > div { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
-.speed-values > div:last-child { text-align: right; }
-.speed-values .st-metric__value { font-size: clamp(20px, 2.2vw, var(--st-fs-stat)); }
-.st-metric__spark .speed-prefill { color: color-mix(in srgb, var(--st-accent) 65%, black); }
+.st-metric__value.is-idle { color: var(--st-ink-muted); }
+.live-tip { position: fixed; z-index: 50; max-width: 340px; padding: 6px 8px; white-space: pre-line; pointer-events: none;
+            font-size: var(--st-fs-xs); color: var(--st-ink); background: var(--st-surface-2);
+            border: 1px solid var(--st-line); border-radius: 6px; box-shadow: 0 4px 14px rgb(0 0 0 / .25); }
 .st-metric__spark[data-tone="warn"] { color: var(--st-warn); }
 .st-metric__spark[data-tone="info"] { color: var(--st-info); }
 .monitor-row { display: grid; grid-template-columns: minmax(min(260px, 100%), 1fr) minmax(0, 2.4fr); gap: var(--st-s-4); }
