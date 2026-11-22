@@ -54,15 +54,15 @@ class Apply(unittest.TestCase):
 
     def test_expert_and_draft_tunings_are_live_and_saved_as_their_flags(self):
         values = runconfig.check_live({"route_tail_skip": 0, "draft_confidence_pct": 40, "draft_cumulative_pct": 15,
-                                       "expert_half_life": 50, "copy_back": "off", "route_prior_tenths": 15}, True)
+                                       "expert_half_life": 50, "copy_back": "off", "route_prior_pct": 348}, True)
         new, changed = runconfig.apply_live({"args": ["--copy-back", "auto"]}, values)
         self.assertEqual(new["args"], ["--copy-back", "off", "--route-tail-skip", "0", "--draft-confidence-pct", "40",
                                        "--draft-cumulative-pct", "15", "--expert-half-life", "50",
-                                       "--route-prior-tenths", "15"])
+                                       "--route-prior-pct", "348"])
         self.assertEqual(len(changed), 6)
         for bad in ({"route_tail_skip": 10}, {"draft_confidence_pct": 101}, {"copy_back": True},
                     {"copy_back": "sometimes"}, {"expert_half_life": -1}, {"expert_half_life": 2147483648},
-                    {"route_prior_tenths": 101}):
+                    {"route_prior_pct": 10001}):
             with self.assertRaises(ValueError):
                 runconfig.check_live(bad, True)
 

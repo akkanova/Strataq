@@ -537,7 +537,8 @@ test('the per-conversation widget respects the capacity loaded into the engine',
   const {calls, onChange} = recorder(), {element, fire} = mount(view, onChange);
   const help = "To raise this limit, increase --max-context in the model's engine arguments, then reload the model.";
   const capacity = (204800).toLocaleString();
-  assert.equal(element.querySelector('[data-setting="context"]').title, `Loaded capacity: ${capacity} tokens. ${help}`);
+  assert.equal(element.querySelector('[data-setting="context"]').title,
+    `--conversation-tokens: Loaded capacity: ${capacity} tokens. ${help}`);
   fire('change', {target: control('[data-setting]', {dataset: {setting: 'context'}, value: '300000'})});
   apply(fire);
   assert.equal(element.querySelector('.mem-notice.mem-error').textContent,
@@ -592,12 +593,12 @@ test('idle eviction age is configurable without implying that age alone evicts a
 });
 
 
-test('the VRAM kept free for other programs is a number box the engine changes live', async () => {
+test('the reserved free VRAM is a number box the engine changes live', async () => {
   assert.doesNotMatch(mount(live, recorder().onChange).element.innerHTML, /data-setting="vram_reserve_mib"/);
   const view = {...live, settings: {...live.settings, vram_reserve_mib: 512}};
   const {calls, onChange} = recorder(), {element, fire} = mount(view, onChange);
   assert.match(element.innerHTML,
-    /VRAM kept free for other programs \(MiB\)[^]*data-setting="vram_reserve_mib" value="512" min="0"/);
+    /Reserve free VRAM \(MiB\)[^]*data-setting="vram_reserve_mib" value="512" min="0"/);
   assert.match(element.querySelector('[data-setting="vram_reserve_mib"]').title,
     /when a pool next grows, and at the next start when it is saved as the default/);
   const target = value => control('[data-setting]', {dataset: {setting: 'vram_reserve_mib'}, value});
@@ -610,7 +611,7 @@ test('the VRAM kept free for other programs is a number box the engine changes l
   assert.deepEqual(calls, [[{vram_reserve_mib: 1024}, 'session']]);
 });
 
-test('the route tail skip, draft cuts and expert half-life are number boxes the engine changes live', async () => {
+test('the minimum experts, draft cuts and expert half-life are number boxes the engine changes live', async () => {
   const view = {...live, settings: {...live.settings, route_tail_skip: 7, draft_confidence_pct: 50,
     draft_cumulative_pct: 0, expert_half_life: 8}};
   const {calls, onChange} = recorder(), {element, fire} = mount(view, onChange);
@@ -621,19 +622,22 @@ test('the route tail skip, draft cuts and expert half-life are number boxes the 
   fire('change', {target: target('10')});
   apply(fire);
   assert.deepEqual(calls, []);
-  fire('change', {target: target('0')});
+  fire('change', {target: target('')});
   apply(fire);
   await settle();
   assert.deepEqual(calls, [[{route_tail_skip: 0}, 'session']]);
+  const off = mount({...view, settings: {...view.settings, route_tail_skip: 0}}, onChange).element;
+  assert.match(off.innerHTML, /data-setting="route_tail_skip" value="" min="0"/);
+  assert.match(off.querySelector('[data-setting="route_tail_skip"]').title, /^--route-tail-skip: /);
 });
 
 test('preferring experts on the GPU warns before it is switched on, and not when it is switched off', async () => {
   const run = async (now, value, answer) => {
     const asked = [], {calls, onChange} = recorder();
-    const {element, fire} = mount({...live, settings: {...live.settings, route_prior_tenths: now}}, onChange);
-    assert.match(element.innerHTML, /data-setting="route_prior_tenths" value="\d+" min="0" max="100"/);
-    assert.match(element.querySelector('[data-setting="route_prior_tenths"]').title, /answers can get worse/);
-    fire('change', {target: control('[data-setting]', {dataset: {setting: 'route_prior_tenths'}, value})});
+    const {element, fire} = mount({...live, settings: {...live.settings, route_prior_pct: now}}, onChange);
+    assert.match(element.innerHTML, /data-setting="route_prior_pct" value="\d+" min="0" max="10000"/);
+    assert.match(element.querySelector('[data-setting="route_prior_pct"]').title, /answers can get worse/);
+    fire('change', {target: control('[data-setting]', {dataset: {setting: 'route_prior_pct'}, value})});
     globalThis.confirm = text => { asked.push(text); return answer; };
     try {
       apply(fire);
@@ -643,14 +647,14 @@ test('preferring experts on the GPU warns before it is switched on, and not when
     }
     return [asked.length, calls];
   };
-  assert.deepEqual(await run(0, '15', false), [1, []]);
-  assert.deepEqual(await run(0, '15', true), [1, [[{route_prior_tenths: 15}, 'session']]]);
-  assert.deepEqual(await run(15, '0', false), [0, [[{route_prior_tenths: 0}, 'session']]]);
+  assert.deepEqual(await run(0, '348', false), [1, []]);
+  assert.deepEqual(await run(0, '348', true), [1, [[{route_prior_pct: 348}, 'session']]]);
+  assert.deepEqual(await run(348, '0', false), [0, [[{route_prior_pct: 0}, 'session']]]);
 });
 
 test('saving an enabled route prior as default warns even when it is already enabled for this session', async () => {
   const asked = [], {calls, onChange} = recorder();
-  const {fire} = mount({...live, settings: {...live.settings, route_prior_tenths: 15}}, onChange);
+  const {fire} = mount({...live, settings: {...live.settings, route_prior_pct: 348}}, onChange);
   globalThis.confirm = text => { asked.push(text); return false; };
   try {
     apply(fire, 'default');
@@ -666,7 +670,7 @@ test('saving an enabled route prior as default warns even when it is already ena
 test('copying evicted experts back is a list the engine reports by index and takes as a word', async () => {
   const view = {...live, settings: {...live.settings, copy_back: 2}};
   const {calls, onChange} = recorder(), {element, fire} = mount(view, onChange);
-  assert.match(element.innerHTML, /data-setting="copy_back"[^]*<option value="2" selected>Copied back to RAM when/);
+  assert.match(element.innerHTML, /data-setting="copy_back"[^]*<option value="2" selected>Copied back to RAM if/);
   assert.doesNotMatch(element.querySelector('.mem-note')?.textContent ?? '', /Experts the GPU evicts/);
   fire('change', {target: control('[data-setting]', {dataset: {setting: 'copy_back'}, value: '0'})});
   apply(fire);

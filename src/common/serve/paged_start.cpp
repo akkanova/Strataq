@@ -110,7 +110,7 @@ int take_paged_options(int& argc, char** argv, const std::string& program, Paged
                        {"--save-on-shutdown", nullptr, &save_on_shutdown},
                        {"--expert-popularity-decay", nullptr, &popularity_decay},
                        {"--expert-half-life", &half_life},    {"--route-tail-skip", &s.route_tail_skip},
-                       {"--route-prior-tenths", &s.route_prior_tenths},
+                       {"--route-prior-pct", &s.route_prior_pct},
                        {"--draft-confidence-pct", &s.draft_confidence_pct},
                        {"--draft-cumulative-pct", &s.draft_cumulative_pct},
                        {"--step-profile", nullptr, &step_profile}};
@@ -178,8 +178,8 @@ int take_paged_options(int& argc, char** argv, const std::string& program, Paged
         std::fprintf(stderr, "%s: --route-tail-skip takes a rank from 1 to 9, or 0 for off\n", name);
         return 2;
     }
-    if (s.route_prior_tenths < -1 || s.route_prior_tenths > 100) {
-        std::fprintf(stderr, "%s: --route-prior-tenths takes 0 (off) to 100\n", name);
+    if (s.route_prior_pct < -1 || s.route_prior_pct > 10000) {
+        std::fprintf(stderr, "%s: --route-prior-pct takes 0 (off) to 10000\n", name);
         return 2;
     }
     if (std::min(s.draft_confidence_pct, s.draft_cumulative_pct) < -1 ||

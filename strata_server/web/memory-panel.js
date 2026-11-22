@@ -44,7 +44,7 @@ const USE_HELP = {
   other_apps: "Memory used outside Strata, including other programs and Windows",
   free: "Not in use by anything",
   kept_free: "Memory Strata leaves free so that other programs, and Strata's own buffers outside its pools, have " +
-    "room. The setting \"VRAM kept free for other programs\" sizes it",
+    "room. The setting \"Reserve free VRAM\" sizes it",
   beyond_dedicated: "Free in the graphics chip's own memory, yet unusable: when Strata's pool last grew, Windows " +
     "put the next piece in slower shared memory although this much was still free here. So the pool cannot grow " +
     "further in dedicated memory",
@@ -75,14 +75,18 @@ const SETTINGS = {context: "Per-conversation token limit", concurrent: "Conversa
                   tokens_max: "Max conversation tokens", ssd_pause_mib: "SSD for paused conversations (MiB)",
                   drafter: "Drafter", save_on_shutdown: "Save conversations on shutdown",
                   step_profile: "Log each step's timing",
-                  vram_reserve_mib: "VRAM kept free for other programs (MiB)",
+                  vram_reserve_mib: "Reserve free VRAM (MiB)",
                   slots: "Maximum conversations at once", batch_groups: "Batch groups (0: auto)",
-                  route_tail_skip: "Skip rarely routed missing experts from rank (0: off)",
-                  route_prior_tenths: "⚠ Prefer experts already on the GPU (tenths; 0: off)",
-                  draft_confidence_pct: "Least confidence of a drafted token (%)",
-                  draft_cumulative_pct: "Least confidence of a draft (%)",
-                  expert_half_life: "Expert popularity half-life (steps, 0: never)",
+                  route_tail_skip: "Minimum experts per layer",
+                  route_prior_pct: "⚠ Bias toward loaded experts (%)",
+                  draft_confidence_pct: "Minimum draft confidence per token (%)",
+                  draft_cumulative_pct: "Minimum draft confidence (%)",
+                  expert_half_life: "Expert popularity half-life steps",
                   copy_back: "Experts the GPU evicts"};
+/** Engine flags whose names are not the setting's name with dashes; the drafter list sets three. */
+const FLAGS = {context: "--conversation-tokens", drafter: "--drafter, --suffix-draft, --lookup-chain"};
+/** The number settings whose 0 (off) is shown as an empty field. */
+const BLANK_ZERO = ["route_tail_skip"];
 /** The settings that are switches: the engine reports them as 1 or 0 and takes "on" or "off". */
 const SWITCHES = ["drafter", "save_on_shutdown", "step_profile"];
 /** Defines the Memory panel's prediction modes. Suffix guesses may replace model guesses; chained guesses follow
@@ -99,7 +103,7 @@ const DRAFTER_CHOICES = [["off", {model: false, suffix: false, chain: false}, nu
 const WORDS = {copy_back: ["off", "on", "auto"]};
 /** What each word of WORDS' settings shows in its list. @type {Record<string, string[]>} */
 const WORD_LABELS = {copy_back: ["Dropped (read from the SSD again)", "Copied back to RAM",
-  "Copied back to RAM when that is faster"]};
+  "Copied back to RAM if faster"]};
 /** Guidance shared by the per-conversation limit's tooltip and capacity error. */
 const CONTEXT_CAPACITY_HELP = "To raise this limit, increase --max-context in the model's engine arguments, " +
   "then reload the model.";
@@ -125,15 +129,15 @@ const CONTROLS = [["concurrent", () => 1, (s) => Math.min(s.slots ?? 8, s.rows ?
                   ["context", () => 1, (s) => s.context_capacity ?? s.context ?? Infinity],
                   ["vram_reserve_mib", () => 0, () => Infinity],
                   ["route_tail_skip", () => 0, () => 9],
-                  ["route_prior_tenths", () => 0, () => 100],
+                  ["route_prior_pct", () => 0, () => 10000],
                   ["draft_confidence_pct", () => 0, () => 100],
                   ["draft_cumulative_pct", () => 0, () => 100],
                   ["expert_half_life", () => 0, () => 2147483647]];
-/** What preferring experts already on the GPU does, and why it is risky: the route_prior_tenths tooltip and the
+/** What biasing the choice toward experts on the GPU does, and why it is risky: the route_prior_pct tooltip and the
  *  question asked before it is switched on. */
 const ROUTE_PRIOR_WARNING = "When the model picks the experts for each word, it prefers those already in the GPU's " +
   "memory, so fewer are read from RAM or the SSD. This may speed up a card that holds few experts " +
-  "(RTX 3060 12 GB, IQ3_XXS, bonus 1.5: story +15%, code +37% decode), but answers can get worse. " +
+  "(RTX 3060 12 GB, IQ3_XXS, 348%: story +15%, code +37% decode), but answers can get worse. " +
   "Long agent sessions repeated themselves and solved fewer tasks in our checks.";
 /** HTML entities for the characters esc replaces. @type {Record<string, string>} */
 const ESCAPES = {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"};
@@ -231,7 +235,7 @@ function render(element, panel) {
     !(editable && (SWITCHES.includes(k) || k in WORDS ||
       getEditableControls(view.settings).some(([key]) => key === k))));
   const note = [listed.map(([k, v]) => `${SETTINGS[k] || k}: ${SWITCHES.includes(k) ?
-    (v ? "on" : "off") : WORDS[k]?.[v] ?? fmt(v)}` +
+    (v ? "on" : "off") : WORDS[k]?.[v] ?? (BLANK_ZERO.includes(k) && v === 0 ? "all" : fmt(v))}` +
       (k === "context" ? " tokens" : "")).join(" · "),
     view.can_change === false ? "these change when the model starts again" : "",
     view.busy ? "a request has the engine: the last reading" : view.error || ""].filter(Boolean).join(" · ");
@@ -360,7 +364,7 @@ function changeControl(element, panel, input) {
   } else if (input.type === "checkbox")
     panel.pending[key] = input.checked;
   else
-    panel.pending[key] = input.value === "" ? NaN : Number(input.value);
+    panel.pending[key] = input.value !== "" ? Number(input.value) : BLANK_ZERO.includes(key) ? 0 : NaN;
 }
 
 /** Validates and submits the staged form as one settings change. */
@@ -386,7 +390,7 @@ async function applyControls(element, panel, save) {
       error: true, until: Infinity};
     return render(element, panel);
   }
-  if (s.route_prior_tenths > 0 && (save === "default" || !panel.view.settings.route_prior_tenths) &&
+  if (s.route_prior_pct > 0 && (save === "default" || !panel.view.settings.route_prior_pct) &&
       !confirm(`${ROUTE_PRIOR_WARNING} ${save === "default" ? "Save it as the default?" : "Turn it on?"}`))
     return;
   const editable = new Set(getEditableControls(s).map(([key]) => key));
@@ -467,9 +471,10 @@ function drawControls(panel) {
   const s = {...panel.view.settings, ...panel.pending}, off = panel.busy ? " disabled" : "";
   const fields = getEditableControls(s).map(([key, smallest, largest]) => {
     const help = esc(getControlHelp(key, s, panel.view.details));
+    const value = BLANK_ZERO.includes(key) && s[key] === 0 ? "" : s[key];
     return `<label data-control="${key}" title="${help}">${esc(SETTINGS[key])} ` +
       `<input class="st-input mem-input" type="number" step="1" data-setting="${key}" ` +
-      `value="${s[key]}" min="${smallest(s)}"${largest(s) < Infinity ? ` max="${largest(s)}"` : ""}` +
+      `value="${value}" min="${smallest(s)}"${largest(s) < Infinity ? ` max="${largest(s)}"` : ""}` +
       ` title="${help}"${off}></label>`;
   });
   if (s.drafter != null)
@@ -524,11 +529,19 @@ function getEditableControls(settings) {
   return CONTROLS.filter(([key]) => settings[key] != null && (key !== "context" || settings.context_capacity != null));
 }
 
-/** Gets the meaning and memory cost of controls with limits that are easy to confuse.
+/** Gets a control's tooltip: the engine flags it sets, then what it means.
  * @param {string} key
  * @param {Record<string, number | boolean>} settings
  * @param {Record<string, string>} details */
 function getControlHelp(key, settings, details = {}) {
+  return `${FLAGS[key] ?? `--${key.replaceAll("_", "-")}`}: ${describeControl(key, settings, details)}`;
+}
+
+/** Gets the meaning and memory cost of controls with limits that are easy to confuse.
+ * @param {string} key
+ * @param {Record<string, number | boolean>} settings
+ * @param {Record<string, string>} details */
+function describeControl(key, settings, details) {
   if (key === "rows")
     return "Maximum number of tokens to compute during each pass through the model. More rows can increase " +
       "throughput but also increases demand for experts, so the more VRAM and RAM you have, " +
@@ -562,7 +575,9 @@ function getControlHelp(key, settings, details = {}) {
       "Prompt-processing and decoding requests are protected; age alone does not evict anything.";
   if (key === "step_profile")
     return "Writes a line to the model's log after each decode step, with host elapsed times for drafting guesses, " +
-      "running the model, keeping the accepted tokens and moving experts. These are not GPU kernel timings.";
+      "running the model, keeping the accepted tokens and moving experts. These are not GPU kernel timings. " +
+      "It adds no waits for the GPU, but a log line at every step (many a second) can slow Strata and " +
+      "makes the log grow quickly.";
   if (key === "save_on_shutdown")
     return "When the model stops, conversations in VRAM and RAM are written to the SSD, the most recent first, " +
       `up to the SSD allowance (${fmt(settings.ssd_pause_mib ?? 0)} MiB), and the next start picks them up. ` +
@@ -584,19 +599,28 @@ function getControlHelp(key, settings, details = {}) {
       `Groups now: ${fmt(settings.batch_groups_now ?? 1)}.`;
   if (key === "vram_reserve_mib")
     return "Graphics memory, in MiB, that Strata leaves free on each GPU for other programs and for its own buffers " +
-      "outside the pools. A change applies when a pool next grows, and at the next start when it is saved as the " +
-      "default; it does not resize a pool by itself.";
+      "outside the pools. Qwen3.8-Flash-Next's on-demand GPU picture reader needs about 1,536 MiB of this space " +
+      "on its GPU (1,342 MiB measured on an RTX A6000 and an R9700), so keep 2,048 MiB or more for it. " +
+      "With too little free room, a configured CPU reader takes over, more slowly. " +
+      "This setting applies to every GPU. A change applies when a pool next grows, and at the next start when it " +
+      "is saved as the default; it does not resize a pool by itself.";
   if (key === "route_tail_skip")
-    return "An expert that is not in the GPU and that every token of a step ranks this low or lower among its " +
-      "experts is left out: it is neither read nor computed. This speeds up decoding when experts are missing " +
-      "from the GPU, and changes the answers slightly. Lower ranks skip more. It does nothing while every expert " +
-      "is in the GPU. 0 turns it off.";
-  if (key === "route_prior_tenths")
-    return ROUTE_PRIOR_WARNING + " 15 (a bonus of 1.5) is the value that was tested; 0 turns it off.";
+    return "In each layer the model picks several experts for each token, ranked by weight. With this set to N, " +
+      "the top N are always used. A lower-ranked expert that is not in the GPU is left out (neither read nor " +
+      "computed) when it is outside the top N for every token of the step; the others keep their original weights. " +
+      "This speeds up decoding when experts are missing from the GPU, and changes the answers slightly. Smaller " +
+      "numbers leave out more. It does nothing while every expert is in the GPU. " +
+      "Empty or 0 uses all the experts the model picks.";
+  if (key === "route_prior_pct")
+    return ROUTE_PRIOR_WARNING + " When the experts are picked, one already on the GPU counts as this many " +
+      "percent more likely than the model says; the picked experts keep the model's weights. 348 is the value " +
+      "that was tested; 0 turns it off.";
   if (key === "draft_confidence_pct" || key === "draft_cumulative_pct")
     return (key === "draft_confidence_pct" ?
-      "The drafter's guesses stop at the first one it is less sure of than this. " :
-      "The drafter's guesses stop where its confidence in all of them together falls below this. ") +
+      "The drafter's guesses stop before the first one it is less sure of than this. " :
+      "The drafter's guesses stop before the one that brings its confidence in all of them together (their " +
+      "chances multiplied) below this. ") + "That guess is dropped, not checked: the model works that token out " +
+      "itself unless suffix drafting or lookup supplies another guess. 0 disables this confidence limit. " +
       "Higher values check fewer guesses, which wastes less work when guesses are often wrong; lower values " +
       "check more. It applies from the next request; a request can send its own.";
   if (key === "expert_half_life")

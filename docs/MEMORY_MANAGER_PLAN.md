@@ -33,7 +33,7 @@ Conversations at once: 2 of 3 | Rows per step: 8 | Lookahead: 4
 | Setting | What it limits | Changes live |
 |---|---|---|
 | Memory used, per GPU and in RAM | the total the engine takes from each memory; it gives memory back or takes more | yes |
-| VRAM kept free for other programs (`--vram-reserve-mib`) | the GPU memory each pool leaves unallocated, for other programs and for the engine's allocations outside the pools; 512 MiB by default, a choice that was not measured | yes, from the next growth (saved as the default: from the next start); it resizes nothing by itself |
+| Reserve free VRAM (`--vram-reserve-mib`) | the GPU memory each pool leaves unallocated, for other programs and for the engine's allocations outside the pools; 512 MiB by default, a choice that was not measured | yes, from the next growth (saved as the default: from the next start); it resizes nothing by itself |
 | Combined GPU token budget | the total logical tokens of all GPU-resident conversations; paused RAM and SSD conversations do not count | yes |
 | Per-conversation token limit | the most tokens one conversation may use; cannot exceed the combined GPU budget or the loaded model capacity | yes |
 | Conversation tokens, minimum | the space kept free of experts in each pool for conversation state | yes |

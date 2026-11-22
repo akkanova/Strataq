@@ -2352,7 +2352,7 @@ strata::serve::MemoryReport PagedEngine::describe_memory() const {
     if (const int rank = model_.get_route_tail_skip(); rank >= 0)
         report.settings.emplace_back("route_tail_skip", rank);
     if (const float prior = model_.get_route_prior(); prior >= 0)
-        report.settings.emplace_back("route_prior_tenths", std::lround(prior * 10));
+        report.settings.emplace_back("route_prior_pct", std::lround(std::expm1(prior) * 100));
     if (facts_.has_drafter)
         report.settings.insert(report.settings.end(),
                                {{"draft_confidence_pct", std::lround(draft_limits_.confidence * 100)},
@@ -2447,8 +2447,8 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
             s.batch_groups = v;
         else if (name == "route_tail_skip" && model_.get_route_tail_skip() >= 0)
             s.route_tail_skip = v;
-        else if (name == "route_prior_tenths" && model_.get_route_prior() >= 0)
-            s.route_prior_tenths = v;
+        else if (name == "route_prior_pct" && model_.get_route_prior() >= 0)
+            s.route_prior_pct = v;
         else if (name == "draft_confidence_pct")
             s.draft_confidence_pct = v;
         else if (name == "draft_cumulative_pct")
@@ -2476,8 +2476,8 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
         return "this engine has no drafter: it needs " + facts_.drafter_start + " at its start";
     if (s.route_tail_skip > 9)
         return "route_tail_skip takes a rank from 1 to 9, or 0 for off";
-    if (s.route_prior_tenths > 100)
-        return "route_prior_tenths takes 0 (off) to 100";
+    if (s.route_prior_pct > 10000)
+        return "route_prior_pct takes 0 (off) to 10000";
     if (std::max(s.draft_confidence_pct, s.draft_cumulative_pct) > 100)
         return "the drafts' confidence cuts take 0 to 100 percent";
     if (const std::string why = strata::serve::get_token_limits_error(s.conversation_context, facts_.context,
@@ -2529,7 +2529,7 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
     settings_.copy_back = s.copy_back;
     settings_.popularity_decay = s.popularity_decay;
     settings_.route_tail_skip = s.route_tail_skip;
-    settings_.route_prior_tenths = s.route_prior_tenths;
+    settings_.route_prior_pct = s.route_prior_pct;
     settings_.draft_confidence_pct = s.draft_confidence_pct;
     settings_.draft_cumulative_pct = s.draft_cumulative_pct;
     std::string err;
@@ -2959,8 +2959,8 @@ void PagedEngine::apply_settings() {
         draft_limits_.cumulative = (float) settings_.draft_cumulative_pct / 100.0f;
     if (settings_.route_tail_skip >= 0 && model_.get_route_tail_skip() >= 0)
         model_.set_route_tail_skip((int) settings_.route_tail_skip);
-    if (settings_.route_prior_tenths >= 0 && model_.get_route_prior() >= 0)
-        model_.set_route_prior((float) settings_.route_prior_tenths / 10.0f);
+    if (settings_.route_prior_pct >= 0 && model_.get_route_prior() >= 0)
+        model_.set_route_prior((float) std::log1p((double) settings_.route_prior_pct / 100.0));
 }
 
 uint64_t PagedEngine::get_smallest_gpu(const PagedCard& card, int64_t tokens_min) const {

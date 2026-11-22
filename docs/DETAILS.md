@@ -156,9 +156,9 @@ Some engine settings depend on the PC more than on the model:
 | `--pool-workers` | How many CPU threads compute experts. On CPUs with efficiency cores, fewer can be faster. |
 | `--adapt-every`, `--adapt-swaps`, `--adapt-decay` | How busily the VRAM expert cache follows the conversation. A CPU that reads missed experts slowly (DDR3 or DDR4 in few channels) gains from more swaps. `--adapt-decay` fades the experts' use counts once per 4 decode steps. |
 | `--expert-popularity-decay` | The page-pool engines (strata-q38, strata-ds41) only: how much the experts' use counts fade at each decode step. By default `--adapt-decay` to the power 0.25 (0.7 gives 0.915), the same fading spread over the 4 steps. |
-| `--expert-half-life` | The page-pool engines only: the same fading as `--expert-popularity-decay`, given as the decode steps after which a use counts half (0: it never fades). The Memory panel changes it while the engine runs ("Expert popularity half-life"). |
+| `--expert-half-life` | The page-pool engines only: the same fading as `--expert-popularity-decay`, given as the decode steps after which a use counts half (0: it never fades). The Memory panel changes it while the engine runs ("Expert popularity half-life steps"). |
 | `--route-tail-skip` | strata-q38 only: `STRATA_ROUTE_TAIL_SKIP`'s rank (0: off), which wins over the variable and its default. The Memory panel changes it while the engine runs. |
-| `--route-prior-tenths` | strata-q38 only: `STRATA_ROUTE_PRIOR` in tenths (15 = 1.5; 0: off, the default), which wins over the variable. It can make answers worse (see `STRATA_ROUTE_PRIOR` below). The Memory panel changes it while the engine runs and asks before switching it on. |
+| `--route-prior-pct` | strata-q38 only: `STRATA_ROUTE_PRIOR` as the percent by which picking experts overrates those already on the GPU (the bonus is ln(1 + pct/100): 348 gives about 1.5; 0: off, the default), which wins over the variable. It can make answers worse (see `STRATA_ROUTE_PRIOR` below). The Memory panel changes it while the engine runs and asks before switching it on. |
 | `--draft-confidence-pct`, `--draft-cumulative-pct` | The page-pool engines only: the least confidence, in percent, of each drafted token (`--spec-min-p`, `--dspark-conf`) and of the drafted tokens together, for a step to check them. The Memory panel changes them while the engine runs; a change applies from the next request. |
 | `--step-profile` | The page-pool engines only: `on` (or `1`) writes a `step-profile` line to the log after each decode step, with host elapsed milliseconds for drafting, verifying, committing and moving experts. These are not GPU kernel timings. The Memory panel switches it while the engine runs ("Log each step's timing"). |
 | `--copy-back` | The page-pool engines only: whether an expert a GPU's pool evicts is copied back to RAM (`on`), dropped (`off`) or copied when that measured faster than reading the SSD (`auto`, the default). The Memory panel changes it while the engine runs. |
@@ -1104,7 +1104,7 @@ resource profiles, so strata-ds41 uses its engine default unless a reserve is se
 
 At start, strata-q38's pools also leave room for what it allocates after them: 256 MiB
 a card (352 on a later card of a layer split), what the old engine measured after its expert cache (#4474), and the
-drafter's head. The Memory panel changes the reserve while the engine runs ("VRAM kept free for other programs",
+drafter's head. The Memory panel changes the reserve while the engine runs ("Reserve free VRAM",
 `vram_reserve_mib`). A change counts from the next growth: in the largest size the panel offers, and in what a growth
 gives back or holds to keep it free in dedicated memory. Saved as the default, it counts from the next start. It does
 not resize a pool by itself. The GPU's bar shows the reserve as "Kept free for other programs", at the start of the free
