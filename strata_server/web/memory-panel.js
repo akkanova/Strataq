@@ -79,7 +79,7 @@ const SETTINGS = {context: "Per-conversation token limit", concurrent: "Conversa
                   slots: "Maximum conversations at once", batch_groups: "Batch groups (0: auto)",
                   route_tail_skip: "Minimum experts per layer",
                   route_prior_pct: "⚠ Bias toward loaded experts (%)",
-                  draft_confidence_pct: "Minimum draft confidence per token (%)",
+                  draft_confidence_pct: "Min draft confidence per token (%)",
                   draft_cumulative_pct: "Minimum draft confidence (%)",
                   expert_half_life: "Expert popularity half-life steps",
                   copy_back: "Experts the GPU evicts"};
@@ -614,7 +614,8 @@ function describeControl(key, settings, details) {
   if (key === "route_prior_pct")
     return ROUTE_PRIOR_WARNING + " When the experts are picked, one already on the GPU counts as this many " +
       "percent more likely than the model says; the picked experts keep the model's weights. 348 is the value " +
-      "that was tested; 0 turns it off.";
+      "that was tested; 0 turns it off. The current value corresponds to STRATA_ROUTE_PRIOR=" +
+      `${Math.log1p(Number(settings.route_prior_pct) / 100).toFixed(2)}.`;
   if (key === "draft_confidence_pct" || key === "draft_cumulative_pct")
     return (key === "draft_confidence_pct" ?
       "The drafter's guesses stop before the first one it is less sure of than this. " :

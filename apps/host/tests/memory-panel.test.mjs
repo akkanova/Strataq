@@ -637,6 +637,8 @@ test('preferring experts on the GPU warns before it is switched on, and not when
     const {element, fire} = mount({...live, settings: {...live.settings, route_prior_pct: now}}, onChange);
     assert.match(element.innerHTML, /data-setting="route_prior_pct" value="\d+" min="0" max="10000"/);
     assert.match(element.querySelector('[data-setting="route_prior_pct"]').title, /answers can get worse/);
+    assert.ok(element.querySelector('[data-setting="route_prior_pct"]').title
+      .endsWith(`corresponds to STRATA_ROUTE_PRIOR=${now === 348 ? '1.50' : '0.00'}.`));
     fire('change', {target: control('[data-setting]', {dataset: {setting: 'route_prior_pct'}, value})});
     globalThis.confirm = text => { asked.push(text); return answer; };
     try {
