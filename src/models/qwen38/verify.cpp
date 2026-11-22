@@ -31,6 +31,7 @@
 
 #include "strata/models/qwen38/native_head.hpp"
 #include "strata/base/gpu/on_device.hpp"
+#include "strata/base/gpu/traffic.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/common/kernels/iq_kernels.hpp"
 #include "strata/common/kernels/cpu/expert_layout.hpp"
@@ -1087,6 +1088,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sink_.publish = &Verifier::publish_plan;
         sink_.fetch = &Verifier::fetch_dma;
         sink_.ctx = this;
+        sink_.device = device_;
     }
 
     // APR: the rotated copy of the expert input (nat_xr_, T x N floats) only where a layer's gate/up is
@@ -3849,6 +3851,7 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
         err = "window_logprobs: the head logits copy failed";
         return false;
     }
+    count_gpu_traffic(device_, 0, h.size() * sizeof(float));
 #endif
     // STRATA_FORCE_FAULT=<m>:<bias> (test only, off by default, no output): adds <bias> to the logit of every token id divisible by <m>
     // before the rows are scored, so the token-forcing checker (tools/force_check.py) can be shown to reject a faulty build
@@ -5435,6 +5438,7 @@ bool Verifier::copy_logits(int t, float* host) const {
 #endif
     if (next_ != nullptr) return next_->copy_logits(t, host);   // a layer split: the head is on the last stage
     if (head_logits_ == nullptr || host == nullptr || t < 0 || n_vocab_ <= 0) return false;
+    count_gpu_traffic(device_, 0, (uint64_t) n_vocab_ * sizeof(float));
     return cudaMemcpy(host, head_logits_ + (size_t) t * (size_t) n_vocab_, (size_t) n_vocab_ * sizeof(float),
                       cudaMemcpyDeviceToHost) == cudaSuccess;
 }

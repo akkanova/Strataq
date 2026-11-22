@@ -29,6 +29,7 @@
 #include "strata/base/gpu/memory_info.hpp"
 #include "strata/base/gpu/runtime.hpp"
 #include "strata/base/gpu/on_device.hpp"
+#include "strata/base/gpu/traffic.hpp"
 #include "strata/base/platform/os.hpp"
 #include "strata/core/expert_source.hpp"
 #include "ds4_pcie.cuh"
@@ -4732,6 +4733,7 @@ struct Model::Impl {
                                    sb != nullptr ? sb + (size_t) i * c.stage_stride : nullptr))
                     return false;
                 c.stream_bytes += (double) unit(member(l0, mi));
+                strata::core::count_gpu_traffic(d.id, unit(member(l0, mi)), 0);
             }
             c.dbg_dma_ms += now_ms() - t_dma;
             CK(cudaEventRecord(c.filled[half], c.cs));
@@ -5076,6 +5078,7 @@ struct Model::Impl {
             if (it.direct) {   // (already in the slot)
                 CK(cudaEventRecord(c.ring_fill[r], c.cs));
                 c.stream_bytes += (double) unit(l);
+                strata::core::count_gpu_traffic(devs[(size_t) c.dev].id, unit(l), 0);
                 ++c.n_dma;
                 continue;
             }
@@ -5091,6 +5094,7 @@ struct Model::Impl {
             CK(cudaEventRecord(c.ring_fill[r], c.cs));
             if (it.stage >= 0) CK(cudaEventRecord(c.stage_ev[(size_t) it.stage], c.cs));
             c.stream_bytes += (double) unit(l);
+            strata::core::count_gpu_traffic(devs[(size_t) c.dev].id, unit(l), 0);
             ++c.n_dma;
         }
         return true;
@@ -8734,6 +8738,7 @@ struct Model::Impl {
             return false;
         std::vector<float> output((size_t) rows * g.dim);
         CK(cudaMemcpyAsync(output.data(), d.ed, output.size() * sizeof(float), cudaMemcpyDeviceToHost, d.st));
+        strata::core::count_gpu_traffic(d.id, input.size() * sizeof(float), output.size() * sizeof(float));
         CK(cudaStreamSynchronize(d.st));
         rows = 0;
         for (const Ent& en : remote) {
@@ -10398,6 +10403,7 @@ struct Model::Impl {
         J.t0 = now_ms();
         J.t_done = 0;
         J.t_dev = 0;
+        strata::core::count_gpu_traffic(devs[(size_t) di].id, (uint64_t) n * unit(l), 0);
         if (n > 0) ln_pool->start(n, ln_fn);
     }
     unsigned lane_wait() {
@@ -12219,6 +12225,7 @@ struct Model::Impl {
             const int slot = wp.eg_slot >= 0 ? wp.eg_slot : wp.k % 2;   // (read ahead by the run: two in flight)
             uint8_t* host = c.eg_host[slot] + (size_t) l.eg * c.C * per;
             CK(cudaMemcpyAsync(c.eg_rows, host, (size_t) T * per, cudaMemcpyHostToDevice, s));
+            strata::core::count_gpu_traffic(d.id, (uint64_t) T * per, 0);
             CK(cudaEventRecord(c.eg_ev[slot], s));
             for (int s0 = 0; s0 < T; s0 += 256) {
                 const int ns = std::min(256, T - s0);
@@ -12451,7 +12458,7 @@ struct Model::Impl {
             if (!gemm(d, c, l.wo_b, c.oa16, OG * g.o_lora, na, c.acc + (size_t) a0 * D, D, 0.0f, err)) return false;
             if (a0 == 0 && na == T) dump_sub(d, "ao", l.il, p0, T, c.acc, (size_t) T * D * 4);
         }
-        if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
+        if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s, d.id);
         dump_sub(d, "h_in", l.il, p0, T, c.h, (size_t) T * H * D * 4);
         hc_post_inplace(c.acc, c.h, c.a_post, c.a_comb, D, H, T, s);
         if (dump_l != nullptr && mi == 0) dump_layer(d, c.h, 1000 + l.il, p0, T);   // (after the attention, as the window path)
@@ -12588,7 +12595,7 @@ struct Model::Impl {
         }
         if (c.flow) {
             if (!flow_layer(d, c, L0, mi, wp.k, T, b, err)) return false;
-            if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
+            if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s, d.id);
             hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
             CK(cudaMemcpyAsync(c.pre, c.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
             prof_mark(d, 3);
@@ -12622,7 +12629,7 @@ struct Model::Impl {
             v_done = v_to;
         }
         if (!run_vram(d, c, L0, l, l, b.data(), v_done, L0.pv_n, T, err)) return false;
-        if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
+        if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s, d.id);
         hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
         CK(cudaMemcpyAsync(c.pre, c.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
         prof_mark(d, 3);
@@ -12791,6 +12798,7 @@ struct Model::Impl {
                     const Xfer x = chunk_xfer(c.lm_state + (size_t) k * hb, c, T, false);
                     for (int i = 0; i < x.n; ++i)
                         CK(cudaMemcpyAsync(x.dst[i], x.src[i], x.bytes[i], cudaMemcpyHostToDevice, s));
+                    strata::core::count_gpu_traffic(d.id, x.total(), 0);
                 }
                 if (last_k && g.n_mtp > 0) {   // the drafter's taps: the last chunk's last rows
                     const auto it = std::find(g.d_targets.begin(), g.d_targets.end(), il);
@@ -12811,6 +12819,7 @@ struct Model::Impl {
                     const Xfer x = chunk_xfer(c.lm_state + (size_t) k * hb, c, T, true);
                     for (int i = 0; i < x.n; ++i)
                         CK(cudaMemcpyAsync(x.dst[i], x.src[i], x.bytes[i], cudaMemcpyDeviceToHost, s));
+                    strata::core::count_gpu_traffic(d.id, 0, x.total());
                     continue;
                 }
                 // through every layer: the chunk's end, and the logits
@@ -12985,7 +12994,7 @@ struct Model::Impl {
                     } else {
                         Chunk& a = *chunks[(size_t) L[(size_t) il - 1].dev];
                         host_wait_at_least(a.hand_flag[slot], wp.win);
-                        xfer_get(chunk_xfer(a.hand[slot], c, T, false), a.hand_flag[slot], wp.win, s);
+                        xfer_get(chunk_xfer(a.hand[slot], c, T, false), a.hand_flag[slot], wp.win, s, d.id);
                         set_flag(a.hand_ack + ((size_t) slot * 8 + mi) * 32, wp.win, s);
                     }
                 }
@@ -13018,7 +13027,7 @@ struct Model::Impl {
                             host_wait_at_least(c.hand_ack + ((size_t) slot * 8 + m) * 32, wp.win - 2);
                         wait_flags(c.hand_ack + (size_t) slot * 8 * 32, nnext, 32, wp.win - 2, s);
                     }
-                    xfer_put(chunk_xfer(c.hand[slot], c, T, true), c.hand_flag[slot], wp.win, d.xcnt, s);
+                    xfer_put(chunk_xfer(c.hand[slot], c, T, true), c.hand_flag[slot], wp.win, d.xcnt, s, d.id);
                 }
             }
             if (di == head_dev && (size_t) k < chunk_done.size()) {
@@ -14122,7 +14131,7 @@ struct Model::Impl {
             x.src[0] = d.logits_part;
             x.dst[0] = stage(mi);
             x.bytes[0] = (size_t) rows * vn * 4;
-            xfer_put(x, flag(mi), seq, d.xcnt, d.st);
+            xfer_put(x, flag(mi), seq, d.xcnt, d.st, d.id);
             return true;
         }
         for (int m = 1; m < nm; ++m) {
@@ -14133,7 +14142,7 @@ struct Model::Impl {
             x.src[0] = stage(m);
             x.dst[0] = d.logits_part;
             x.bytes[0] = (size_t) rows * mn * 4;
-            xfer_get(x, flag(m), seq, d.st);
+            xfer_get(x, flag(m), seq, d.st, d.id);
             CK(cudaMemcpy2DAsync(d.logits + (size_t) m0, (size_t) V * 4, d.logits_part, (size_t) mn * 4,
                                  (size_t) mn * 4, (size_t) rows, cudaMemcpyDeviceToDevice, d.st));
         }
@@ -14344,6 +14353,7 @@ struct Model::Impl {
             Xfer x = hand_xfer(pg.hand, d, T, false);
             for (int i = 0; i < x.n; ++i)
                 CK(cudaMemcpyAsync(x.dst[i], x.src[i], x.bytes[i], cudaMemcpyHostToDevice, d.st));
+            strata::core::count_gpu_traffic(d.id, x.total(), 0);
         }
         std::swap(h_eg, pg.engram);
         std::swap(h_taps, pg.taps);
@@ -14390,6 +14400,7 @@ struct Model::Impl {
             Xfer x = hand_xfer(pg.hand, d, T, true);
             for (int i = 0; i < x.n; ++i)
                 CK(cudaMemcpyAsync(x.dst[i], x.src[i], x.bytes[i], cudaMemcpyDeviceToHost, d.st));
+            strata::core::count_gpu_traffic(d.id, 0, x.total());
         }
         CK(cudaEventRecord(d.ev_out, d.st));
         return true;
@@ -14524,6 +14535,8 @@ struct Model::Impl {
                 CK(cudaMemcpyAsync(b.pre, bb + nh, np, cudaMemcpyHostToDevice, b.st));
                 CK(cudaMemcpyAsync(b.topk, bb + nh + np, nk, cudaMemcpyHostToDevice, b.st));
                 CK(cudaMemcpyAsync(b.cand, bb + nh + np + nk, nc, cudaMemcpyHostToDevice, b.st));
+                strata::core::count_gpu_traffic(a.id, 0, nh + np + nk + nc);
+                strata::core::count_gpu_traffic(b.id, nh + np + nk + nc, 0);
                 cur = l.dev;
             }
             if (!tap(devs[(size_t) l.dev], il, T, err)) return false;
@@ -14612,7 +14625,7 @@ struct Model::Impl {
                     init_pre(d.pre, T, s);
                 } else {
                     const Dev& a = devs[(size_t) L[(size_t) il - 1].dev];
-                    xfer_get(hand_xfer(a.hand, d, T, false), a.hand_flag, wp.win, s);
+                    xfer_get(hand_xfer(a.hand, d, T, false), a.hand_flag, wp.win, s, d.id);
                 }
             }
             // the compressed KV / index keys another group's source layer wrote this window
@@ -14631,7 +14644,8 @@ struct Model::Impl {
             if (!layer(L0, mi, p0, T, wp, err)) return false;
             if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, il, p0, T);
             const bool last = il + 1 == g.nl || L[(size_t) il + 1].grp != L0.grp;
-            if (last && mi == 0 && il + 1 < g.nl) xfer_put(hand_xfer(d.hand, d, T, true), d.hand_flag, wp.win, d.xcnt, s);
+            if (last && mi == 0 && il + 1 < g.nl)
+                xfer_put(hand_xfer(d.hand, d, T, true), d.hand_flag, wp.win, d.xcnt, s, d.id);
         }
         if (d.grp == devs[(size_t) head_dev].grp) return head_rows_dev(di, T, err);
         return true;
@@ -14655,6 +14669,7 @@ struct Model::Impl {
         Dev& d = devs[(size_t) from];
         if (!copies[(size_t) from].for_each_run(r0, n, [&](size_t off, size_t bytes, const uint8_t* at) {
                 CK(cudaMemcpyAsync(stage + off, at, bytes, cudaMemcpyDeviceToHost, d.st));
+                strata::core::count_gpu_traffic(d.id, 0, bytes);
                 return true;
             }))
             return false;
@@ -14666,6 +14681,7 @@ struct Model::Impl {
             CK(cudaStreamWaitEvent(o2.st, ev, 0));
             if (!copies[od].for_each_run(r0, n, [&](size_t off, size_t bytes, uint8_t* at) {
                     CK(cudaMemcpyAsync(at, stage + off, bytes, cudaMemcpyHostToDevice, o2.st));
+                    strata::core::count_gpu_traffic(o2.id, bytes, 0);
                     return true;
                 }))
                 return false;
@@ -14686,7 +14702,7 @@ struct Model::Impl {
                            true);
         // (the flag goes with the last part: the parts before it are earlier on the same stream)
         for (size_t i = 0; i < xs.size(); ++i)
-            xfer_put(xs[i], i + 1 == xs.size() ? flag : nullptr, seq, cnt, s);
+            xfer_put(xs[i], i + 1 == xs.size() ? flag : nullptr, seq, cnt, s, devs[(size_t) l.dev].id);
     }
 
     // Queues device di's side of put_new_rows for the window or chunk of T tokens at p0: once *flag >= seq, copies
@@ -14704,7 +14720,7 @@ struct Model::Impl {
         if (host_first && !xs.empty())
             host_wait_at_least(flag, seq);
         for (const Xfer& x : xs)
-            xfer_get(x, flag, seq, s);
+            xfer_get(x, flag, seq, s, devs[di].id);
     }
 
     // Appends to xs the copies of rows [r0, r0 + n) of `rows` to `stage` (out) or from it: one segment for each
@@ -14776,7 +14792,7 @@ struct Model::Impl {
             x.bytes[1] = (size_t) j * ik_rb();
             x.n = 2;
         }
-        xfer_put(x, sr.x_flag, wp.win, d.xcnt, s);
+        xfer_put(x, sr.x_flag, wp.win, d.xcnt, s, d.id);
         return true;
     }
     // ... and on a reader of source sidx (device di): the rows multi_put gathered, each to its conversation's copy
@@ -14801,7 +14817,7 @@ struct Model::Impl {
             x.bytes[x.n++] = (size_t) j * ik_rb();
         }
         if (x.n == 0) return true;
-        xfer_get(x, sr.x_flag, wp.win, s);
+        xfer_get(x, sr.x_flag, wp.win, s, d.id);
         j = 0;
         for (int t = 0; t < wp.nrow; ++t) {
             const int64_t p = wp.rpos[t];
@@ -14884,6 +14900,7 @@ struct Model::Impl {
             for (int t = 0; t < T; ++t)
                 CK(cudaMemcpyAsync(sc + (size_t) t * cols * (ehd / 32), src + (size_t) t * per + (size_t) cols * ehd,
                                    (size_t) cols * (ehd / 32), cudaMemcpyHostToDevice, s));
+            strata::core::count_gpu_traffic(d.id, (uint64_t) T * per, 0);
             engram_dequant(d.eg_rows, sc, T * cols, ehd, d.eg_x, s, (int) eg_fmt[(size_t) l.eg]);
             dump_sub(d, "eg_rows", l.il, p0, T, d.eg_rows, (size_t) T * cols * ehd);
             dump_sub(d, "eg_x", l.il, p0, T, d.eg_x, (size_t) T * cols * ehd * 4);
@@ -15014,7 +15031,7 @@ struct Model::Impl {
                 return false;
         } else CK(cudaMemsetAsync(d.ao, 0, (size_t) T * D * sizeof(*d.ao), s));   // (no heads: nothing to add)
         dump_sub(d, "ao", l.il, p0, T, d.ao, (size_t) T * D * 4);
-        if (nm > 1) allreduce(d.ao, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
+        if (nm > 1) allreduce(d.ao, T * D, ag, mi, ++d.ar_seq, d.xcnt, s, d.id);
         hc_post(d.ao, d.h, d.a_post, d.a_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
         if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, 1000 + l.il, p0, T);   // (DS4_DUMP_L: after the attention)
@@ -15360,7 +15377,7 @@ struct Model::Impl {
                 }
             }
             if (lead) st.experts += (int64_t) T * l.k_exp;
-            if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
+            if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s, d.id);
             hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
             std::swap(d.h, d.h2);
             CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
@@ -15383,6 +15400,7 @@ struct Model::Impl {
         CK(cudaMemcpyAsync(h_idx, d.ridx, (size_t) T * kPicks * 4, cudaMemcpyDeviceToHost, s));
         CK(cudaMemcpyAsync(h_w, d.rw, (size_t) T * kPicks * 4, cudaMemcpyDeviceToHost, s));
         CK(cudaMemcpyAsync(h_x, d.x, (size_t) T * D * 4, cudaMemcpyDeviceToHost, s));
+        strata::core::count_gpu_traffic(d.id, 0, (uint64_t) T * D * 4);
         CK(cudaEventRecord(d.ev, s));
         // the shared expert while the host looks at the picks
         if (!mv(d, {job(l.s1, d.x, d.sg, T, D, g.ff), job(l.s3, d.x, d.su, T, D, g.ff)}, err)) return false;
@@ -15542,6 +15560,7 @@ struct Model::Impl {
             st.cpu_ms += now_ms() - tc;
             dump_sub_host("cpu_part", l.il, p0, T, h_part, (size_t) T * D * 4);
             CK(cudaMemcpyAsync(d.cpu_part, h_part, (size_t) T * D * 4, cudaMemcpyHostToDevice, s));
+            strata::core::count_gpu_traffic(d.id, (uint64_t) T * D * 4, 0);
         }
         combine(d.ed, ents.empty() ? nullptr : d.cpu_part, d.sh_out, cm, T, D, d.moe_out, s);
         dump_sub(d, "moe_out", l.il, p0, T, d.moe_out, (size_t) T * D * 4);
@@ -15912,6 +15931,7 @@ struct Model::Impl {
         ds4_metal_flush();   // (a host read of a device result: commit the batched dispatches first)
 #endif
         // (on d.st: the legacy stream is not ordered after the non-blocking d.st's head; Project Maya #619)
+        strata::core::count_gpu_traffic(d.id, 0, out.size() * 4);
         return cudaMemcpyAsync(out.data(), d.logits, out.size() * 4, cudaMemcpyDeviceToHost, d.st) == cudaSuccess &&
                cudaStreamSynchronize(d.st) == cudaSuccess;
     }
@@ -16427,6 +16447,7 @@ bool Model::copy_logits_row(int row, float* out) {
     ds4_metal_flush();   // (a host read of a device result: commit the batched dispatches first)
 #endif
     const size_t at = (size_t) (row < 0 ? std::max(0, p.n_logits - 1) : row) * (size_t) p.g.vocab;
+    strata::core::count_gpu_traffic(d.id, 0, (uint64_t) p.g.vocab * 4);
     return cudaMemcpyAsync(out, d.logits + at, (size_t) p.g.vocab * 4, cudaMemcpyDeviceToHost, d.st) == cudaSuccess &&
            cudaStreamSynchronize(d.st) == cudaSuccess;
 }

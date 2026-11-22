@@ -24,6 +24,7 @@
 #include "strata/base/gpu/pinned_ring.hpp"
 #include "strata/common/state/progress.hpp"
 #include "strata/base/gpu/on_device.hpp"
+#include "strata/base/gpu/traffic.hpp"
 #include "strata/base/platform/aux_cpus.hpp"
 
 #include "strata/core/layout.hpp"
@@ -3639,6 +3640,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         const auto tsetup = Clock::now();
         // ---- embeddings, broadcast to the four streams - or, in a later stage of a layer split, the rows the
         // previous stage handed on
+        if (hand_in_ != nullptr)
+            core::count_gpu_traffic(m.device, (uint64_t) T * D * 4, 0);
         if (hand_in_ != nullptr && hand_ev_ != nullptr) {
             // STRATA_HANDOFF_PIPE: each piece's upload waits on the GPU for its download on the stage before.  The
             // stage before split the chunk it handed on (n rows); one chunk here is all of it, otherwise (a smaller
@@ -3768,6 +3771,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 err = std::string("prefill: the PLE rows' upload failed: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
+            core::count_gpu_traffic(m.device, m.ple_compact[ple_buf] ? raw_bytes : (size_t) T * N * 4, 0);
             if (m.ple_compact[ple_buf]) {
                 strata::kernels::ple_iq4nl_dequant(m.ple_raw_dev, T * strata::kernels::PLE_N_HEADS, m.ple_emb, m.cs);
                 if (ple_side && cudaEventRecord(m.ple_raw_free, m.cs) != cudaSuccess) {
@@ -3855,8 +3859,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 const PeerPrefill::PsEntry& en = P.pseq[P.p_issued];
                 const size_t sl = P.p_issued % (size_t) P.RP;
                 if (P.plive[sl]) cudaStreamWaitEvent(P.s_cp, P.pused[sl], 0);
-                cudaMemcpyAsync(P.pstage[sl], en.blob, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(en.l),
-                                cudaMemcpyHostToDevice, P.s_cp);
+                const size_t bytes = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(en.l);
+                cudaMemcpyAsync(P.pstage[sl], en.blob, bytes, cudaMemcpyHostToDevice, P.s_cp);
+                core::count_gpu_traffic(P.dev, bytes, 0);
                 cudaEventRecord(P.pcopied[sl], P.s_cp);
                 P.plive[sl] = 1;
                 ++P.p_issued;
@@ -3951,6 +3956,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     m.stager->issued_one(en.job, m.copy);
                 }
                 cudaEventRecord(m.copied[sl], m.copy);
+                core::count_gpu_traffic(m.device, bytes, 0);
                 m.stage_live[sl] = true;
                 stats_.ms_experts_host += ms_since(th);
                 ++stats_.experts_streamed;
@@ -4059,6 +4065,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 m.stager->issued_one(en.job, m.copy);
                             }
                             cudaEventRecord(m.copied[sl], m.copy);
+                            core::count_gpu_traffic(m.device, bytes, 0);
                             m.stage_live[sl] = true;
                             iss_ms += ms_since(th);
                             ++iss_streamed;
@@ -4115,6 +4122,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     if (!sparse_copied) cudaEventRecord(m.copied[sl], m.copy);
                     else if (strata::prefill::copy_event_due(idx, seq.size(), copy_event_every)) record(idx);
+                    core::count_gpu_traffic(m.device, bytes, 0);
                     m.stage_live[sl] = true;
                     iss_ms += ms_since(th);
                     ++iss_streamed;
@@ -5066,7 +5074,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     m.cpu_x_n = want;
                                 }
                             }
-                            if (cpu_maybe) cudaMemcpyAsync(m.cpu_x, m.mixed, want * sizeof(float), cudaMemcpyDeviceToHost, m.cs);
+                            if (cpu_maybe) {
+                                cudaMemcpyAsync(m.cpu_x, m.mixed, want * sizeof(float), cudaMemcpyDeviceToHost, m.cs);
+                                core::count_gpu_traffic(m.device, 0, want * sizeof(float));
+                            }
                         }
                         // #579: a stall here is the GPU (this layer's attention and router, or the previous layer's
                         // work), not the host: the watchdog's report says so (only its text changes)
@@ -5803,6 +5814,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             ++P.layers;
                             P.experts += (int64_t) n;
                             P.rows += rows_peer;
+                            if (!P.p2p) {   // the host route: the activations out to the peer, its sums or rows back
+                                const uint64_t xb = (uint64_t) T * N * (P.f16 ? 2 : 4),
+                                               bb = P.sums ? xb : (uint64_t) rows_peer * N * 4;
+                                core::count_gpu_traffic(m.device, bb, xb);
+                                core::count_gpu_traffic(P.dev, xb, bb);
+                            }
                         }
                         if (ps_on) {   // multi-GPU: this layer's peer-ring entries the routing did not pick give their slots back
                             int pd = 0;
@@ -5889,6 +5906,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 m.stager->issued_one(job_of[j], m.copy);
                             }
                             cudaEventRecord(m.copied[sl], m.copy);
+                            core::count_gpu_traffic(m.device, lay.blob_bytes(l), 0);
                             m.stage_live[sl] = true;
                             stage_of[j] = sl;
                             stats_.ms_experts_host += ms_since(th);
@@ -6275,6 +6293,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const int64_t r0c = cpu_at;
                         cudaMemcpyAsync(m.Dm + (size_t) r0c * N, m.cpu_rows, (size_t) rows_cpu * N * sizeof(float),
                                         cudaMemcpyHostToDevice, m.cs);
+                        core::count_gpu_traffic(m.device, (uint64_t) rows_cpu * N * 4, 0);
                         if (use_mmq && !fused_l && lay.native && lay.fmt[(size_t) l].tail_off)
                             cudaMemcpyAsync(m.row_sd + r0c, m.cpu_ones, (size_t) rows_cpu * sizeof(float),
                                             cudaMemcpyHostToDevice, m.cs);
@@ -6426,6 +6445,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         if (next_ != nullptr) {
             // The current hand-off slot was used two chunks ago.
             float* h = m.hand[hand_buf_];
+            core::count_gpu_traffic(m.device, 0, (uint64_t) T * D * 4);
             const int hp = m.hand_pieces;
             if (hp > 0) {
                 // STRATA_HANDOFF_PIPE: the pieces' downloads stay queued; the host waits for the chunk's work only (the
@@ -7383,6 +7403,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                 m.stager->issued_one(job_of[u], m.copy);
             }
             cudaEventRecord(m.copied[sl], m.copy);
+            core::count_gpu_traffic(m.device, lay.blob_bytes(l), 0);
             m.stage_live[sl] = true;
             stage_of[u] = sl;
             stats_.ms_experts_host += ms_since(tq);

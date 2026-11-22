@@ -2073,11 +2073,25 @@ class Service:
                                                     "prefill_tok_s_mean": self._prefill_tok_s_mean()},
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
                                        gpu_indices=getattr(self, "gpu_indices", None),
-                                       amd=getattr(self, "backend", None) == "hip")
+                                       amd=getattr(self, "backend", None) == "hip", transfers=self._engine_transfers)
             if getattr(self, "engine", None) is not None and hasattr(self.engine, "gpu_busy"):
                 # #1317: the quick frozen-engine check does not end an engine whose GPU is busy (a long prompt chunk on a
                 # slow card keeps the GPU at work while the host thread sleeps)
                 self.engine.gpu_busy = lambda: (self.telemetry.snapshot()["now"].get("gpu_util") or 0) >= 10
+
+    def _engine_transfers(self):
+        """Gets the engine's traffic totals from its last STATS line (contracts/requests.md) for the hardware sampler
+        (Telemetry's `transfers`): (seconds, {card index: (bytes to it, bytes from it)}), or None.  The engine's
+        `gpu<N>` is the Nth card of its visibility list, or card N without one."""
+        stats = getattr(getattr(self, "engine", None), "live_stats", None)
+        if not stats:
+            return None
+        order = getattr(self, "terminal_visibility_order", None) or []
+        cards = {}
+        for g in stats["gpus"]:
+            n = int(g["id"].removeprefix("gpu").partition(".")[0])
+            cards[order[n] if n < len(order) else n] = (g["to_gpu"], g["from_gpu"])
+        return stats["seconds"], cards
 
     def _tok_s(self):
         """tok/s over the last RATE_WINDOW_S seconds.  Returns 0.0 while nothing is generating.  With parallel requests:

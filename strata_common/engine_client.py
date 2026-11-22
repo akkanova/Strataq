@@ -894,6 +894,7 @@ class StrataEngine:
         self.terminal_stages: list[dict] = []  # final layer ranges from this engine start's bounded stderr log
         self.terminal_batch_sample: dict | None = None
         self.terminal_stage_sample: dict | None = None
+        self.live_stats: dict | None = None   # a paged engine's last STATS line's object (contracts/requests.md)
         self.prefill_tok_s_mean = None
         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
         self.progress_ms = 0             # PP's own milliseconds since the prompt started (its third field)
@@ -925,6 +926,7 @@ class StrataEngine:
                 self.log.flush()
             except OSError:
                 pass
+        self.live_stats = None
         self.max_context = 0                             # before the new process is visible: never its predecessor's
         pin = {}
         if cpus and hasattr(os, "sched_setaffinity"):    # replicas: this engine's own physical cores (strata_server/replicas.py)
@@ -1182,6 +1184,11 @@ class StrataEngine:
                 if sample is not None and self.proc is proc:
                     self.terminal_batch_sample = {**sample, "observed_monotonic": time.monotonic()}
                 continue                        # control telemetry never enters a request's token stream
+            if line.startswith("STATS "):
+                with contextlib.suppress(ValueError):
+                    if self.proc is proc:
+                        self.live_stats = json.loads(line[6:])
+                continue
             if line.startswith("PSTAT"):
                 sample = parse_stage_in_flight_sample(line)
                 if sample is not None and self.proc is proc:

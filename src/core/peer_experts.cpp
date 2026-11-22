@@ -4,6 +4,7 @@
 
 #include "strata/base/gpu/device.hpp"   // primary_device() (STRATA_PRIMARY_DEVICE)
 #include "strata/base/gpu/on_device.hpp"
+#include "strata/base/gpu/traffic.hpp"
 #include "strata/common/kernels/cpu/expert_layout.hpp"
 #include "strata/common/kernels/cpu/hadamard.hpp"
 #include "strata/common/kernels/elementwise.hpp"
@@ -326,6 +327,7 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
     // direct: x is the verifier's pinned (portable) doorbell row block - copied from where it is
     if (!direct) std::memcpy(h_x_, x, (size_t) (n_tok * H) * sizeof(float));
     OnDevice on(device_);
+    count_gpu_traffic(device_, (uint64_t) (n_tok * H) * sizeof(float), (uint64_t) rows * H * sizeof(float));
     const cudaStream_t s = stream_;
     if (!ck(cudaMemcpyAsync(d_x_, direct ? x : h_x_, (size_t) (n_tok * H) * sizeof(float), cudaMemcpyHostToDevice, s), "input", err) ||
         !ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err))
@@ -438,6 +440,7 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, 
         if (!ck(cudaMemcpyAsync(cache_.device_slot(slot), b, (size_t) lay.blob_bytes(s.layer), cudaMemcpyHostToDevice,
                                 refill_), "refill", err))
             return false;
+        count_gpu_traffic(device_, lay.blob_bytes(s.layer), 0);
         if (gated) {
             (*gate_has_)[(size_t) s.layer] = 1;
             *gate_last_ = std::max(*gate_last_, s.layer);

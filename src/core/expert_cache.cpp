@@ -1,6 +1,7 @@
 #include "strata/base/gpu/managed_memory.hpp"
 // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the header first.
 #include "strata/core/expert_cache.hpp"
+#include "strata/base/gpu/traffic.hpp"
 
 // #533's segmented cache uses CUDA's virtual memory management (cuMem*): not on HIP, neither the RDNA backend nor
 // the gfx906 compat build (PR #638), which compiles this file as HIP without STRATA_USE_HIP
@@ -420,6 +421,7 @@ void ExpertCache::set_vmm(bool enabled) { g_cache_vmm = enabled; }
 bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes,
                        std::string& err, uint8_t* arena) {
     close();
+    cudaGetDevice(&device_);
     if (n_slots <= 0) {
         err = "ExpertCache: n_slots must be positive";
         return false;
@@ -659,6 +661,7 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
         err = std::string("ExpertCache::fill_slot: ") + cudaGetErrorString(e);
         return false;
     }
+    count_gpu_traffic(device_, n, 0);
     ++fills_;
     return true;
 }
@@ -691,6 +694,7 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
         err = std::string("ExpertCache::fill_slot_blocking: ") + cudaGetErrorString(e);
         return false;
     }
+    count_gpu_traffic(device_, n, 0);
     ++fills_;
     return true;
 }
@@ -721,6 +725,7 @@ bool ExpertCache::fill_slot_queued_parts(int32_t slot, const BlobPart* parts, in
             return false;
         }
     }
+    count_gpu_traffic(device_, total, 0);
     ++fills_;
     return true;
 }

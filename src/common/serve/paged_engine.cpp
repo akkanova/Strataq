@@ -5,6 +5,7 @@
 
 #include "strata/base/gpu/memory_info.hpp"
 #include "strata/base/gpu/on_device.hpp"
+#include "strata/base/gpu/traffic.hpp"
 #include "strata/common/experts/card_rules.hpp"
 #include "strata/common/experts/expert_swaps.hpp"
 #include "strata/common/experts/ram_tier.hpp"
@@ -24,6 +25,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -35,8 +37,10 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -450,6 +454,9 @@ private:
     std::vector<strata::core::HeldConversation> list_conversations() const;
     /// Describes the memories for GET_MEMORY_USE, and the start-up fill (EXPERT_FILL): loaded once it has ended.
     strata::serve::MemoryReport describe_memory() const;
+    /// Writes a STATS line (contracts/requests.md) once a second until `stop` is requested.  Runs on its own thread,
+    /// so that a long prompt chunk does not hold the lines up: it reads only what is safe beside the step loop.
+    void send_live_stats(std::stop_token stop) const;
     /// Gets the step's view of the model: PagedModel's rows over the conversations' state.
     strata::spec::StepModel get_step_model();
     /// Finds learned costs by token affinity even when the GPU state cannot rewind to that prompt.
@@ -523,6 +530,9 @@ private:
     /// Since the last report: the decode steps that routed on the CPU's side (not every expert on the GPU), their
     /// rows, and the experts they routed to, each counted once a step (docs/DETAILS.md, rows and guesses)
     int64_t routed_steps_ = 0, routed_rows_ = 0, routed_experts_ = 0;
+    /// Sends the STATS lines (send_live_stats) while the engine serves.  Last, so that it stops before the members it
+    /// reads are destroyed.
+    std::jthread live_stats_;
 };
 
 /// Gets the layers [lb, le) card `k` runs at layer cut `cut` (PagedEngine::get_cut's form) of a model of `n_layers`.
@@ -639,12 +649,15 @@ PagedEngine::PagedEngine(PagedModel& model, PagedCards& cards, strata::core::Ram
             (own ? model_.get_residency()[i] : c.lent[i]) = slot;
             residency_changed_ = residency_changed_ || own;
         };
-        hooks.leaving = [this](strata::core::ExpertKey key, const uint8_t* bytes) {
+        hooks.leaving = [this, &c = card](strata::core::ExpertKey key, const uint8_t* bytes) {
             if (!strata::core::is_copy_back_worth(get_copy_back_gain_for(settings_.copy_back, copy_back_gain_),
                                                   lending_))
                 return;
             const Clock::time_point t0 = Clock::now();
-            copied_back_ += ram_.keep_copy(key, bytes, model_.get_usage());
+            if (ram_.keep_copy(key, bytes, model_.get_usage())) {   // (keep_copy copies no drafter layer's expert)
+                ++copied_back_;
+                strata::core::count_gpu_traffic(c.dev, 0, facts_.expert_bytes[(size_t) key.layer]);
+            }
             copy_back_ms_ += get_ms_since(t0);
         };
         card.experts.set_hooks(std::move(hooks));
@@ -734,6 +747,7 @@ int PagedEngine::serve() {
     print_response("INFO request_capacity=%d request_queue=1\n", get_most_concurrent());
     print_response(
         "READY %lld stop conversations memory preempt settings requests\n", (long long) settings_.conversation_context);
+    live_stats_ = std::jthread([this](std::stop_token stop) { send_live_stats(stop); });
     strata::serve::EngineHooks hooks;
     hooks.before_line = [this](const std::string&) { return wait_model_state(); };
     hooks.is_busy = [this] { return !pending_.empty() || is_decoding() || filling_since_.has_value(); };
@@ -1877,6 +1891,8 @@ bool PagedEngine::pause(Held& h, std::string& err, bool ram_only) {
         drop_pages(p);
         return false;
     }
+    for (size_t k = 0; k < h.parts.size(); ++k)
+        strata::core::count_gpu_traffic(cards_[k].dev, 0, h.parts[k]->bytes());
     if (!in_ram) {
         p.bytes = std::filesystem::file_size(p.file);
         std::vector<uint8_t>().swap(p.head.state);
@@ -1929,6 +1945,7 @@ bool PagedEngine::resume(const Paused& p, Held& h, int64_t tokens, std::string& 
                                                    model_.get_ram_span(card.lb, card.le), model_.get_gpu_span(card))
                  : strata::core::read_conversation_section(file.get(), card.experts.pool(), id, err,
                                                            model_.get_gpu_span(card));
+        strata::core::count_gpu_traffic(card.dev, ok ? h.parts[k]->bytes() : 0, 0);
     }
     if (through_ram)
         ram.remove_conversation(p.serial);
@@ -2214,6 +2231,27 @@ std::vector<strata::core::HeldConversation> PagedEngine::list_conversations() co
         list.push_back(c);
     }
     return list;
+}
+
+void PagedEngine::send_live_stats(std::stop_token stop) const {
+    const Clock::time_point t0 = Clock::now();
+    std::mutex mu;
+    std::condition_variable_any tick;
+    std::unique_lock lock(mu);
+    while (!tick.wait_for(lock, stop, std::chrono::seconds(1), [&] { return stop.stop_requested(); })) {
+        print_response("STATS {\"seconds\":%.3f,\"gpus\":[", get_ms_since(t0) / 1000.0);   // a line ends at its "\n"
+        bool first = true;
+        for (size_t k = 0; k < cards_.size(); ++k) {
+            if (std::any_of(cards_.begin(), cards_.begin() + k,
+                            [&](const PagedCard& c) { return c.dev == cards_[k].dev; }))
+                continue;
+            const strata::core::GpuTraffic t = strata::core::get_gpu_traffic(cards_[k].dev);
+            print_response("%s{\"id\":\"%s\",\"to_gpu\":%llu,\"from_gpu\":%llu}", first ? "" : ",", cards_[k].id.c_str(),
+                           (unsigned long long) t.to_gpu, (unsigned long long) t.from_gpu);
+            first = false;
+        }
+        print_response("]}\n");
+    }
 }
 
 strata::serve::MemoryReport PagedEngine::describe_memory() const {

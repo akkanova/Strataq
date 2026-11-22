@@ -277,6 +277,7 @@ struct GpuPlanSink {
     /// holds the arena's device alias.
     int pcie_mode = 0;
     int32_t cpu_jobs = 0;   ///< host only: the distinct experts the pool computes for the layer just published
+    int device = -1;        ///< the GPU the plan runs on: its PCIe share and the CPU's rows are counted as its traffic
 };
 
 /// Verifier::set_pcie_balance: a verify window's costs, fitted to each layer's measured times (ms, least squares with

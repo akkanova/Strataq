@@ -8,6 +8,7 @@
 #include "expert_files.hpp"
 #include "strata/base/gpu/on_device.hpp"
 #include "strata/base/gpu/runtime.hpp"
+#include "strata/base/gpu/traffic.hpp"
 #include "strata/base/platform/os.hpp"
 #include "strata/common/experts/ram_experts.hpp"
 #include "strata/common/experts/card_rules.hpp"
@@ -786,6 +787,7 @@ bool PagedDeepSeek::copy_expert(const PagedCard& card, strata::core::ExpertKey k
               card.id + " failed";
         return false;
     }
+    strata::core::count_gpu_traffic(card.dev, blobs_[(size_t) key.layer], 0);
     return true;
 }
 

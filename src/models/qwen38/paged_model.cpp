@@ -9,6 +9,7 @@
 #include "strata/common/artifact/gguf_reader.hpp"
 #include "strata/common/experts/auto_cache.hpp"
 #include "strata/base/gpu/runtime.hpp"
+#include "strata/base/gpu/traffic.hpp"
 #include "strata/models/qwen38/prompt_images.hpp"
 #include "strata/common/experts/card_rules.hpp"
 #include "strata/common/experts/expert_pages.hpp"
@@ -1063,6 +1064,7 @@ bool PagedQwen::copy_recurrent_state(std::vector<uint8_t>& state, const PagedPar
             err = "the checkpoint's recurrent state could not be copied";
             return false;
         }
+        strata::core::count_gpu_traffic(p.dev, to_gpu ? bytes : 0, to_gpu ? 0 : bytes);
     }
     return true;
 }

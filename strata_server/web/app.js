@@ -137,7 +137,7 @@ const METRICS = [
   {key: "vram", label: "VRAM", icon: "layers", unit: "GB", series: "gpu_mem_used"},
   {key: "temp", label: "GPU temp", icon: "thermometer", unit: "°C", series: "gpu_temp", tone: "warn"},
   {key: "power", label: "Power", icon: "bolt", unit: "W", series: "gpu_power"},
-  {key: "pcie", label: "PCIe", icon: "link", unit: "", series: "gpu_pcie_rx_mb", tone: "info"},
+  {key: "moved", label: "Transfers", icon: "link", unit: "MB/s", series: "moved_mb_s", tone: "info"},
   {key: "cpu", label: "CPU", icon: "cpu", unit: "%", series: "cpu", max: 100},
   {key: "disk", label: "Disk read", icon: "disk", unit: "MB/s", series: "disk_read_mb", tone: "info"},
 ];
@@ -147,7 +147,8 @@ $("metrics").innerHTML = METRICS.map((m) => `
     ${m.key === "speed" ? `<div class="speed-values">
       <div><span class="st-metric__value" id="mv-speed">-</span><span class="st-metric__sub" id="ms-speed">Decode</span></div>
       <div class="speed-prefill"><span class="st-metric__value" id="mv-prefill">-</span><span class="st-metric__sub" id="ms-prefill">Prefill</span></div>
-    </div>` : `<span class="st-metric__value" id="mv-${m.key}">–</span>
+    </div>` : `<div class="metric-row"><span class="st-metric__value" id="mv-${m.key}">–</span>
+      <div class="metric-side" id="mx-${m.key}"></div></div>
     <span class="st-metric__sub" id="ms-${m.key}"></span>`}
     <svg class="st-metric__spark" id="sp-${m.key}" viewBox="0 0 100 32" preserveAspectRatio="none"${m.tone ? ` data-tone="${m.tone}"` : ""}>
       <path class="area" fill="currentColor" opacity=".12"/><path class="line" fill="none" stroke="currentColor"
@@ -166,6 +167,32 @@ function spark(id, values, max) {
   const line = pts.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(2)},${p[1].toFixed(2)}`).join("");
   svg.querySelector(".line").setAttribute("d", line);
   svg.querySelector(".area").setAttribute("d", `${line}L100,32L0,32Z`);
+}
+/**
+ * Fills the Transfers card from `cards` (the sampler's `moved`: each card's traffic with host memory, in MB/s) and
+ * their total `mbS`: the total on the left, each card's on the right when there are several, the cards' links below.
+ */
+function showTransfers(cards, mbS) {
+  const rate = (x) => fmt(x, x != null && x < 10 ? 1 : 0);
+  const link = (c, gen = c.pcie_gen_max || c.pcie_gen, width = c.pcie_width_max || c.pcie_width) =>
+    gen ? `Gen${gen}${width ? ` x${width}` : ""}` : "";
+  const tip = (c) => {
+    const now = c.pcie_gen && c.pcie_gen_max && c.pcie_gen < c.pcie_gen_max
+      ? ` (now ${link(c, c.pcie_gen, c.pcie_width)})` : "";
+    return [`GPU ${c.index}: ${c.name || "unknown card"}${link(c) ? ` · ${link(c)}${now}` : ""}`,
+      ...[["To GPU", c.to], ["From GPU", c.from]].map(([way, s]) =>
+        `${way} ${rate(s.moving)} MB/s (average ${rate(s.average)}, lowest ${rate(s.low)}, highest ${rate(s.high)})`),
+      c.source === "driver" ? "Read from the driver's PCIe counters" : c.source ? "Counted by the engine"
+        : "Nothing reads this card's traffic"].join("\n");
+  };
+  const links = cards.map((c) => link(c)).filter(Boolean);
+  setMetric("moved", mbS == null ? null : rate(mbS), "MB/s", new Set(links).size === 1 ? links[0] : links.join(" · "));
+  $("ms-moved").title = cards.map((c) => `${link(c) || "Link unknown"}: ${c.name || `GPU ${c.index}`}`).join("\n");
+  $("mv-moved").title = cards.length === 1 ? tip(cards[0]) : cards.length ? "Both ways, all cards together" : "";
+  $("mx-moved").innerHTML = cards.length > 1 ? cards.map((c) =>
+    `<div title="${esc(tip(c))}">${c.source && c.to.moving != null && c.from.moving != null
+      ? `${rate(c.to.moving + c.from.moving)} MB/s` : "–"}</div>`)
+    .join("") : "";
 }
 function setMetric(key, value, unit, sub) {
   $(`mv-${key}`).innerHTML = value == null ? "–" : `${esc(value)}${unit ? `<small>${esc(unit)}</small>` : ""}`;
@@ -557,11 +584,8 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   spark("sp-temp", h.gpu_temp, 90);
   setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W", hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : "");
   spark("sp-power", h.gpu_power, hw.gpu_power_limit);
-  const gen = hw.gpu_pcie_gen_max || hw.gpu_pcie_gen;
-  setMetric("pcie", gen ? `Gen${gen}` : null, hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` : "",
-            hw.gpu_pcie_rx_mb == null ? "" : `to GPU ${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s` +
-            (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : ""));
-  spark("sp-pcie", h.gpu_pcie_rx_mb);
+  showTransfers(hw.moved || [], hw.moved_mb_s);
+  spark("sp-moved", h.moved_mb_s);
   setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "");
   spark("sp-cpu", h.cpu, 100);
   if (hw.disk_read_mb == null) {

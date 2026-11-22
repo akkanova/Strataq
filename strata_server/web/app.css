@@ -101,6 +101,9 @@ main { flex: 1; min-height: 0; display: flex; }
 .st-metric__value small { font-size: var(--st-fs-md); font-weight: var(--st-fw-medium); color: var(--st-ink-muted); margin-left: 4px; }
 .st-metric__sub { font-size: var(--st-fs-xs); color: var(--st-ink-muted); font-variant-numeric: tabular-nums; min-height: 1em; }
 .st-metric__spark { display: block; overflow: visible; }
+.metric-row { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--st-s-3); }
+.metric-side { font-size: var(--st-fs-xs); color: var(--st-ink-muted); text-align: right;
+               font-variant-numeric: tabular-nums; }
 .speed-values { display: flex; justify-content: space-between; gap: var(--st-s-3); }
 .speed-values > div { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 .speed-values > div:last-child { text-align: right; }

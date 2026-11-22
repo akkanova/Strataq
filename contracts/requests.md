@@ -83,6 +83,24 @@ their admission and completion statistics into one DONE. Their `GEN`, `BGEN`,
 still finish an operation before servicing another command; this protocol does
 not make an old model implementation concurrent or add live settings support.
 
+## Live statistics
+
+The paged engine writes one untagged `STATS` line a second, unasked, from its
+own thread, so the lines keep coming during a long prompt chunk. The rest of
+the line is one JSON object:
+
+```text
+STATS {"seconds":12.004,"gpus":[{"id":"gpu0","to_gpu":81920,"from_gpu":4096}]}
+```
+
+`seconds` is the time since the engine became ready. Each of `gpus` is one card
+(`id` as in `GET_MEMORY_USE`). `to_gpu` and `from_gpu` are the bytes that moved
+from host memory to the card and back since the engine started: copies, and the card's reads
+and writes of host memory in place. They are totals, so the difference between
+two lines over the difference of their `seconds` is the rate, even when a line
+is late. Readers ignore keys they do not know, so that more statistics can be
+added.
+
 Python retains its old protocol client for installed engines that do not
 advertise `requests`. It never chooses that client for an updated engine.
 

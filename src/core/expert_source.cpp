@@ -14,6 +14,7 @@
 #include "strata/common/artifact/gguf_reader.hpp"
 
 #include "strata/base/gpu/pinned.hpp"
+#include "strata/base/gpu/traffic.hpp"
 #include "strata/base/platform/memory.hpp"
 #include "strata/common/kernels/elementwise.hpp"
 #include "strata/common/kernels/quantize_act.hpp"
@@ -4702,6 +4703,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);
         pt("fetch", fetches);
+        count_gpu_traffic(P.device, (uint64_t) fetches * bb, 0);   // every --pcie-mode moves the blobs over once
         if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
     } else {
         for (int64_t i = 0; i < n; ++i) {
@@ -4961,6 +4963,13 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         const int64_t e = ids[i];
         if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;
     }
+    // Logical payloads exclude doorbell polling and cache-line transactions in mapped memory.
+    const int64_t host_rows = dec_batch && !device_plan
+        ? std::count_if(kind, kind + n, [](int32_t v) { return v < 0 || v > 1; }) : n;
+    const bool published = std::any_of(kind, kind + n, [](int32_t v) { return v != 0; });
+    if (d.plan != nullptr)
+        count_gpu_traffic(d.plan->device, (uint64_t) host_rows * H * 4,
+                          published ? (uint64_t) n_tok * H * 4 : 0);
     d.multi_misses += njobs;
     ++d.layers;
     d.experts += n_tok * k;
