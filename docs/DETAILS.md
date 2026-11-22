@@ -1068,9 +1068,11 @@ its size just before it, the pool gives back chunks of that growth until the roo
 (`--vram-reserve-mib`) is free in dedicated memory. The Memory panel says how much fits in dedicated memory and asks
 whether to take the rest as shared memory; yes sends the same size with `shared_memory=on`. That growth first fills
 the reserve with temporary 16 MiB placeholders (rounded up, or as much as fits), so that its chunks leave that
-room alone, and gives the placeholders back when it ends. A size past what Windows' commit limit leaves room for
-is not refused: the pool grows as far as the limit allows, and the change says so ("Windows' commit limit has room for
-58.45 GiB of pool").
+room alone, and gives the placeholders back when it ends. A size past what the GPU has room for is not refused: the
+pool grows as far as it can, and the change says so ("the GPU has room for 58.45 GiB of pool"). A GPU pool's size
+does not weigh Windows' commit charge, though on the Strix Halo GPU allocations are charged to it (strata-q38 on
+the Strix Halo, 2026-11-22: free commit fell from 71.9 to 1.0 GiB while the engine took 43.8 GiB of dedicated memory,
+4.1 GiB of shared memory and a 4 GiB RAM pool); only the RAM pool is capped by free commit.
 A GPU's `largest` estimates the pool size that fits in dedicated memory, using the last measured edge (before that,
 the share's size), current use and the reserve. The panel shows a larger size in red but still sends it.
 `pool_shared` is the part of the pool in shared memory. Prompt buffers are lent below the first shared chunk.

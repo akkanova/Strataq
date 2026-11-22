@@ -249,8 +249,9 @@ std::string get_step_settings_problem(const strata::spec::StepSettings& s, int m
 /// Windows, for a GPU whose memory is the system RAM, what is free is an estimate of what its dedicated memory still
 /// takes (get_share_top less every program's bytes there now), not the runtime's free memory: that is the share and
 /// what the GPU may borrow beyond it, more slowly, and HIP takes page-locked host memory off it twice (on the Strix
-/// Halo, 8 GiB of hipHostMalloc took 16 GiB off it); with `past_dedicated`, the shared memory too, where only the
-/// commit charge bounds it.  Its memory counts in Windows' commit charge, so no more than get_commit_room either.
+/// Halo, 8 GiB of hipHostMalloc took 16 GiB off it); with `past_dedicated`, the runtime's free memory, shared memory
+/// included, so HIP's double counting can underestimate room in that case. GPU capacity is treated independently
+/// of Windows' commit charge, even on the Strix Halo where GPU allocations count toward it and can exhaust it.
 /// Cards on one GPU each see what is free of it.
 uint64_t get_gpu_room(int dev, uint64_t keep, bool past_dedicated = false);
 /// Gets the RAM a pool may take by default besides what the pools hold: what is available less `headroom`, and no more

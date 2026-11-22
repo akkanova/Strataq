@@ -23,7 +23,7 @@ namespace strata::qwen38 {
 /// --vram-reserve-mib (default kDefaultVramReserveMib) and what the start allocates after the pool, but no more than
 /// those experts and a conversation at --max-context take).  The RAM:
 /// `--ram-mib N`, the RAM's pool (default: what the RAM has free less the resident headroom, but no more than every
-/// expert takes, and like the GPU's default leaving a tenth of Windows' commit limit, at least 8 GiB, uncommitted;
+/// expert takes or Windows' free commit allows;
 /// `--resident-budget-gib N` stands for it);
 /// `--tokens-max N`, the tokens the conversations paused in RAM may hold (as many pages as one conversation of N
 /// takes; default --max-context); `--ssd-pause-mib N`, the SSD space paused conversations may take (default 8192);

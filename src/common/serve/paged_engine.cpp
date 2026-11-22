@@ -542,7 +542,7 @@ bool is_layer_cut(const std::vector<int64_t>& cut, int64_t n_layers) {
     return true;
 }
 
-/// Gets Windows' remaining allocation capacity, without an automatic reserve.
+/// Gets Windows' remaining allocation capacity for get_ram_room, without an automatic reserve.
 uint64_t get_commit_room() {
     strata::core::detail::HostMemory hm;
     return strata::core::detail::host_available_memory(hm) ? hm.commit : UINT64_MAX;
@@ -574,10 +574,8 @@ std::string get_step_settings_problem(const strata::spec::StepSettings& s, int m
 
 uint64_t get_gpu_room(int dev, uint64_t keep, bool past_dedicated) {
     const strata::core::OnDevice on(dev);
-    const std::optional<uint64_t> dedicated = get_dedicated_room(dev);
-    const uint64_t free_b = !dedicated     ? strata::core::device_free_bytes()
-                            : past_dedicated ? get_commit_room()
-                                             : std::min(*dedicated, get_commit_room());
+    const std::optional<uint64_t> dedicated = past_dedicated ? std::nullopt : get_dedicated_room(dev);
+    const uint64_t free_b = dedicated ? *dedicated : strata::core::device_free_bytes();
     return free_b > keep ? free_b - keep : 0;
 }
 
@@ -2458,8 +2456,6 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
             return "the biggest active conversation and the token minimum need " + gib(smallest) + "; the pool of " +
                    card.id + " would keep " + gib(asked);
     }
-    // (each range takes all of get_commit_room: on the Strix Halo, where the GPU's memory is commit too, one change
-    // that grows both pools must share the remaining commit capacity)
     if (ram_bytes && (*ram_bytes < get_smallest_ram() || *ram_bytes > get_largest_ram()))
         return "the RAM's pool may be " + gib(get_smallest_ram()) + " to " + gib(get_largest_ram()) + ", not " +
                gib(*ram_bytes);
@@ -2475,8 +2471,7 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
             gpu_bytes[card.index] && asked > largest) {
             gpu_bytes[card.index] = largest;
             note(("the pool of " + card.id + ": ").c_str(),
-                 std::string(get_share_top(card.dev) ? "Windows' commit limit" : "the GPU") + " has room for " +
-                     gib(largest) + " of pool, not " + gib(asked));
+                 "the GPU has room for " + gib(largest) + " of pool, not " + gib(asked));
         }
     }
     (void) trim_gpu_conversations((int) s.vram_conversations);
