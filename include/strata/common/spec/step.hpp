@@ -21,7 +21,6 @@ struct StepSettings {
     int rows = 8;         ///< the most rows each group computes; at least its active conversation count
     int lookahead = 0;    ///< the most guesses one conversation may add to a step; 0 turns drafting off
     int model_lookahead = -1; ///< --mtp-max-t minus one; negative leaves the model draft width uncapped.
-    int max_draft_conversations = 0; ///< Above this count guesses are suppressed; 0 imposes no limit.
     int groups = 1;       ///< The pipeline groups selected from live concurrency; 1 keeps the serial path.
 };
 
@@ -40,10 +39,9 @@ struct StepRow {
     int parent = -1;   ///< the row whose token this one follows; -1: the conversation's last kept token
 };
 
-/// Selects confidence floors and the model's capacity restrictions for the shared step.
+/// Selects confidence floors and the model's drafting restrictions for the shared step.
 struct DraftLimits {
     float confidence = 0.0f, cumulative = 0.0f;
-    int max_conversations = 0; ///< Zero imposes no limit on simultaneous drafting.
     bool cool_after_rejection = false; ///< Allows a plain step after the whole model proposal failed its cut.
 };
 
@@ -178,8 +176,7 @@ private:
         std::vector<size_t> start;
     };
     /// Builds a group's windows before any pipeline work starts; -1 uses the serial rotation.
-    /// wave_conversations includes peers whose windows belong to other groups.
-    void prepare(const std::vector<Decoding*>& active, Work& work, int group = -1, int wave_conversations = 0);
+    void prepare(const std::vector<Decoding*>& active, Work& work, int group = -1);
     /// Applies the model's picks after its stages have drained.
     bool complete(Work& work, int group, double ms, std::string& err);
     /// Gets how many of the `n` rows of `d` (its token, then its guesses) from `picks` it keeps, and sets its

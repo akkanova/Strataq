@@ -622,8 +622,9 @@ three-slot startup hit the commit watchdog; the completed main solo matrix retai
 ### Suffix drafting in the page-pool engines (2026-11-03)
 
 Both engines reuse `common/spec/WindowPlanner`: source choice, measured costs, MTP keep/stop and lookup chaining.
-`Step` shares rows, applies individual and cumulative confidence cuts, schedules cooldown, and suppresses guesses
-when the model's declared conversation capacity is exceeded (DeepSeek without DSpark: one; with it: the row budget).
+`Step` shares rows, applies individual and cumulative confidence cuts, and schedules cooldown; rows
+per step and conversations at once decide how many guesses there are (DeepSeek without DSpark guessed for one
+conversation only until 2026-11-22).
 Model adapters run their drafter networks and maintain rings/K/V; they return raw tokens and confidences.
 `ConfidenceCut` also backs D7's
 `Model::count_confident` wrapper, so the old DeepSeek round and both new engines share the same cuts.

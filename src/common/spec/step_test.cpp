@@ -194,34 +194,6 @@ int main() {
         check(a.guessed == 5 && b.guessed == 5 && c.guessed == 5 && d.guessed == 5,
               "equal-priority conversations rotate the extra row within every group");
     }
-    {
-        FakeModel fm;
-        fm.right = 3;
-        auto hooks = fm.hooks();
-        fm.add_drafter(hooks);
-        hooks.run_groups = [](std::vector<StepGroup>& groups, std::string&) {
-            for (auto& group : groups) {
-                check(group.rows.size() == 1, "single-conversation drafter stays paused across groups");
-                group.picks = {group.rows[0].token + 1};
-            }
-            return true;
-        };
-        hooks.keep_group = [](int, const std::vector<StepRow>&, const std::vector<int>&, std::string&) {
-            return true;
-        };
-        Step step(hooks, {});
-        step.settings = {2, 8, 3};
-        step.settings.groups = 2;
-        step.settings.max_draft_conversations = 1;
-        auto a = conversation(0, 10, 0, 32), b = conversation(1, 20, 0, 32);
-        std::string err;
-        check(step.run({&a, &b}, err) && fm.asked == std::vector<int>{0, 0},
-              "model draft limits count conversations across the whole wave");
-        fm.asked.clear();
-        auto c = conversation(2, 30, 0, 32);
-        check(step.run({&c}, err) && fm.asked == std::vector<int>{3} && c.emitted.size() == 4,
-              "single-conversation drafting resumes after a grouped wave");
-    }
     {   // the plan's table: 3 conversations at once, 8 rows
         StepSettings s{3, 8, 8};
         check(share_guess_rows(s, 3, 3, 0) == std::vector<int>{2, 2, 1}, "3 active: 2, 2, 1");
@@ -350,13 +322,6 @@ int main() {
                   b.emitted == std::vector<int32_t>({33, 34, 35}), "independent lookup windows");
         check(a.suffix_offered == 2 && a.suffix_kept == 2 && a.planner->sfx.history().back() == 15,
               "lookup counts and history include only accepted tokens");
-        a = conversation(0, 12, 8, 20);
-        a.produced = 1;
-        a.planner = std::make_unique<WindowPlanner>(8, 8, 3, 0, 3, 64);
-        a.planner->sfx.append(ah.data(), ah.size());
-        step.settings.max_draft_conversations = 1;
-        check(step.run({&a, &b}, err) && a.emitted.size() == 1 && a.suffix_offered == 0,
-              "multiple conversations suppress lookup where configured");
         Decoding first = conversation(0, 12, 8, 20);
         first.planner = std::make_unique<WindowPlanner>(8, 8, 3, 0, 3, 64);
         first.planner->sfx.append(ah.data(), ah.size());
@@ -492,7 +457,7 @@ int main() {
                 a.push_back(conversation(i, 100 + i * 20, 10 + i, 100));
                 b.push_back(conversation(i, 100 + i * 20, 10 + i, 100));
             }
-            a[0].draft_limits = b[0].draft_limits = {0.99f, 0, 0, true};
+            a[0].draft_limits = b[0].draft_limits = {0.99f, 0, true};
             std::vector<Decoding*> pa, pb;
             for (int i = 0; i < count; ++i) {
                 pa.push_back(&a[(size_t) i]);

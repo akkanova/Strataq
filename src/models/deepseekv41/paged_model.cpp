@@ -725,7 +725,6 @@ PagedDeepSeek::PagedDeepSeek(Model& m, const Options& o, const ProgramOptions& x
     }
     facts.draft_limits.confidence = o.dspark_conf;
     facts.draft_limits.cumulative = m.get_default_cum();
-    facts.draft_limits.max_conversations = facts.has_drafter ? 0 : 1;
     facts.draft_limits.cool_after_rejection = true;
     facts.gpu_experts = x.gpu_experts;
     facts.adapt_every = x.adapt_every;

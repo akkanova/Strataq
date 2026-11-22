@@ -2905,7 +2905,6 @@ void PagedEngine::apply_settings() {
             --groups;
     }
     step_.settings.groups = stages > 1 && groups > 1 && concurrent % groups == 0 ? groups : 1;
-    step_.settings.max_draft_conversations = facts_.draft_limits.max_conversations;
     if (!is_model_drafting() && settings_.suffix_draft == 0 && settings_.lookup_chain == 0)
         step_.settings.lookahead = 0;
     draft_limits_ = facts_.draft_limits;
