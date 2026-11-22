@@ -74,6 +74,7 @@ const SETTINGS = {context: "Per-conversation token limit", concurrent: "Conversa
                   lookahead: "Max lookahead", tokens_min: "Min conversation tokens",
                   tokens_max: "Max conversation tokens", ssd_pause_mib: "SSD for paused conversations (MiB)",
                   drafter: "Drafter", save_on_shutdown: "Save conversations on shutdown",
+                  step_profile: "Log each step's timing",
                   vram_reserve_mib: "VRAM kept free for other programs (MiB)",
                   slots: "Maximum conversations at once", batch_groups: "Batch groups (0: auto)",
                   route_tail_skip: "Skip rarely routed missing experts from rank (0: off)",
@@ -82,7 +83,7 @@ const SETTINGS = {context: "Per-conversation token limit", concurrent: "Conversa
                   expert_half_life: "Expert popularity half-life (steps, 0: never)",
                   copy_back: "Experts the GPU evicts"};
 /** The settings that are switches: the engine reports them as 1 or 0 and takes "on" or "off". */
-const SWITCHES = ["drafter", "save_on_shutdown"];
+const SWITCHES = ["drafter", "save_on_shutdown", "step_profile"];
 /** Defines the Memory panel's prediction modes. Suffix guesses may replace model guesses; chained guesses follow
  * them. A null label uses the mode's own words instead of extending the model drafter's label.
  * @type {[choice: string, use: {model: boolean, suffix: boolean, chain: boolean}, label: string | null][]} */
@@ -470,11 +471,10 @@ function drawControls(panel) {
           `<option value="${i}"${Number(s[key]) === i ? " selected" : ""}>${esc(WORD_LABELS[key][i])}</option>`)
           .join("") + "</select></label>");
     }
-  if (s.save_on_shutdown != null) {
-    const help = esc(getControlHelp("save_on_shutdown", s));
-    fields.push(`<label class="mem-switch" data-control="save_on_shutdown" title="${help}"><input type="checkbox" ` +
-      `data-setting="save_on_shutdown"${s.save_on_shutdown ? " checked" : ""}${off}> ` +
-      `${esc(SETTINGS.save_on_shutdown)}</label>`);
+  for (const key of SWITCHES.filter((k) => k !== "drafter" && s[k] != null)) {
+    const help = esc(getControlHelp(key, s));
+    fields.push(`<label class="mem-switch" data-control="${key}" title="${help}"><input type="checkbox" ` +
+      `data-setting="${key}"${s[key] ? " checked" : ""}${off}> ${esc(SETTINGS[key])}</label>`);
   }
   return `<div class="mem-controls">${fields.join("")}</div><div class="mem-actions">` +
     `<button type="button" data-apply="session"${off}>Apply settings</button> ` +
@@ -549,6 +549,9 @@ function getControlHelp(key, settings, details = {}) {
   if (key === "conversation_idle_seconds")
     return "Idle GPU conversations this old may move to RAM or SSD when experts or another conversation need space. " +
       "Prompt-processing and decoding requests are protected; age alone does not evict anything.";
+  if (key === "step_profile")
+    return "Writes a line to the model's log after each decode step, with host elapsed times for drafting guesses, " +
+      "running the model, keeping the accepted tokens and moving experts. These are not GPU kernel timings.";
   if (key === "save_on_shutdown")
     return "When the model stops, conversations in VRAM and RAM are written to the SSD, the most recent first, " +
       `up to the SSD allowance (${fmt(settings.ssd_pause_mib ?? 0)} MiB), and the next start picks them up. ` +

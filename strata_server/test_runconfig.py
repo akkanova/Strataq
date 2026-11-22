@@ -64,6 +64,11 @@ class Apply(unittest.TestCase):
             with self.assertRaises(ValueError):
                 runconfig.check_live(bad, True)
 
+    def test_step_profile_is_a_switch_saved_as_on_or_off(self):
+        new, changed = runconfig.apply_live({"args": ["--step-profile", "1"]},
+                                            runconfig.check_live({"step_profile": False}, True))
+        self.assertEqual((new["args"], changed), (["--step-profile", "off"], ["step_profile"]))
+
     def test_saving_conversations_on_shutdown_is_a_switch_saved_as_on_or_off(self):
         values = runconfig.check_live({"save_on_shutdown": True}, True)
         new, changed = runconfig.apply_live({"args": []}, values)

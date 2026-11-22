@@ -22,7 +22,7 @@ def translate_args(cfg: dict, args: list[str]) -> list[str]:
         route-tail-skip draft-confidence-pct draft-cumulative-pct
         tokens-min tokens-max conversation-tokens vram-conversations gpu-mib ram-mib ssd-pause-mib
         rows lookahead concurrent pause-dir copy-back conversation-idle-seconds decode-share-percent prompt-turn-ms
-        drafter remote-experts save-on-shutdown
+        drafter remote-experts save-on-shutdown step-profile
         suffix-draft mtp-max-t
         lookup-chain lookup-chain-min""".split())
     model = set(("""vision eos gpus reserve-mib cpu-threads dspark dspark-conf experts dspark-block prefill-chunk threads"""

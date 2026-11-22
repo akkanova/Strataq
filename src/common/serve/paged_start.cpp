@@ -90,7 +90,7 @@ int take_paged_options(int& argc, char** argv, const std::string& program, Paged
     };
     int64_t rows = s.step.rows, lookahead = -1, concurrent = -1, mtp_rows = 0;   // -1: chosen after parsing
     int64_t half_life = -1;   // -1: --expert-popularity-decay's
-    std::string drafter = "on", save_on_shutdown = "off", gpu_mib, popularity_decay;
+    std::string drafter = "on", save_on_shutdown = "off", step_profile = "off", gpu_mib, popularity_decay;
     std::string batch_groups = std::to_string(s.batch_groups);
     const Own own[] = {{"--tokens-min", &s.tokens_min},       {"--tokens-max", &s.tokens_max},
                        {"--conversation-tokens", &s.conversation_context},
@@ -112,7 +112,7 @@ int take_paged_options(int& argc, char** argv, const std::string& program, Paged
                        {"--expert-half-life", &half_life},    {"--route-tail-skip", &s.route_tail_skip},
                        {"--draft-confidence-pct", &s.draft_confidence_pct},
                        {"--draft-cumulative-pct", &s.draft_cumulative_pct},
-                       {"--step-profile", &s.step_profile}};
+                       {"--step-profile", nullptr, &step_profile}};
     const char* const name = program.c_str();
     int out = 1;
     for (int i = 1; i < argc; ++i) {
@@ -132,10 +132,8 @@ int take_paged_options(int& argc, char** argv, const std::string& program, Paged
             *o->value = std::atoll(argv[++i]);
     }
     argc = out;
-    if (s.step_profile != 0 && s.step_profile != 1) {
-        std::fprintf(stderr, "%s: --step-profile takes 0 or 1\n", name);
-        return 2;
-    }
+    if (step_profile == "0" || step_profile == "1")
+        step_profile = step_profile == "1" ? "on" : "off";
     if (s.vram_reserve_mib < 0 || s.vram_reserve_mib > INT32_MAX) {
         std::fprintf(stderr, "%s: --vram-reserve-mib takes MiB from 0 to %d\n", name, INT32_MAX);
         return 2;
@@ -145,6 +143,7 @@ int take_paged_options(int& argc, char** argv, const std::string& program, Paged
     s.step.concurrent = (int) std::clamp<int64_t>(concurrent, -1, INT32_MAX);   // -1: --batch, set once it is read
     s.drafter = drafter == "on";
     s.save_on_shutdown = save_on_shutdown == "on";
+    s.step_profile = step_profile == "on";
     s.step.model_lookahead = mtp_rows > 0 ? (int) std::min<int64_t>(mtp_rows - 1, 7) : -1;
     s.suffix_draft = std::clamp<int64_t>(s.suffix_draft, 0, INT32_MAX);
     s.decode_share_percent = std::clamp<int64_t>(s.decode_share_percent, 0, INT32_MAX);
@@ -187,7 +186,8 @@ int take_paged_options(int& argc, char** argv, const std::string& program, Paged
         std::fprintf(stderr, "%s: --remote-experts takes auto, on or off\n", name);
         return 2;
     }
-    for (const auto& [flag, word] : {std::pair{"--drafter", &drafter}, {"--save-on-shutdown", &save_on_shutdown}})
+    for (const auto& [flag, word] : {std::pair{"--drafter", &drafter}, {"--save-on-shutdown", &save_on_shutdown},
+                                     {"--step-profile", &step_profile}})
         if (*word != "on" && *word != "off") {
             std::fprintf(stderr, "%s: %s takes on or off\n", name, flag);
             return 2;

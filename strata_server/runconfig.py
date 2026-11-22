@@ -56,9 +56,10 @@ LIVE_FLAGS = {"memory_mib.gpu0": "--gpu-mib", "memory_mib.ram": "--ram-mib", "to
               "save_on_shutdown": "--save-on-shutdown", "vram_reserve_mib": "--vram-reserve-mib",
               "batch_groups": "--batch-groups", "route_tail_skip": "--route-tail-skip",
               "draft_confidence_pct": "--draft-confidence-pct", "draft_cumulative_pct": "--draft-cumulative-pct",
-              "expert_half_life": "--expert-half-life", "copy_back": "--copy-back"}
+              "expert_half_life": "--expert-half-life", "copy_back": "--copy-back",
+              "step_profile": "--step-profile"}
 # The live settings that are switches: CHANGE_SETTINGS and the run config spell them "on" or "off".
-_LIVE_SWITCHES = ("drafter", "save_on_shutdown", "shared_memory")
+_LIVE_SWITCHES = ("drafter", "save_on_shutdown", "shared_memory", "step_profile")
 # The live settings that take one of a few words, with those words.
 _LIVE_WORDS = {"copy_back": ("auto", "on", "off")}
 # The switches that hold for the one change they come with, so have no default: shared_memory=on lets that change's

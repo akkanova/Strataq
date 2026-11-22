@@ -1436,7 +1436,7 @@ bool PagedEngine::decode_step() {
         finish_request(*h, d.finish);
     }
     strata::core::progress_beat();
-    const bool ok = time_step_if(settings_.step_profile != 0, pages_ms_,
+    const bool ok = time_step_if(settings_.step_profile, pages_ms_,
         [&] { return adapt_experts() && (!filling_since_ || fill_experts()); });
     if (settings_.step_profile)
         say("step-profile rows=%d draft=%.3f verify=%.3f commit=%.3f pages=%.3f total=%.3f ms\n",
@@ -2310,6 +2310,7 @@ strata::serve::MemoryReport PagedEngine::describe_memory() const {
                                                        {"pipeline_stages", model_.get_pipeline_stages()}});
     report.settings.emplace_back("drafter", settings_.drafter && facts_.has_drafter ? 1 : 0);
     report.settings.emplace_back("save_on_shutdown", settings_.save_on_shutdown ? 1 : 0);
+    report.settings.emplace_back("step_profile", settings_.step_profile ? 1 : 0);
     report.settings.emplace_back("suffix_draft", settings_.suffix_draft);
     report.settings.emplace_back("lookup_chain", settings_.lookup_chain);
     if (const int rank = model_.get_route_tail_skip(); rank >= 0)
@@ -2356,10 +2357,13 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
             s.copy_back = text;
             continue;
         }
-        if (name == "drafter" || name == "save_on_shutdown" || name == "shared_memory") {
+        if (name == "drafter" || name == "save_on_shutdown" || name == "shared_memory" || name == "step_profile") {
             if (text != "on" && text != "off")
                 return name + " takes on or off, not " + text;
-            (name == "drafter" ? s.drafter : name == "shared_memory" ? shared_ok : s.save_on_shutdown) = text == "on";
+            (name == "drafter"         ? s.drafter
+             : name == "shared_memory" ? shared_ok
+             : name == "step_profile"  ? s.step_profile
+                                       : s.save_on_shutdown) = text == "on";
             continue;
         }
         char* end = nullptr;
@@ -2481,6 +2485,7 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
     settings_.decode_share_percent = s.decode_share_percent;
     settings_.prompt_turn_ms = s.prompt_turn_ms;
     settings_.save_on_shutdown = s.save_on_shutdown;
+    settings_.step_profile = s.step_profile;
     settings_.vram_reserve_mib = s.vram_reserve_mib;
     settings_.copy_back = s.copy_back;
     settings_.popularity_decay = s.popularity_decay;
@@ -2955,7 +2960,7 @@ strata::spec::StepModel PagedEngine::get_step_model() {
     model.begin = [this](int count) { model_.begin_step(count); };
     model.make_room = [this](int session, int64_t tokens) {
         std::string err;
-        if (time_step_if(settings_.step_profile != 0, pages_ms_,
+        if (time_step_if(settings_.step_profile, pages_ms_,
                          [&] { return make_room(*held_[(size_t) session], tokens, err); }))
             return true;
         say("%s\n", err.c_str());
@@ -2969,7 +2974,7 @@ strata::spec::StepModel PagedEngine::get_step_model() {
         for (const auto& row : rows)
             histories.push_back(&held_[(size_t) row.session]->live);
         model_.set_step_histories(histories);
-        return time_step_if(settings_.step_profile != 0, verify_ms_,
+        return time_step_if(settings_.step_profile, verify_ms_,
                             [&] { return model_.run_rows(rows, picks, err); });
     };
     if (model_.get_pipeline_stages() > 1) {
@@ -2998,7 +3003,7 @@ strata::spec::StepModel PagedEngine::get_step_model() {
             // No admission, page trade, restore or settings command runs until this wave has drained.
             int peak = 0;
             stages.peak_in_flight = &peak;
-            const bool ok = time_step_if(settings_.step_profile != 0, verify_ms_,
+            const bool ok = time_step_if(settings_.step_profile, verify_ms_,
                 [&] { return strata::spec::run_stage_groups(std::move(stages), groups, err); });
             if (peak > pipeline_peak_) {
                 pipeline_peak_ = peak;
@@ -3009,13 +3014,13 @@ strata::spec::StepModel PagedEngine::get_step_model() {
         };
         model.keep_group = [this](int group, const std::vector<strata::spec::StepRow>& rows,
                                   const std::vector<int>& kept, std::string& err) {
-            return time_step_if(settings_.step_profile != 0, commit_ms_,
+            return time_step_if(settings_.step_profile, commit_ms_,
                 [&] { return model_.keep_group(group, rows, kept, is_model_drafting(), err); });
         };
     }
     model.keep = [this](const std::vector<strata::spec::StepRow>& rows, const std::vector<int>& kept,
                         std::string& err) {
-        return time_step_if(settings_.step_profile != 0, commit_ms_,
+        return time_step_if(settings_.step_profile, commit_ms_,
             [&] { return model_.keep_rows(rows, kept, is_model_drafting(), err); });
     };
     if (facts_.has_drafter)
@@ -3025,10 +3030,10 @@ strata::spec::StepModel PagedEngine::get_step_model() {
                 return 0;
             Held& h = *held_[(size_t) session];
             std::string err;
-            if (n > 0 && !time_step_if(settings_.step_profile != 0, pages_ms_,
+            if (n > 0 && !time_step_if(settings_.step_profile, pages_ms_,
                                       [&] { return make_room(h, pos + 1 + n, err); }))
                 n = 0;
-            const int got = time_step_if(settings_.step_profile != 0, draft_ms_,
+            const int got = time_step_if(settings_.step_profile, draft_ms_,
                 [&] { return model_.propose(*h.parts.back(), session, token, pos, n, out, err, draft); });
             if (got >= 0)
                 return got;
@@ -3042,11 +3047,11 @@ strata::spec::StepModel PagedEngine::get_step_model() {
             std::string err;
             for (auto& request : requests) {
                 Held& h = *held_[(size_t) request.session];
-                if (request.limit > 0 && !time_step_if(settings_.step_profile != 0, pages_ms_,
+                if (request.limit > 0 && !time_step_if(settings_.step_profile, pages_ms_,
                         [&] { return make_room(h, request.pos + 1 + request.limit, err); }))
                     request.limit = 0;
             }
-            if (!time_step_if(settings_.step_profile != 0, draft_ms_,
+            if (!time_step_if(settings_.step_profile, draft_ms_,
                               [&] { return model_.propose_batch(requests, err); })) {
                 for (auto& request : requests)
                     request.count = 0;

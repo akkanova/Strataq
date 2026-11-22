@@ -728,6 +728,17 @@ test('saving conversations on shutdown is a checkbox sent as a switch', async ()
   assert.deepEqual(calls, [[{save_on_shutdown: true}, 'session']]);
 });
 
+test('the step timing log is a checkbox sent as a switch', async () => {
+  const view = {...live, settings: {...live.settings, step_profile: 1}};
+  const {calls, onChange} = recorder(), {element, fire} = mount(view, onChange);
+  assert.match(element.innerHTML, /type="checkbox" data-setting="step_profile" checked> Log each step's timing/);
+  fire('change', {target: control('[data-setting]', {dataset: {setting: 'step_profile'}, type: 'checkbox',
+    checked: false})});
+  apply(fire);
+  await settle();
+  assert.deepEqual(calls, [[{step_profile: false}, 'session']]);
+});
+
 test('pending edits survive polling and a live memory resize', async () => {
   const {calls, onChange} = recorder({ok: true, view: live});
   const {element, fire} = mount(live, onChange);

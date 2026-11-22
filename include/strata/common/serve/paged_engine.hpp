@@ -131,7 +131,9 @@ struct PagedSettings {
     /// SSD (by request priority, then the most recently used, up to --ssd-pause-mib) and stay there for the next
     /// start to adopt.
     bool save_on_shutdown = false;
-    int64_t step_profile = 0; ///< --step-profile 1 reports host elapsed times for each decode step.
+    /// --step-profile on|off (also 1|0; live: step_profile): says on stderr how long each decode step's host work
+    /// took, by part.
+    bool step_profile = false;
     strata::spec::StepSettings step;               ///< --rows, --lookahead and --concurrent (default --batch)
 
     /// Gets vram_reserve_mib in bytes.
