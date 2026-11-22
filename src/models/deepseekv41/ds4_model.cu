@@ -47,6 +47,7 @@
 #endif
 #include "strata/models/deepseekv41/exl3_cpu.hpp"
 #include "strata/models/deepseekv41/exl3.hpp"
+#include "strata/common/experts/expert_swaps.hpp"
 #include "strata/common/kernels/f16_bits.hpp"
 #include "strata/models/deepseekv41/moe_win.hpp"
 #include "strata/models/deepseekv41/sampler.hpp"
@@ -1369,7 +1370,7 @@ struct Model::Impl {
     // the RAM store (--ssd-cache): the CPU lane's experts in slots a policy owns, read unbuffered (null: off)
     std::unique_ptr<ExpertStore> store;
     // (Options::expert_pages) the blobs of the experts the CPU lane computes now, by expert, from the RAM's pool
-    // (cpu_experts_paged); and each expert's routings in windows ([layer][expert], count_usage; empty: not counted)
+    // (cpu_experts_paged); and each expert's routings ([layer][expert], count_usage; empty: not counted)
     std::vector<const uint8_t*> held;
     std::vector<float> usage;
     uint8_t* zc_stage_buf = nullptr;   // device: k staging slots for the store's experts of a decode token
@@ -9722,10 +9723,10 @@ struct Model::Impl {
             b.clear();
         }
     }
-    // (Options::expert_pages) a routing of layer l's expert e in a window, for the paged engine's adaptive tier
-    void count_usage(const Layer& l, int e) {
+    // Adds weighted routings to the paged engine's adaptive counts, excluding MTP layers.
+    void count_usage(const Layer& l, int e, float n = 1.0f) {
         if (!usage.empty() && !l.mtp)
-            usage[(size_t) l.il * g.n_exp + e] += 1.0f;
+            usage[(size_t) l.il * g.n_exp + e] += n;
     }
     // an expert the CPU lane reads from the files (neither in VRAM nor in the RAM tier)
     static bool file_read(const Layer& l, int e) {
@@ -12445,6 +12446,11 @@ struct Model::Impl {
         if (mi == 0) {   // the profile (the CPU lane's experts: by the plan's order)
             uint32_t* pr = prof.data() + (size_t) l.il * g.n_exp;
             int n_picked = 0;
+            // Swaps stay within a layer, so fully resident layers need no prompt counts.
+            const bool lacking = !usage.empty() && !l.mtp &&
+                                 std::any_of(l.slot.begin(), l.slot.end(), [](int s) { return s < 0; });
+            const float per = strata::core::get_prompt_routing_weight(strata::core::kPromptRoutings, l.k_exp,
+                                                                      (int64_t) T * l.k_exp);
             for (int e = 0; e < l.n_exp; ++e) {
                 const int v = L0.vs_pin[e];
                 const int cnt = b[(size_t) v + 1] - b[(size_t) v];
@@ -12453,6 +12459,8 @@ struct Model::Impl {
                     ++n_picked;
                     l.heat[(size_t) e] += (float) cnt;
                     if (l.slot[(size_t) e] < 0) l.cpu_hits.push_back(e);
+                    if (lacking)
+                        count_usage(l, e, per * (float) cnt);
                 }
             }
             static const bool ustat = std::getenv("DS4_UNPICKED_STAT") != nullptr;
