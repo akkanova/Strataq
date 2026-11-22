@@ -20,7 +20,8 @@ int main() {
         check(get_primary_option(alias.primary) == alias.primary, "a primary is not renamed (no chains)",
               alias.primary);
     }
-    for (const char* name : {"--gpu", "--gpus", "--prefill-chunk", "--parallel", "--reserve"})
+    check(std::strcmp(get_primary_option("--native"), "--model") == 0, "the model file's old name", "--native");
+    for (const char* name : {"--gpu", "--gpus", "--prefill-chunk", "--parallel", "--reserve", "--native-dense-gguf", "--native-something"})
         check(get_primary_option(name) == name, "a name outside the table is kept", name);
     return failures == 0 ? 0 : 1;
 }

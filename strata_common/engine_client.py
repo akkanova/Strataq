@@ -577,10 +577,10 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
     into RAM and locks part of it for the GPU, and on many PCs everything is slow or frozen for a minute or more -
     people closed the window thinking it had hung.  The warning comes at that step, not after it."""
     gb = 0.0
-    if "--native" in args:                              # about the size of the experts it will read
+    if model := user_args.find_model_file(args):        # about the size of the experts it will read
         try:
-            gb = os.path.getsize(args[args.index("--native") + 1]) / 1e9
-        except (OSError, IndexError):
+            gb = os.path.getsize(model) / 1e9
+        except OSError:
             pass
     size = f"about {gb:.0f} GB" if gb >= 1 else "tens of GB"
     loading = experts_loading_words(args, size)
@@ -875,8 +875,7 @@ class StrataEngine:
         # the all-cards split engine (sFNX, strata-split-N[-arch]): its GEN parser accepts fewer keys than Strata's engine (tests/split/test_split_gen_keys.py pins them)
         self.split_engine = os.path.basename(str(exe)).startswith("strata-split")
         self.session_save_reclaim = '--session-save-reclaim' in args
-        paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
-        self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
+        self.model_path = user_args.find_model_file(args) or dict(zip(args, args[1:])).get("--pack", "pack/full")
         # The engine excludes a temporary effort turn from its reusable history boundary.
         self._tail_role_token = int(args[args.index("--tail-role-token") + 1]) if "--tail-role-token" in args else -1
         self.log_path = log

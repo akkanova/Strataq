@@ -21,6 +21,7 @@ from strata_common.profiles import read_run_config
 PATH_FLAGS = {
     "--pack": "directory",
     "--native": "file",
+    "--model": "file",
     "--ple-gguf": "file",
     "--expert-profile": "file",
     "--mtp": "directory",

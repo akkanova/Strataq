@@ -34,6 +34,8 @@ import dataclasses
 import pathlib
 import re
 
+from strata_common import user_args
+
 # What has been run with the host exchange, per make: {make: {architecture: card counts}}.  NVIDIA: 2x RTX A6000 (boston, sm_86), 2x RTX PRO 6000 (srv118, sm_120).
 # AMD: 4x Radeon AI PRO R9700 (r9700, gfx1201; phaseA-tests/sfnx/RESULTS-HIP.md): 4 cards with UD-Q4_K_XL, 3 cards with the IQ3_S set, 2 cards with the IQ3_S set at 8K context and 2 slots only
 # (the memory rule below refuses that by its estimate; the counts here say the engine has run on them).
@@ -532,7 +534,7 @@ def _apply(cfg: dict, *, exe_for_cards, system, allow_untested, probe, ram, scan
 
     system = system or ("linux" if sys.platform.startswith("linux") else sys.platform)
     args = [str(a) for a in cfg.get("args") or []]
-    native = _flag(args, "--native")
+    native = user_args.find_model_file(args)
     if not native:
         return Decision(False, ["this model is not a single GGUF file set"])
     # choices the split engine does not honour: the normal layer split keeps them

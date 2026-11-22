@@ -16,6 +16,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / 'tools')]
 from conversation_cache_parity import STATE_KEYS, engine_args, require, state_hashes
 from strata_tokenizer import load_folder
 from strata_common.gguf_reader import GGUFFile
+from strata_common.user_args import find_model_file
 from gguf_writer import GGUFWriter
 from strata_common.engine_client import StrataEngine, child_env
 from strata_server.frontend import ChatTemplate
@@ -82,7 +83,7 @@ def main():
         print(f'Dry run: {args.scenario} isolation; no model loaded or files created.')
         return
     cfg = json.loads(args.config.read_text(encoding='utf-8'))
-    native = cfg['args'][cfg['args'].index('--native') + 1]
+    native = find_model_file(cfg['args'])
     geometry = GGUFFile(native).metadata
     width = geometry['qwen4exp.embedding_length']
     require(geometry['qwen4exp.block_count'] > 20, 'fixture requires layers 1 and 20')

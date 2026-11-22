@@ -1,7 +1,7 @@
 """Adapts saved server settings for the opt-in page-pool engines."""
 from pathlib import Path
 
-from . import draft_layer
+from . import draft_layer, user_args
 
 
 def is_paged_engine(cfg: dict) -> bool:
@@ -12,6 +12,8 @@ def is_paged_engine(cfg: dict) -> bool:
 def translate_args(cfg: dict, args: list[str]) -> list[str]:
     """Keeps supported options and reports settings with no page-pool equivalent."""
     deepseek = get_engine_name(cfg) == "strata-ds41"
+    if not deepseek:
+        args = user_args.flat(user_args.groups(args))
     model_off = cfg.get("mtp") is False or cfg.get("drafting") == "off"
     if model_off:
         args, _ = draft_layer.strip(args)
@@ -33,7 +35,7 @@ def translate_args(cfg: dict, args: list[str]) -> list[str]:
     # Installed engines may predate shared option names, so emit each family's original spelling.
     aliases = {"--slots": "--batch"}
     aliases.update({"--gpu": "--gpus", "--vram-reserve-mib": "--reserve-mib", "--eos-ids": "--eos"} if deepseek else
-                   {"--gpus": "--gpu", "--resident-budget-gib": "--ram-mib",
+                   {"--gpus": "--gpu", "--resident-budget-gib": "--ram-mib", "--model": "--native",
                     "--reserve-mib": "--vram-reserve-mib", "--eos": "--eos-ids"})
     supported = common | model | switches
     out, omitted = [], []

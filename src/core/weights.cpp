@@ -310,7 +310,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
             continue;
         if (r.code_bits != 0 && r.dst_bytes == 0) {
             // plan v0.3 P6: a native pack's row that carries a shape only - the GGUF form must serve it
-            err = r.name + ": this pack holds the tensor only in its GGUF form (run with --native SHARD1)";
+            err = r.name + ": this pack holds the tensor only in its GGUF form (run with --model SHARD1)";
             return false;
         }
         if (r.file != cur_file) {

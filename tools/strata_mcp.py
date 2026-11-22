@@ -622,7 +622,7 @@ class Strata:
                 "last_used": time.strftime("%Y-%m-%d %H:%M", time.localtime(path.stat().st_mtime))}
 
     # ---- what a model owns on disk (Delete, and the per-model disk usage in Storage)
-    FILE_FLAGS = ("--native", "--ple-gguf", "--embd-gguf", "--native-dense-gguf")
+    FILE_FLAGS = ("--native", "--model", "--ple-gguf", "--embd-gguf", "--native-dense-gguf")
     DIR_FLAGS = ("--pack", "--mtp")
 
     def model_paths(self, cfg: dict) -> tuple[list, list]:

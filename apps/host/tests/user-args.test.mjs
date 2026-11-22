@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createNativeControl } from '../server/native-control.mjs';
 import { resourceSettings, explicitReserve } from '../server/native-resources.mjs';
-import { capture, merge, groups } from '../server/native-user-args.mjs';
+import { capture, merge, groups, setFlag, flagValue } from '../server/native-user-args.mjs';
 
 const ARGS = ['--pack', '/p', '--expert-cache', 'auto', '--spec', '4', '--max-context', '40000', '--kv', 'int8'];
 const CVEC = ['--control-vector-scaled', 'C:/vectors/mine.gguf:1.0', '--control-vector-layer-range', '4', '44', '--cvec-mode', 'project', '--cvec-dir', 'per-layer'];
@@ -174,4 +174,20 @@ test('3216: without any resource preference the load keeps them too, and the per
     assert.equal(run.args[run.args.indexOf('--spec') + 1], '2', 'a hand-changed --spec is the person\'s');
     assert.deepEqual(f.read().user_args, ['--spec', '2']);
   } finally { await f.native.close(); f.cleanup(); }
+});
+
+
+test('model file edits replace both spellings and leave native projection options intact', () => {
+  for (const [old, next] of [['--native', '--model'], ['--model', '--native']]) {
+    const args = [old, 'old.gguf', '--native-dense-gguf', 'dense.gguf'];
+    const expected = ['--native-dense-gguf', 'dense.gguf', '--native', 'new.gguf'];
+    assert.deepEqual(merge(args, [next, 'new.gguf']), expected);
+    assert.deepEqual(setFlag(args, next, 'new.gguf'), expected);
+    assert.deepEqual(setFlag(args, next, null), expected.slice(0, 2));
+  }
+  const mixed = ['--model', 'old.gguf', '--native', 'new.gguf'];
+  assert.deepEqual(merge(mixed, []), ['--native', 'new.gguf']);
+  assert.equal(flagValue(mixed, '--model'), 'new.gguf');
+  assert.deepEqual(capture({args: ['--model', 'new.gguf'], args_written: ['--native', 'old.gguf'],
+    user_args: ['--native', 'old.gguf']}), ['--native', 'new.gguf']);
 });

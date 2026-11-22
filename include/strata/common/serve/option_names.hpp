@@ -20,6 +20,9 @@ inline constexpr OptionAlias kOptionAliases[] = {
     {"--n", "--max-new"},                      // deprecated (strata-dsv41, strata-q36): use --max-new
     {"--ctx", "--max-context"},                // deprecated (strata-q36): use --max-context
     {"--chunk", "--prefill"},                  // deprecated (strata-q36): use --prefill
+    // deprecated (strata, strata-q38, strata-q36): use --model. Setup, the Terminal and the app still write --native
+    // because older installed engines know only that name (strata_common/user_args.py MODEL_FLAGS).
+    {"--native", "--model"},
 };
 
 /// Gets the name an engine's parser compares command-line option `name` with: its primary if `name` is deprecated.

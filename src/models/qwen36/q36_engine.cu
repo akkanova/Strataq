@@ -3647,7 +3647,7 @@ int strata::qwen35::run(int argc, char** argv) {
             return argv[++i];
         };
         // strata's names where they mean the same thing (the family switch passes strata's command line on)
-        if (a == "--model" || a == "--native") model = next();
+        if (a == "--model") model = next();
         else if (a == "--max-new") n_gen = std::atoi(next().c_str());
         else if (a == "--no-token-graph") graph = false;
         else if (a == "--pool-workers") cpu_threads = std::atoi(next().c_str());

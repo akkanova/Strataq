@@ -30,6 +30,7 @@ PLAIN = {
     "--mtp": "The draft layer that makes answers faster.",
     "--pack": "The folder with the model's prepared data.",
     "--native": "The model file.",
+    "--model": "The model file.",
     "--ple-gguf": "The model file that holds the word-embedding table.",
     "--expert-profile": "A table of which experts are used most, to decide what stays in graphics memory.",
     "--max-context": "How much text the model remembers at once.",

@@ -543,7 +543,7 @@ int Model::load() {
                 const strata::GgufFile meta(o.native_shards.front());
                 const std::string why = strata::model_family_not_supported(strata::model_family(meta));
                 if (strata::model_family(meta) != strata::ModelFamily::Unknown && !why.empty()) {
-                    std::fprintf(stderr, "strata generate: --native %s: %s\n", o.native_preset.c_str(), why.c_str());
+                    std::fprintf(stderr, "strata generate: --model %s: %s\n", o.native_preset.c_str(), why.c_str());
                     return 2;
                 }
             }
@@ -555,11 +555,11 @@ int Model::load() {
                 if (model.find("per_layer_token_embd.weight", &at) != nullptr) o.ple_gguf = o.native_shards[at];
             }
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "strata generate: --native %s: %s\n", o.native_preset.c_str(), e.what());
+            std::fprintf(stderr, "strata generate: --model %s: %s\n", o.native_preset.c_str(), e.what());
             return 2;
         }
         if (o.no_ple || o.ple_gguf.empty()) {
-            std::fprintf(stderr, "strata generate: --native requires --ple-gguf (the PLE key is native too), and no "
+            std::fprintf(stderr, "strata generate: --model requires --ple-gguf (the PLE key is native too), and no "
                                  "shard of the model holds per_layer_token_embd.weight\n");
             return 2;
         }
@@ -1156,7 +1156,7 @@ int Model::load() {
     if (native_pack) {
         if (o.native_preset.empty() || o.spec < 2 || o.keep_canonical ||
             (o.prefill_chunk <= 0 && o.tokens.size() > 1)) {
-            std::fprintf(stderr, "strata generate: %s is a native (IQ) pack: it needs --native SHARD1, --spec T (T >= 2) "
+            std::fprintf(stderr, "strata generate: %s is a native (IQ) pack: it needs --model SHARD1, --spec T (T >= 2) "
                                  "and --prefill CHUNK\n", o.pack.c_str());
             return 2;
         }

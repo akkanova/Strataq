@@ -35,6 +35,7 @@
 #include "strata/common/state/token_listing.hpp"
 #include "strata/common/serve/gpu_fatal.hpp"
 #include "strata/common/serve/loop.hpp"
+#include "strata/common/serve/option_names.hpp"
 #include "strata/common/serve/request.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/common/experts/expert_profile.hpp"
@@ -1372,9 +1373,11 @@ int main(int argc, char** argv) {
 #if defined(STRATA_HAVE_QWEN35)
     // **THE FAMILY SWITCH.**  A Qwen3.6-35B-A3B file (GGUF architecture qwen35moe) runs on its own engine path
     // (src/models/qwen36), decided here from the file's header before any of this engine's state exists; every other file
-    // goes on below exactly as before.  Only the architecture string is read (the header of --native's shard).
-    for (int i = 1; i + 1 < argc; ++i) {
-        if (std::strcmp(argv[i], "--native") != 0 && std::strcmp(argv[i], "--model") != 0) continue;
+    // goes on below exactly as before.  Only the architecture string is read (the header of --model's shard).
+    for (int i = argc - 2; i >= 1; --i) {
+        if (std::strcmp(strata::serve::get_primary_option(argv[i]), "--model") != 0) {
+            continue;
+        }
         bool qwen35 = false;
         try {
             const strata::GgufFile meta(strata::gguf_split_paths(argv[i + 1]).front());

@@ -538,6 +538,7 @@ and the separate SYCL engine may accept only their original names. Launchers kee
 
 | Option | Older name, still taken |
 | --- | --- |
+| `--model GGUF` (the model's file, shard 1) | `--native` (the Qwen engines) |
 | `--vram-reserve-mib N` | `--reserve-mib` (the DeepSeek engines) |
 | `--eos-ids LIST` | `--eos` (the DeepSeek engines) |
 | `--batch N` | `--slots` |

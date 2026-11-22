@@ -38,6 +38,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from strata_common import user_args
+
 CHUNK_STEPS = (1024, 512, 256)                   # a smaller prompt chunk, tried after the default one (1024 is the value measured end to end)
 RESERVE_FLOOR_MIB = 100                 # the lowest reserve the engine accepts without complaint (docs/INTEL.md); never raised
 AUTO_CHUNK = 2048                       # what --prefill auto came to on the 8 GB card
@@ -299,7 +301,7 @@ def fit_start(cfg: dict, args: list, vram_mib: float | None, backend: str | None
     reserve_s = flag("--vram-reserve-mib")
     reserve = int(reserve_s) if reserve_s and str(reserve_s).isdigit() else 700      # the engine's default reserve
     user = [str(a) for a in (cfg.get("user_args") or [])]
-    model = str(cfg.get("model_name") or flag("--native") or "")
+    model = str(cfg.get("model_name") or user_args.find_model_file(args) or "")
     vendor = {"sycl": "intel", "cuda": "cuda", "hip": "hip"}.get(str(backend), "other")
     if not n and ("--batch" in args or "--slots" in args):
         b = flag("--batch") or flag("--slots") or "0"

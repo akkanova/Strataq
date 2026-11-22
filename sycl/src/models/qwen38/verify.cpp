@@ -292,7 +292,7 @@ const WeightRef* need(const LayerView& v, const char* suffix, std::string& err) 
 bool native_of(const WeightRef* w, const std::string& name, std::string& err) {
     if (w == nullptr) return false;
     if (w->native_data == nullptr) {
-        err = "verify: " + name + " is not served natively (run with --native)";
+        err = "verify: " + name + " is not served natively (run with --model)";
         return false;
     }
     return true;
