@@ -139,11 +139,19 @@ PoolResize PagePool::resize(uint64_t bytes, const PoolGrowth& growth) {
         runs_[first].use = RunUse::lent;   // (released at once: it joins a free run that ends where it starts)
         release(first, 0);
     }
-    // Only this growth's chunks can be returned; the token minimum or a current loan can prevent releasing spare.
-    if (const size_t back = std::min(chunks_.size() - had, (size_t) ((growth.spare + config_.chunk_bytes - 1) /
-                                                                     config_.chunk_bytes));
-        !out.refusal.empty() && back > 0)
-        (void) shrink(chunks_.size() - back);   // (new chunks hold no conversation yet)
+    // Only this growth's chunks can be returned; a token minimum or a current loan can prevent releasing spare.
+    if (chunks_.size() > had && growth.spare > 0) {
+        const bool stopped = !out.refusal.empty();
+        const std::optional<uint64_t> room = hooks_.get_own_room();
+        // With outside_ok, the caller holds the spare until resize returns.
+        const uint64_t lack = room ? (growth.outside_ok ? 0 : growth.spare - std::min(*room, growth.spare))
+                                   : (stopped ? growth.spare : 0);
+        const uint64_t chunk = config_.chunk_bytes;
+        const size_t back = (size_t) std::min<uint64_t>(chunks_.size() - had,
+                                                       lack / chunk + (lack % chunk != 0));
+        if (back > 0)
+            (void) shrink(chunks_.size() - back);   // (new chunks hold no conversation yet)
+    }
     place_homes();
     return out;
 }

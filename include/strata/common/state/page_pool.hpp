@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <tuple>
@@ -63,6 +64,9 @@ struct PagePoolHooks {
     /// Tells whether a chunk `alloc` gave lies outside the memory's own, in slower memory it borrows: on Windows, an
     /// integrated GPU's chunk that went to the system RAM the GPU shares (ChunkMemory::is_outside).
     std::function<bool(void*)> is_outside = [](void*) { return false; };
+    /// Gets the bytes no one holds in the memory's own part, besides the pool's chunks: on Windows, what is left of an
+    /// integrated GPU's dedicated memory (ChunkMemory::get_own_room).  No value when not known.
+    std::function<std::optional<uint64_t>()> get_own_room = [] { return std::optional<uint64_t>(); };
     /// Gets the time for the experts' recency and the hysteresis: milliseconds by default.
     std::function<uint64_t()> now = [] {
         return (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -113,8 +117,11 @@ struct PoolGrowth {
     /// Keep chunks outside the memory's own (PagePoolHooks::is_outside); else the first such chunk is given back and
     /// the growth stops there.
     bool outside_ok = false;
-    /// The bytes a growth that stops early gives back of the chunks it took: room for the allocations outside the
-    /// pools and for other programs, which would otherwise land outside the memory's own or fail.
+    /// The bytes a growth leaves free in the memory's own part: room for the allocations outside the pools and for
+    /// other programs, which would otherwise land outside the memory's own or fail.  After a growth without
+    /// `outside_ok`, the pool gives back chunks it took until PagePoolHooks::get_own_room is at least this. When that
+    /// room is not known, it gives back this much after an early stop, else none. With `outside_ok` and known room,
+    /// the caller keeps the spare free.
     uint64_t spare = 0;
 };
 
@@ -174,7 +181,7 @@ public:
     /// their conversation blocks copied below (so read conversation_blocks again).  It is refused, changing nothing,
     /// while a run is lent or when an active conversation or the token minimum would not fit, and stops (having moved
     /// some blocks) when a block has no room.  A growth stops early when a chunk cannot be had, or lies outside the
-    /// memory's own as `growth` says.
+    /// memory's own as `growth` says, and gives back of the chunks it took what PoolGrowth::spare says.
     PoolResize resize(uint64_t bytes, const PoolGrowth& growth = {});
     /// Lends the top `pages` pages of the pool's own memory (one run, inside the joined chunks below any chunk outside
     /// it, as prompt buffers are read more than other pages) for a prompt's buffers

@@ -127,6 +127,8 @@ bool ExpertPages::open_pool(ChunkMemory memory, uint64_t bytes, const StateLayou
         const auto it = raw_.find((uint8_t*) chunk);
         return memory_.is_outside && it != raw_.end() && memory_.is_outside(it->second);
     };
+    if (memory_.get_own_room)
+        hooks.get_own_room = memory_.get_own_room;
     hooks.evicted = [this](ExpertKey key, PageId first) { on_evicted(key, first); };
     hooks.copy = [this, page](PageId to, PageId from, uint32_t pages) {
         return memory_.copy(pool_->page_address(to), pool_->page_address(from), pages * page);

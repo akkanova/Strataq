@@ -38,6 +38,8 @@ struct ChunkMemory {
     bool contiguous = false;
     /// Tells whether a chunk `alloc` gave lies outside the memory's own (PagePoolHooks::is_outside); null: none does.
     std::function<bool(const uint8_t*)> is_outside;
+    /// Gets the bytes of the memory's own part that no one holds (PagePoolHooks::get_own_room); null: not known.
+    std::function<std::optional<uint64_t>()> get_own_room;
 };
 
 /// Experts in the pages of a page pool made over one arena: a GPU's expert cache (whose slots are the pages) or host

@@ -49,7 +49,7 @@ std::mutex share_tops_mutex;   ///< guards share_tops
 /// can hide a spill, and unrelated aperture allocations can look like one;
 /// get_share_top then gets what every program held in the dedicated memory before it.  How full the dedicated memory
 /// gets depends on the allocations' sizes and on the other programs, so each growth finds it anew.  Used by
-/// get_gpu_chunk_memory.
+/// get_gpu_chunk_memory and DedicatedHold.
 class ShareWatch {
 public:
     /// Starts watching integrated GPU `dev`; other GPUs need no landing check.
@@ -215,6 +215,8 @@ strata::core::ChunkMemory get_gpu_chunk_memory(int dev, uint64_t chunk_bytes, bo
     strata::core::read_gpu_memory(dev, name, total, free, unified);
     strata::platform::GpuLocalMemory share;
     const bool watched = strata::core::read_share_use(dev, share);
+    if (watched)
+        memory.get_own_room = [dev] { return get_dedicated_room(dev); };
     auto range = std::make_shared<strata::core::VmmRange>();
     const uint64_t granularity = strata::core::vmm_min_granularity();
     if (granularity > 0 && chunk_bytes % granularity == 0 && range->reserve(total, chunk_bytes)) {
@@ -289,6 +291,43 @@ uint64_t get_unusable_share(int dev) {
     strata::platform::GpuLocalMemory share;
     const std::optional<uint64_t> top = get_share_top(dev);
     return top && strata::core::read_share_use(dev, share) ? share.size - std::min(*top, share.size) : 0;
+}
+
+std::optional<uint64_t> get_dedicated_room(int dev) {
+    strata::platform::GpuLocalMemory share;
+    const std::optional<uint64_t> top = get_share_top(dev);
+    if (!top || !strata::core::read_share_use(dev, share))
+        return std::nullopt;
+    return *top - std::min(*top, share.all);
+}
+
+DedicatedHold::DedicatedHold(int dev, uint64_t bytes) : dev_(dev) {
+    strata::platform::GpuLocalMemory share;
+    if (bytes == 0 || !strata::core::read_share_use(dev, share))
+        return;
+    const strata::core::OnDevice on(dev);
+    ShareWatch watch(dev, true);
+    const auto free_piece = [](void* p) { strata::core::gpu_free(p); };
+    try {
+        while ((uint64_t) pieces_.size() * kPieceBytes < bytes) {
+            std::unique_ptr<void, decltype(free_piece)> piece(strata::core::gpu_alloc(kPieceBytes), free_piece);
+            bool outside = false;
+            if (!piece || !watch.read_landing(kPieceBytes, outside) || outside)
+                break;
+            pieces_.push_back(piece.get());
+            piece.release();
+        }
+    } catch (...) {
+        for (void* held : pieces_)
+            strata::core::gpu_free(held);
+        throw;
+    }
+}
+
+DedicatedHold::~DedicatedHold() {
+    const strata::core::OnDevice on(dev_);
+    for (void* piece : pieces_)
+        strata::core::gpu_free(piece);
 }
 
 uint64_t get_gpu_pool_bytes(int dev, uint64_t keep, int64_t gpu_mib, uint64_t most, uint64_t& room) {

@@ -100,8 +100,9 @@ struct PagedSettings {
     int64_t ram_mib = -1;                          ///< --ram-mib; -1: get_ram_room
     /// --vram-reserve-mib (also --reserve-mib, strata-dsv41's name for it): the memory each GPU's pool leaves
     /// unallocated, for other programs and for the engine's own allocations outside the pools (PagedModel::get_gpu_keep
-    /// adds what the model knows of these).  A change applies to the next growth that reaches the end of an integrated
-    /// GPU's dedicated memory and to the largest pool a change may ask for; it resizes nothing by itself.
+    /// adds what the model knows of these).  A change applies to the next growth (which keeps this much of an integrated
+    /// GPU's dedicated memory free, PoolGrowth::spare) and to the largest pool a change may ask for; it resizes nothing
+    /// by itself.
     int64_t vram_reserve_mib = kDefaultVramReserveMib;
     int64_t ssd_pause_mib = kDefaultSsdPauseMib;   ///< --ssd-pause-mib
     std::string pause_dir;                         ///< --pause-dir; empty: the temporary folder's <program name>
@@ -167,6 +168,24 @@ std::optional<uint64_t> get_share_top(int dev);
 /// chunks last went to shared memory instead: the share's size less get_share_top.  0 before any chunk did, for another
 /// GPU and on Linux.
 uint64_t get_unusable_share(int dev);
+/// Gets an estimate of the bytes integrated GPU `dev`'s dedicated memory still takes: get_share_top less every
+/// program's bytes there now.  No value for another GPU, or on Linux.
+std::optional<uint64_t> get_dedicated_room(int dev);
+/// While it lives, holds `bytes` (rounded up to kPieceBytes) of integrated GPU `dev`'s free dedicated memory, or as
+/// much as fits, with placeholder allocations (those that land there, until one does not), so that a pool growing into shared memory
+/// (PoolGrowth::outside_ok) leaves that much of the dedicated memory to the rest instead of filling it first.  Holds
+/// nothing on another GPU, or on Linux.  Used by PagedEngine::resize_gpu.
+class DedicatedHold {
+public:
+    DedicatedHold(int dev, uint64_t bytes);
+    ~DedicatedHold();
+    DedicatedHold(const DedicatedHold&) = delete;
+    DedicatedHold& operator=(const DedicatedHold&) = delete;
+
+private:
+    int dev_;
+    std::vector<void*> pieces_;   ///< the placeholders, each kPieceBytes
+};
 /// Gets the bytes a pool on GPU `dev` takes: `gpu_mib` (--gpu-mib), but no more than `room`; -1: `room` but no more
 /// than `most`.  `room` gets what the pool could take: get_gpu_room(dev, keep).
 uint64_t get_gpu_pool_bytes(int dev, uint64_t keep, int64_t gpu_mib, uint64_t most, uint64_t& room);

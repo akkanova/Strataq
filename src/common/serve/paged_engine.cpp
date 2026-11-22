@@ -174,15 +174,17 @@ public:
 private:
     /// Changes the settings CHANGE_SETTINGS names (memory_report.hpp): the pools' sizes, the token limits, the SSD's
     /// budget, the drafter, the conversations at once, the rows and the lookahead.  Gets why not, having changed
-    /// nothing, or an empty string.  When a memory gives less than asked (a failed allocation), the change is made as
-    /// far as it goes, the report shows the sizes it reached, and `shortfall` says what was missing.
+    /// nothing, or an empty string.  When a memory gives less than asked (a failed allocation, or a GPU's pool larger
+    /// than get_largest_gpu with `past_dedicated`), the change is made as far as it goes, the report shows the sizes
+    /// it reached, and `shortfall` says what was missing.
     std::string change_settings(const SettingValues& values, std::string& shortfall);
     /// Takes or gives back chunks of `card`'s pool so that it holds `bytes`.  When the conversations' pages do not fit
     /// the smaller pool, conversations are paused until they do: those that do not decode first (those in the chunks
     /// it gives back before the others), then batch slots' decoding ones in those chunks, the lowest priority first,
-    /// which end as preempted.  A growth stops where the GPU's dedicated memory ends unless `shared_ok`, then gives
-    /// back what the model keeps free there (dedicated_full_).  Gets why not (the memory had less to give), or an
-    /// empty string.
+    /// which end as preempted.  A growth leaves get_gpu_keep free in the GPU's dedicated memory: without `shared_ok`
+    /// it stops where that memory ends (dedicated_full_) and gives back chunks until that much is free there; with
+    /// it, a DedicatedHold keeps that much there while its chunks go to shared memory.  Gets why not (the memory had
+    /// less to give), or an empty string.
     std::string resize_gpu(PagedCard& card, uint64_t bytes, bool shared_ok = false);
     /// Takes or gives back chunks of the RAM's pool so that it (and the staging ring) hold `bytes`: the conversations
     /// paused in the chunks it gives back move to the SSD.  Gets why not, or an empty string.
@@ -571,16 +573,10 @@ std::string get_step_settings_problem(const strata::spec::StepSettings& s, int m
 
 uint64_t get_gpu_room(int dev, uint64_t keep, bool past_dedicated) {
     const strata::core::OnDevice on(dev);
-    uint64_t free_b = 0;
-    strata::platform::GpuLocalMemory share;
-    if (const auto top = get_share_top(dev); top.has_value()) {
-        if (past_dedicated)
-            free_b = get_commit_room();
-        else if (strata::core::read_share_use(dev, share))
-            free_b = std::min(*top > share.all ? *top - share.all : 0, get_commit_room());
-    } else {
-        free_b = strata::core::device_free_bytes();
-    }
+    const std::optional<uint64_t> dedicated = get_dedicated_room(dev);
+    const uint64_t free_b = !dedicated     ? strata::core::device_free_bytes()
+                            : past_dedicated ? get_commit_room()
+                                             : std::min(*dedicated, get_commit_room());
     return free_b > keep ? free_b - keep : 0;
 }
 
@@ -2416,6 +2412,10 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
             return "a conversation decoding now holds " + std::to_string(h->live.size()) +
                    " tokens and needs room for its next token; the per-conversation limit must exceed " +
                    std::to_string(h->live.size() + 1);
+    const auto note = [&shortfall](const char* what, const std::string& why) {
+        if (!why.empty())
+            shortfall += (shortfall.empty() ? "" : "; ") + (what + why);
+    };
     std::vector<uint64_t> gpu_now;
     for (const PagedCard& card : cards_) {
         const uint64_t now = gpu_now.emplace_back(card.experts.pool().report().total.bytes);
@@ -2423,10 +2423,6 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
         if (asked < smallest)
             return "the biggest active conversation and the token minimum need " + gib(smallest) + "; the pool of " +
                    card.id + " would keep " + gib(asked);
-        // (a growth itself finds where the GPU's dedicated memory ends, resize_gpu)
-        if (gpu_bytes[card.index] && asked > get_largest_gpu(card, s.vram_reserve_mib, true))
-            return card.id + " has room for " + gib(get_largest_gpu(card, s.vram_reserve_mib, true)) +
-                   " of pool, not " + gib(asked);
     }
     // (each range takes all of get_commit_room: on the Strix Halo, where the GPU's memory is commit too, one change
     // that grows both pools must share the remaining commit capacity)
@@ -2438,6 +2434,17 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
     const int64_t min_first = std::min(s.tokens_min, settings_.tokens_min);
     if (const std::string why = set_token_limits(min_first, s.tokens_max, s.conversation_context); !why.empty())
         return why;
+    for (const PagedCard& card : cards_) {
+        const uint64_t asked = gpu_bytes[card.index].value_or(gpu_now[card.index]);
+        // (a growth itself finds where the GPU's dedicated memory ends, resize_gpu)
+        if (const uint64_t largest = get_largest_gpu(card, s.vram_reserve_mib, true);
+            gpu_bytes[card.index] && asked > largest) {
+            gpu_bytes[card.index] = largest;
+            note(("the pool of " + card.id + ": ").c_str(),
+                 std::string(get_share_top(card.dev) ? "Windows' commit limit" : "the GPU") + " has room for " +
+                     gib(largest) + " of pool, not " + gib(asked));
+        }
+    }
     (void) trim_gpu_conversations((int) s.vram_conversations);
     settings_.vram_conversations = s.vram_conversations;
     settings_.conversation_idle_seconds = s.conversation_idle_seconds;
@@ -2454,10 +2461,6 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
     settings_.batch_groups = s.batch_groups;
     settings_.suffix_draft = s.suffix_draft;
     settings_.lookup_chain = s.lookup_chain;
-    const auto note = [&shortfall](const char* what, const std::string& why) {
-        if (!why.empty())
-            shortfall += (shortfall.empty() ? "" : "; ") + (what + why);
-    };
     const uint64_t ram_now = ram_.pages().pool().report().total.bytes + ram_.ring_bytes();
     const auto resize = [&](bool shrink) {
         for (PagedCard& card : cards_)
@@ -2502,9 +2505,10 @@ std::string PagedEngine::resize_gpu(PagedCard& card, uint64_t bytes, bool shared
            }))
         pause_or_forget(*h);
     std::string shortfall;   // (a growth that stops early keeps the chunks it took)
+    const uint64_t spare = get_gpu_keep(card, settings_.vram_reserve_mib);
+    const DedicatedHold hold(card.dev, shared_ok && bytes > before.total.bytes ? spare : 0);
     for (;;) {
-        const strata::core::PoolResize r =
-            card.experts.resize(bytes, {shared_ok, get_gpu_keep(card, settings_.vram_reserve_mib)});
+        const strata::core::PoolResize r = card.experts.resize(bytes, {shared_ok, spare});
         dedicated_full_.resize(cards_.size());
         dedicated_full_[card.index] = r.own_memory_full;
         if (r.refusal.empty() || r.own_memory_full) {

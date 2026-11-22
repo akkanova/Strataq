@@ -1055,10 +1055,15 @@ only it held the same but took 4.7-9.9 s. Using 256 then 8 MiB pieces held 0.23 
 program's first allocation looked shared when they were not. So the new engines (strata-q38, strata-ds41) find out
 each time a GPU pool grows, at start too: they take its 256 MiB chunks one at a time, each first as one piece. When Windows puts that piece in shared
 memory, which is slower (with the pool's top there, strata-ds41 read 4K to 32K prompts 21-24% slower), it goes back
-and the chunk is made of 16 MiB pieces instead. The growth stops at the first chunk with a piece in shared memory.
-That chunk goes back, and so does the room the model leaves free (`--vram-reserve-mib`). The Memory panel says how much
-fits in dedicated memory and asks whether to take the rest as shared memory; yes sends the same size with
-`shared_memory=on`.
+and the chunk is made of 16 MiB pieces instead. The growth stops at the first chunk with a piece in shared memory,
+and that chunk goes back. After every growth that stays in dedicated memory, whether it stopped at the end or reached
+its size just before it, the pool gives back chunks of that growth until the room the model leaves free
+(`--vram-reserve-mib`) is free in dedicated memory. The Memory panel says how much fits in dedicated memory and asks
+whether to take the rest as shared memory; yes sends the same size with `shared_memory=on`. That growth first fills
+the reserve with temporary 16 MiB placeholders (rounded up, or as much as fits), so that its chunks leave that
+room alone, and gives the placeholders back when it ends. A size past what Windows' commit limit leaves room for
+is not refused: the pool grows as far as the limit allows, and the change says so ("Windows' commit limit has room for
+58.45 GiB of pool").
 A GPU's `largest` estimates the pool size that fits in dedicated memory, using the last measured edge (before that,
 the share's size), current use and the reserve. The panel shows a larger size in red but still sends it.
 `pool_shared` is the part of the pool in shared memory. Prompt buffers are lent below the first shared chunk.
@@ -1075,7 +1080,8 @@ prompt buffers from their pools. At start, strata-q38's pools also leave room fo
 a card (352 on a later card of a layer split), what the old engine measured after its expert cache (#4474), and the
 drafter's head. The Memory panel changes the reserve while the engine runs ("VRAM kept free for other programs",
 `vram_reserve_mib`). A change counts from the next growth: in the largest size the panel offers, and in what a growth
-that reaches the end of dedicated memory gives back. Saved as the default, it counts from the next start. It does not
+gives back or holds to keep it free in dedicated memory. Saved as the default, it counts from the next start. It does
+not
 resize a pool by itself. The GPU's bar shows the reserve as "Kept free for other programs", at the start of the free
 memory (no more than is free). After a growth found where the dedicated memory ends, the part of the share that was
 still free then but could not be used shows as "Not usable as dedicated memory", at the end of the free memory.
