@@ -311,6 +311,11 @@ public:
                           std::string& err) = 0;
     /// Gets the independently driven stage count; zero leaves pipeline groups unavailable.
     virtual int get_pipeline_stages() const { return 0; }
+    /// Gets the routing rank from which an expert missing from the GPUs is skipped when every token of a verify
+    /// window ranks it that low (0: never), or -1 when the model has no such skip.
+    virtual int get_route_tail_skip() const { return -1; }
+    /// Changes get_route_tail_skip's rank (0 to 9) for the steps after this; only for a model that has the skip.
+    virtual void set_route_tail_skip(int) {}
     /// Captures a group's graphs and stores its immutable row inputs before any stage launches.
     virtual bool prepare_group(int, const std::vector<strata::spec::StepRow>&, std::string&) { return false; }
     /// Starts one prepared group on an idle stage without waiting for its GPU.

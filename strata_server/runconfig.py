@@ -54,15 +54,21 @@ LIVE_FLAGS = {"memory_mib.gpu0": "--gpu-mib", "memory_mib.ram": "--ram-mib", "to
               "suffix_draft": "--suffix-draft", "lookup_chain": "--lookup-chain",
               "lookahead": "--lookahead", "concurrent": "--concurrent", "drafter": "--drafter",
               "save_on_shutdown": "--save-on-shutdown", "vram_reserve_mib": "--vram-reserve-mib",
-              "batch_groups": "--batch-groups"}
+              "batch_groups": "--batch-groups", "route_tail_skip": "--route-tail-skip",
+              "draft_confidence_pct": "--draft-confidence-pct", "draft_cumulative_pct": "--draft-cumulative-pct",
+              "expert_half_life": "--expert-half-life", "copy_back": "--copy-back"}
 # The live settings that are switches: CHANGE_SETTINGS and the run config spell them "on" or "off".
 _LIVE_SWITCHES = ("drafter", "save_on_shutdown", "shared_memory")
+# The live settings that take one of a few words, with those words.
+_LIVE_WORDS = {"copy_back": ("auto", "on", "off")}
 # The switches that hold for the one change they come with, so have no default: shared_memory=on lets that change's
 # GPU pools grow past the dedicated memory into shared memory.
 _ONE_CHANGE = ("shared_memory",)
 # The numeric live settings whose range is not "at least 0": (least, most); the engine checks the rest (concurrent
 # against its batch slots, lookahead against rows, rows against its verify windows: 8, or 16 in a wide build).
-_LIVE_RANGE = {"rows": (1, 16), "concurrent": (1, None), "context": (1, None), "vram_conversations": (1, None)}
+_LIVE_RANGE = {"rows": (1, 16), "concurrent": (1, None), "context": (1, None), "vram_conversations": (1, None),
+               "route_tail_skip": (0, 9), "draft_confidence_pct": (0, 100), "draft_cumulative_pct": (0, 100),
+               "expert_half_life": (0, 2147483647)}
 # Alternate spellings accepted by the page-pool engines, removed when their canonical flag is saved.
 _LIVE_ALIASES = {"--vram-reserve-mib": ("--reserve-mib",)}
 
@@ -99,7 +105,8 @@ def view(cfg: dict, path: str | Path) -> dict:
 
 def check_live(changes, to_default: bool, cards: list[str] | None = None) -> dict:
     """Checks POST /v1/memory's "set" ({setting: value}): gets the values as CHANGE_SETTINGS spells them (whole
-    numbers; _LIVE_SWITCHES "on" or "off"), or raises a ValueError naming the first bad setting or value.  `to_default`:
+    numbers; _LIVE_SWITCHES "on" or "off"; _LIVE_WORDS one of their words), or raises a ValueError naming the first
+    bad setting or value.  `to_default`:
     the values are to be saved to the run config too, so only settings with a flag there are accepted; `cards`: the
     engine's GPU pool settings (get_card_settings), which --gpu-mib holds (one size per card)."""
     if not isinstance(changes, dict) or not changes:
@@ -115,6 +122,10 @@ def check_live(changes, to_default: bool, cards: list[str] | None = None) -> dic
             if not isinstance(v, bool) and v not in ("on", "off"):
                 raise ValueError(f'{key}: expected true, false, "on" or "off", not {v!r}')
             out[key] = "on" if v in (True, "on") else "off"
+        elif key in _LIVE_WORDS:
+            if v not in _LIVE_WORDS[key]:
+                raise ValueError(f"{key}: expected one of {', '.join(_LIVE_WORDS[key])}, not {v!r}")
+            out[key] = v
         else:
             out[key] = _number(key, v, True, *_LIVE_RANGE.get(key, (0, None)))
     return out

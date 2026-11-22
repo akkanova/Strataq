@@ -173,7 +173,8 @@ public:
 
 private:
     /// Changes the settings CHANGE_SETTINGS names (memory_report.hpp): the pools' sizes, the token limits, the SSD's
-    /// budget, the drafter, the conversations at once, the rows and the lookahead.  Gets why not, having changed
+    /// budget, the drafter and its confidence cuts, the conversations at once, the rows, the lookahead, the route tail
+    /// skip and the experts' copy back and popularity half-life.  Gets why not, having changed
     /// nothing, or an empty string.  When a memory gives less than asked (a failed allocation, or a GPU's pool larger
     /// than get_largest_gpu with `past_dedicated`), the change is made as far as it goes, the report shows the sizes
     /// it reached, and `shortfall` says what was missing.
@@ -401,7 +402,7 @@ private:
     /// in the GPUs' pools, of the experts there that the steps since the last round routed to; then the experts
     /// routed to most that the pools do not hold come in (at most --adapt-swaps): into free pages while there are
     /// some, else into the pages of the least-routed expert of their layer when they beat it by --adapt-min-gain
-    /// routings.  The routing counts then decay by popularity_decay_ per step.  False (ERR printed) when a copy
+    /// routings.  The routing counts then decay by settings_.popularity_decay per step.  False (ERR printed) when a copy
     /// failed.
     bool adapt_experts();
     /// Loads a batch of the start-up fill (fill_round), or waits until pages open to its experts.  The serve loop runs
@@ -431,8 +432,9 @@ private:
     int get_most_concurrent() const {
         return facts_.max_concurrent > 0 ? std::min(facts_.max_rows, facts_.max_concurrent) : facts_.max_rows;
     }
-    /// Gives the step settings_' step settings, the lookahead 0 while the drafter is off.
-    void apply_step_settings();
+    /// Gives the step settings_' step settings, the lookahead 0 while the drafter is off; gives draft_limits_ and the
+    /// model the settings that override the model's defaults.
+    void apply_settings();
     /// Gets the conversation in place `place` of `at_`.
     Held& get_held(size_t place) const { return *held_[at_[place]]; }
     /// Gets the card that runs layer `layer`.
@@ -492,9 +494,8 @@ private:
     int pipeline_peak_ = 0; ///< The most stages occupied together, reported when it increases.
     int64_t steps_ = 0;                ///< the decode steps so far
     int64_t adapted_at_ = 0;           ///< steps_ at adapt_experts' last round
-    /// The factor by which each decode step multiplies the routing counts (--expert-popularity-decay, or
-    /// --adapt-decay's per 4 steps to the power 0.25)
-    double popularity_decay_;
+    /// The drafts' confidence cuts and limits a request starts with: the model's, with settings_' percents
+    strata::spec::DraftLimits draft_limits_;
     /// The GPUs' part of the start-up fill is over: the RAM's pool has stopped wanting the experts they took, and
     /// fills.
     bool gpus_filled_ = false;
@@ -510,7 +511,7 @@ private:
     double adapt_ms_ = 0;              ///< the time those took
     int64_t copied_back_ = 0;          ///< the experts the GPU's pool evicted that were copied to RAM, since then
     double copy_back_ms_ = 0;          ///< the time the copies back took (all evictions', failed copies too)
-    double copy_back_gain_;            ///< see serve_paged_model
+    double copy_back_gain_;            ///< see serve_paged_model; the one --copy-back auto uses
     /// Per card: its pool's last growth stopped where the GPU's dedicated memory ended (resize_gpu), for the Memory
     /// panel to offer shared memory.
     std::vector<bool> dedicated_full_;
@@ -593,9 +594,9 @@ PagedEngine::PagedEngine(PagedModel& model, PagedCards& cards, strata::core::Ram
                          const PagedSettings& settings)
     : model_(model), facts_(model.facts), cards_(cards), ram_(ram), settings_(settings),
       step_(get_step_model(), model.facts.end_tokens),
-      popularity_decay_(settings.popularity_decay > 0 ? settings.popularity_decay
-                                                      : std::pow((double) model.facts.adapt_decay, 0.25)),
       copy_back_gain_(copy_back_gain) {
+    if (settings_.popularity_decay <= 0)
+        settings_.popularity_decay = std::pow((double) facts_.adapt_decay, 0.25);
     if (settings_.tokens_max < 0)
         settings_.tokens_max = facts_.context;
     if (settings_.vram_conversations < 0) {
@@ -612,7 +613,7 @@ PagedEngine::PagedEngine(PagedModel& model, PagedCards& cards, strata::core::Ram
             settings_.step.concurrent, get_most_concurrent(), smallest == UINT64_MAX ? 0 : smallest,
             facts_.extra_resident_vram);
     }
-    apply_step_settings();
+    apply_settings();
     if (settings_.conversation_context < 0)
         settings_.conversation_context = std::min(facts_.context, settings_.tokens_max);
     (void) gpu_token_budget_.try_set_limit((uint64_t) settings_.tokens_max);
@@ -641,7 +642,8 @@ PagedEngine::PagedEngine(PagedModel& model, PagedCards& cards, strata::core::Ram
             residency_changed_ = residency_changed_ || own;
         };
         hooks.leaving = [this](strata::core::ExpertKey key, const uint8_t* bytes) {
-            if (!strata::core::is_copy_back_worth(copy_back_gain_, lending_))
+            if (!strata::core::is_copy_back_worth(get_copy_back_gain_for(settings_.copy_back, copy_back_gain_),
+                                                  lending_))
                 return;
             const Clock::time_point t0 = Clock::now();
             copied_back_ += ram_.keep_copy(key, bytes, model_.get_usage());
@@ -1117,15 +1119,15 @@ bool PagedEngine::serve_request(const std::string& line, bool admit) {
     h.used = ++requests_;
     h.dec = strata::spec::Decoding{};
     h.dec.priority = priority;
-    h.dec.draft_limits = facts_.draft_limits;
+    h.dec.draft_limits = draft_limits_;
     for (const auto& [key, value] : req.keys) {
         const float floor = std::strtof(value.c_str(), nullptr);
         if (key == "spec")
             h.dec.draft_enabled = std::atoi(value.c_str()) != 0;
         else if (key == "dspark_conf" || key == "spec_min_p")
-            h.dec.draft_limits.confidence = floor >= 0 ? floor : facts_.draft_limits.confidence;
+            h.dec.draft_limits.confidence = floor >= 0 ? floor : draft_limits_.confidence;
         else if (key == "dspark_cum" || key == "spec_cum")
-            h.dec.draft_limits.cumulative = floor >= 0 ? floor : facts_.draft_limits.cumulative;
+            h.dec.draft_limits.cumulative = floor >= 0 ? floor : draft_limits_.cumulative;
     }
     if (facts_.has_drafter)
         model_.forget_drafts(session);
@@ -2090,7 +2092,7 @@ bool PagedEngine::adapt_experts() {
         }
         moved += got;
     }
-    const float decay = (float) std::pow(popularity_decay_, (double) (steps_ - adapted_at_));
+    const float decay = (float) std::pow(settings_.popularity_decay, (double) (steps_ - adapted_at_));
     adapted_at_ = steps_;
     for (float& u : usage)
         u *= decay;
@@ -2310,6 +2312,15 @@ strata::serve::MemoryReport PagedEngine::describe_memory() const {
     report.settings.emplace_back("save_on_shutdown", settings_.save_on_shutdown ? 1 : 0);
     report.settings.emplace_back("suffix_draft", settings_.suffix_draft);
     report.settings.emplace_back("lookup_chain", settings_.lookup_chain);
+    if (const int rank = model_.get_route_tail_skip(); rank >= 0)
+        report.settings.emplace_back("route_tail_skip", rank);
+    if (facts_.has_drafter)
+        report.settings.insert(report.settings.end(),
+                               {{"draft_confidence_pct", std::lround(draft_limits_.confidence * 100)},
+                                {"draft_cumulative_pct", std::lround(draft_limits_.cumulative * 100)}});
+    report.settings.insert(report.settings.end(),
+                           {{"expert_half_life", get_half_life(settings_.popularity_decay)},
+                            {"copy_back", settings_.copy_back == "off" ? 0 : settings_.copy_back == "on" ? 1 : 2}});
     // Qwen retains conversation snapshots with MTP off; those alone cannot tell us the cost of enabling it.
     uint64_t dense = 0, held = 0;
     for (const PagedCard& card : cards_) {
@@ -2339,6 +2350,12 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
     std::optional<uint64_t> ram_bytes;
     bool shared_ok = false;   // this change's GPU pools may grow into shared memory (one change only: no setting)
     for (const auto& [name, text] : values) {
+        if (name == "copy_back") {
+            if (text != "auto" && text != "on" && text != "off")
+                return "copy_back takes auto, on or off, not " + text;
+            s.copy_back = text;
+            continue;
+        }
         if (name == "drafter" || name == "save_on_shutdown" || name == "shared_memory") {
             if (text != "on" && text != "off")
                 return name + " takes on or off, not " + text;
@@ -2386,6 +2403,14 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
             s.step.lookahead = (int) v;
         else if (name == "batch_groups" && cards_.size() > 1)
             s.batch_groups = v;
+        else if (name == "route_tail_skip" && model_.get_route_tail_skip() >= 0)
+            s.route_tail_skip = v;
+        else if (name == "draft_confidence_pct")
+            s.draft_confidence_pct = v;
+        else if (name == "draft_cumulative_pct")
+            s.draft_cumulative_pct = v;
+        else if (name == "expert_half_life")
+            s.popularity_decay = get_popularity_decay(v);
         else
             return facts_.name + " has no setting " + name;
     }
@@ -2405,6 +2430,10 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
         return why;
     if (s.drafter && !facts_.has_drafter)
         return "this engine has no drafter: it needs " + facts_.drafter_start + " at its start";
+    if (s.route_tail_skip > 9)
+        return "route_tail_skip takes a rank from 1 to 9, or 0 for off";
+    if (std::max(s.draft_confidence_pct, s.draft_cumulative_pct) > 100)
+        return "the drafts' confidence cuts take 0 to 100 percent";
     if (const std::string why = strata::serve::get_token_limits_error(s.conversation_context, facts_.context,
             s.tokens_min, s.tokens_max); !why.empty())
         return why;
@@ -2453,6 +2482,11 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
     settings_.prompt_turn_ms = s.prompt_turn_ms;
     settings_.save_on_shutdown = s.save_on_shutdown;
     settings_.vram_reserve_mib = s.vram_reserve_mib;
+    settings_.copy_back = s.copy_back;
+    settings_.popularity_decay = s.popularity_decay;
+    settings_.route_tail_skip = s.route_tail_skip;
+    settings_.draft_confidence_pct = s.draft_confidence_pct;
+    settings_.draft_cumulative_pct = s.draft_cumulative_pct;
     std::string err;
     if (!s.drafter && settings_.drafter)
         (void) switch_drafter(false, err);
@@ -2488,7 +2522,7 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
     }
     if (s.tokens_min != min_first)
         note("", set_token_limits(s.tokens_min, s.tokens_max, s.conversation_context));
-    apply_step_settings();
+    apply_settings();
     if (!shortfall.empty())
         say("CHANGE_SETTINGS changed less than asked: %s\n", shortfall.c_str());
     return {};
@@ -2861,7 +2895,7 @@ bool PagedEngine::switch_drafter(bool on, std::string& err) {
     return true;
 }
 
-void PagedEngine::apply_step_settings() {
+void PagedEngine::apply_settings() {
     step_.settings = settings_.step;
     const int stages = model_.get_pipeline_stages();
     const int concurrent = settings_.step.concurrent;
@@ -2874,6 +2908,13 @@ void PagedEngine::apply_step_settings() {
     step_.settings.max_draft_conversations = facts_.draft_limits.max_conversations;
     if (!is_model_drafting() && settings_.suffix_draft == 0 && settings_.lookup_chain == 0)
         step_.settings.lookahead = 0;
+    draft_limits_ = facts_.draft_limits;
+    if (settings_.draft_confidence_pct >= 0)
+        draft_limits_.confidence = (float) settings_.draft_confidence_pct / 100.0f;
+    if (settings_.draft_cumulative_pct >= 0)
+        draft_limits_.cumulative = (float) settings_.draft_cumulative_pct / 100.0f;
+    if (settings_.route_tail_skip >= 0 && model_.get_route_tail_skip() >= 0)
+        model_.set_route_tail_skip((int) settings_.route_tail_skip);
 }
 
 uint64_t PagedEngine::get_smallest_gpu(const PagedCard& card, int64_t tokens_min) const {

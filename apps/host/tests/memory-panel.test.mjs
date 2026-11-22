@@ -610,6 +610,48 @@ test('the VRAM kept free for other programs is a number box the engine changes l
   assert.deepEqual(calls, [[{vram_reserve_mib: 1024}, 'session']]);
 });
 
+test('the route tail skip, draft cuts and expert half-life are number boxes the engine changes live', async () => {
+  const view = {...live, settings: {...live.settings, route_tail_skip: 7, draft_confidence_pct: 50,
+    draft_cumulative_pct: 0, expert_half_life: 8}};
+  const {calls, onChange} = recorder(), {element, fire} = mount(view, onChange);
+  assert.match(element.innerHTML, /data-setting="route_tail_skip" value="7" min="0" max="9"/);
+  assert.match(element.innerHTML, /data-setting="draft_confidence_pct" value="50" min="0" max="100"/);
+  assert.match(element.innerHTML, /data-setting="expert_half_life" value="8" min="0"/);
+  const target = value => control('[data-setting]', {dataset: {setting: 'route_tail_skip'}, value});
+  fire('change', {target: target('10')});
+  apply(fire);
+  assert.deepEqual(calls, []);
+  fire('change', {target: target('0')});
+  apply(fire);
+  await settle();
+  assert.deepEqual(calls, [[{route_tail_skip: 0}, 'session']]);
+});
+
+test('copying evicted experts back is a list the engine reports by index and takes as a word', async () => {
+  const view = {...live, settings: {...live.settings, copy_back: 2}};
+  const {calls, onChange} = recorder(), {element, fire} = mount(view, onChange);
+  assert.match(element.innerHTML, /data-setting="copy_back"[^]*<option value="2" selected>Copied back to RAM when/);
+  assert.doesNotMatch(element.querySelector('.mem-note')?.textContent ?? '', /Experts the GPU evicts/);
+  fire('change', {target: control('[data-setting]', {dataset: {setting: 'copy_back'}, value: '0'})});
+  apply(fire);
+  await settle();
+  assert.deepEqual(calls, [[{copy_back: 'off'}, 'session']]);
+  assert.match(mount({...view, can_change: false}).element.innerHTML, /Experts the GPU evicts: auto/);
+});
+
+test('expert half-life respects the engine integer limit before submitting the form', async () => {
+  const view = {...live, settings: {...live.settings, expert_half_life: 8}};
+  const {calls, onChange} = recorder(), {fire} = mount(view, onChange);
+  const target = value => control('[data-setting]', {dataset: {setting: 'expert_half_life'}, value});
+  fire('change', {target: target('2147483648')});
+  apply(fire);
+  assert.deepEqual(calls, []);
+  fire('change', {target: target('0')});
+  apply(fire);
+  await settle();
+  assert.deepEqual(calls, [[{expert_half_life: 0}, 'session']]);
+});
+
 test('free memory shows the reserve at its start and unusable dedicated memory at its end', () => {
   const card = {id: 'gpu0', total: 16 * GIB, free: 3 * GIB, uses: {weights: 4 * GIB, experts: 9 * GIB},
     kept_free: 512 * MIB, dedicated_room: 2 * GIB};

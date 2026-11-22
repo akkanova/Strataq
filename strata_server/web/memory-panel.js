@@ -75,9 +75,20 @@ const SETTINGS = {context: "Per-conversation token limit", concurrent: "Conversa
                   tokens_max: "Max conversation tokens", ssd_pause_mib: "SSD for paused conversations (MiB)",
                   drafter: "Drafter", save_on_shutdown: "Save conversations on shutdown",
                   vram_reserve_mib: "VRAM kept free for other programs (MiB)",
-                  slots: "Maximum conversations at once", batch_groups: "Batch groups (0: auto)"};
+                  slots: "Maximum conversations at once", batch_groups: "Batch groups (0: auto)",
+                  route_tail_skip: "Skip rarely routed missing experts from rank (0: off)",
+                  draft_confidence_pct: "Least confidence of a drafted token (%)",
+                  draft_cumulative_pct: "Least confidence of a draft (%)",
+                  expert_half_life: "Expert popularity half-life (steps, 0: never)",
+                  copy_back: "Experts the GPU evicts"};
 /** The settings that are switches: the engine reports them as 1 or 0 and takes "on" or "off". */
 const SWITCHES = ["drafter", "save_on_shutdown"];
+/** The settings that take one of a few words: the engine reports the word's index and takes the word.
+ * @type {Record<string, string[]>} */
+const WORDS = {copy_back: ["off", "on", "auto"]};
+/** What each word of WORDS' settings shows in its list. @type {Record<string, string[]>} */
+const WORD_LABELS = {copy_back: ["Dropped (read from the SSD again)", "Copied back to RAM",
+  "Copied back to RAM when that is faster"]};
 /** Guidance shared by the per-conversation limit's tooltip and capacity error. */
 const CONTEXT_CAPACITY_HELP = "To raise this limit, increase --max-context in the model's engine arguments, " +
   "then reload the model.";
@@ -101,7 +112,11 @@ const CONTROLS = [["concurrent", () => 1, (s) => Math.min(s.slots ?? 8, s.rows ?
                   ["tokens_min", () => 0, (s) => s.tokens_max ?? Infinity],
                   ["tokens_max", (s) => s.tokens_min ?? 0, () => Infinity],
                   ["context", () => 1, (s) => s.context_capacity ?? s.context ?? Infinity],
-                  ["vram_reserve_mib", () => 0, () => Infinity]];
+                  ["vram_reserve_mib", () => 0, () => Infinity],
+                  ["route_tail_skip", () => 0, () => 9],
+                  ["draft_confidence_pct", () => 0, () => 100],
+                  ["draft_cumulative_pct", () => 0, () => 100],
+                  ["expert_half_life", () => 0, () => 2147483647]];
 /** HTML entities for the characters esc replaces. @type {Record<string, string>} */
 const ESCAPES = {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"};
 /** Names shown for where a conversation is held (its `place`). */
@@ -195,9 +210,10 @@ function render(element, panel) {
   panel.dividers = editable ? Object.fromEntries(memories.map((x) => [x.id, findDivider(x)]).filter(([, d]) => d))
     : {};
   const listed = Object.entries(view.settings).filter(([k]) => !UNLISTED.test(k) &&
-    !(editable && (SWITCHES.includes(k) || getEditableControls(view.settings).some(([key]) => key === k))));
+    !(editable && (SWITCHES.includes(k) || k in WORDS ||
+      getEditableControls(view.settings).some(([key]) => key === k))));
   const note = [listed.map(([k, v]) => `${SETTINGS[k] || k}: ${SWITCHES.includes(k) ?
-    (v ? "on" : "off") : fmt(v)}` +
+    (v ? "on" : "off") : WORDS[k]?.[v] ?? fmt(v)}` +
       (k === "context" ? " tokens" : "")).join(" · "),
     view.can_change === false ? "these change when the model starts again" : "",
     view.busy ? "a request has the engine: the last reading" : view.error || ""].filter(Boolean).join(" · ");
@@ -345,12 +361,16 @@ async function applyControls(element, panel, save) {
   const editable = new Set(getEditableControls(s).map(([key]) => key));
   const set = save === "default" ? Object.fromEntries(Object.entries(s).filter(([key]) =>
     editable.has(key) || key.startsWith("memory_mib.") ||
-    ["ssd_pause_mib", "suffix_draft", "lookup_chain", ...SWITCHES].includes(key))) : {...panel.pending};
+    ["ssd_pause_mib", "suffix_draft", "lookup_chain", ...SWITCHES, ...Object.keys(WORDS)].includes(key))) :
+    {...panel.pending};
   if (!Object.keys(set).length || (save === "default" && !panel.view.config))
     return;
   for (const key of SWITCHES)
     if (key in set)
       set[key] = Boolean(set[key]);
+  for (const [key, words] of Object.entries(WORDS))
+    if (key in set)
+      set[key] = words[Number(set[key])];
   await change(element, panel, set, null, save);
 }
 
@@ -423,6 +443,14 @@ function drawControls(panel) {
   });
   if (s.drafter != null)
     fields.push(drawDrafterControl(s, panel.view.details, off));
+  for (const [key, words] of Object.entries(WORDS))
+    if (s[key] != null) {
+      const help = esc(getControlHelp(key, s));
+      fields.push(`<label data-control="${key}" title="${help}">${esc(SETTINGS[key])} ` +
+        `<select class="st-input mem-input" data-setting="${key}"${off}>` + words.map((_, i) =>
+          `<option value="${i}"${Number(s[key]) === i ? " selected" : ""}>${esc(WORD_LABELS[key][i])}</option>`)
+          .join("") + "</select></label>");
+    }
   if (s.save_on_shutdown != null) {
     const help = esc(getControlHelp("save_on_shutdown", s));
     fields.push(`<label class="mem-switch" data-control="save_on_shutdown" title="${help}"><input type="checkbox" ` +
@@ -523,6 +551,25 @@ function getControlHelp(key, settings, details = {}) {
     return "Graphics memory, in MiB, that Strata leaves free on each GPU for other programs and for its own buffers " +
       "outside the pools. A change applies when a pool next grows, and at the next start when it is saved as the " +
       "default; it does not resize a pool by itself.";
+  if (key === "route_tail_skip")
+    return "An expert that is not in the GPU and that every token of a step ranks this low or lower among its " +
+      "experts is left out: it is neither read nor computed. This speeds up decoding when experts are missing " +
+      "from the GPU, and changes the answers slightly. Lower ranks skip more. It does nothing while every expert " +
+      "is in the GPU. 0 turns it off.";
+  if (key === "draft_confidence_pct" || key === "draft_cumulative_pct")
+    return (key === "draft_confidence_pct" ?
+      "The drafter's guesses stop at the first one it is less sure of than this. " :
+      "The drafter's guesses stop where its confidence in all of them together falls below this. ") +
+      "Higher values check fewer guesses, which wastes less work when guesses are often wrong; lower values " +
+      "check more. It applies from the next request; a request can send its own.";
+  if (key === "expert_half_life")
+    return "How quickly the GPU forgets which experts were used: after this many decode steps a use counts half. " +
+      "Shorter makes the GPU's experts follow a change of topic sooner, but swaps more of them. " +
+      "0 never forgets.";
+  if (key === "copy_back")
+    return "What becomes of an expert that the GPU's memory gives up to make room. Copied back to RAM, it comes " +
+      "back quickly the next time; dropped, it is read from the SSD again. The automatic choice copies it back " +
+      "when Strata measured that faster than reading the SSD.";
   if (key === "vram_conversations")
     return "Limits active conversations and idle GPU caches together. " +
       (settings.conversation_bytes ? `Each takes ${size(settings.conversation_bytes)} of fixed state ` +

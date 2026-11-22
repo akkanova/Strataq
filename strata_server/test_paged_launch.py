@@ -37,6 +37,13 @@ class PagedLaunchTests(unittest.TestCase):
                 args = ['--batch-groups', groups, '--batch', '2']
                 self.assertEqual(engine_client.engine_args({'exe': exe, 'args': args}), args)
 
+    def test_saved_expert_and_draft_tunings_reach_both_engines(self):
+        args = ['--route-tail-skip', '0', '--draft-confidence-pct', '40', '--draft-cumulative-pct', '15',
+                '--expert-half-life', '50', '--copy-back', 'off']
+        for exe in ('strata-q38', 'strata-ds41'):
+            with self.subTest(exe=exe):
+                self.assertEqual(engine_client.engine_args({'exe': exe, 'args': args}), args)
+
     def test_deepseek_groups_survive_disabled_drafting(self):
         for groups in ('1', '2', 'auto'):
             cfg = {'exe': 'strata-ds41.exe', 'drafting': 'off', 'parallel': 4,

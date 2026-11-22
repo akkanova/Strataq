@@ -240,6 +240,8 @@ public:
         return run_rows(rows, histories_, picks, err);
     }
     int get_pipeline_stages() const override { return (int) cards_.size(); }
+    int get_route_tail_skip() const override { return strata::core::tail_skip_rank(); }
+    void set_route_tail_skip(int rank) override { strata::core::set_tail_skip_rank(rank); }
     bool prepare_group(int group, const std::vector<strata::spec::StepRow>& rows, std::string& err) override;
     bool launch_group(int stage, int group, std::string& err) override;
     int poll_group(int stage, int group, std::vector<int32_t>& picks, std::string& err) override;

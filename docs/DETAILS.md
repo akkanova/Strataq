@@ -156,6 +156,10 @@ Some engine settings depend on the PC more than on the model:
 | `--pool-workers` | How many CPU threads compute experts. On CPUs with efficiency cores, fewer can be faster. |
 | `--adapt-every`, `--adapt-swaps`, `--adapt-decay` | How busily the VRAM expert cache follows the conversation. A CPU that reads missed experts slowly (DDR3 or DDR4 in few channels) gains from more swaps. `--adapt-decay` fades the experts' use counts once per 4 decode steps. |
 | `--expert-popularity-decay` | The page-pool engines (strata-q38, strata-ds41) only: how much the experts' use counts fade at each decode step. By default `--adapt-decay` to the power 0.25 (0.7 gives 0.915), the same fading spread over the 4 steps. |
+| `--expert-half-life` | The page-pool engines only: the same fading as `--expert-popularity-decay`, given as the decode steps after which a use counts half (0: it never fades). The Memory panel changes it while the engine runs ("Expert popularity half-life"). |
+| `--route-tail-skip` | strata-q38 only: `STRATA_ROUTE_TAIL_SKIP`'s rank (0: off), which wins over the variable and its default. The Memory panel changes it while the engine runs. |
+| `--draft-confidence-pct`, `--draft-cumulative-pct` | The page-pool engines only: the least confidence, in percent, of each drafted token (`--spec-min-p`, `--dspark-conf`) and of the drafted tokens together, for a step to check them. The Memory panel changes them while the engine runs; a change applies from the next request. |
+| `--copy-back` | The page-pool engines only: whether an expert a GPU's pool evicts is copied back to RAM (`on`), dropped (`off`) or copied when that measured faster than reading the SSD (`auto`, the default). The Memory panel changes it while the engine runs. |
 | `--prefill-pipe` | On two or more cards (layer split), the prompt chunks that keep the cards reading at once. See [MULTI_GPU.md](MULTI_GPU.md). |
 
 The defaults were measured on a Ryzen 5 7600 with an RTX 5070. From a source checkout, `START-HERE.bat --calibrate` (Linux: `./setup.sh --calibrate`)

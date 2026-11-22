@@ -106,15 +106,24 @@ struct PagedSettings {
     int64_t vram_reserve_mib = kDefaultVramReserveMib;
     int64_t ssd_pause_mib = kDefaultSsdPauseMib;   ///< --ssd-pause-mib
     std::string pause_dir;                         ///< --pause-dir; empty: the temporary folder's <program name>
-    std::string copy_back = "auto";                ///< --copy-back
+    std::string copy_back = "auto";                ///< --copy-back (live: copy_back): auto, on or off
     /// --batch-groups (live: batch_groups): how many groups a step's conversations split into, each group running on
     /// a different card of a layer split at once; 0 (also --batch-groups auto): the largest divisor of live
     /// concurrency no greater than the stage count.  A count that does not divide live concurrency runs one group.
     int64_t batch_groups = 1;
     std::string remote_experts = "auto";           ///< --remote-experts
     /// --expert-popularity-decay: the factor by which each decode step multiplies the adaptive tier's routing counts;
-    /// 0: --adapt-decay's (a factor per 4 steps) to the power 0.25
+    /// 0: --adapt-decay's (a factor per 4 steps) to the power 0.25.  --expert-half-life (live: expert_half_life)
+    /// sets it as the decode steps that halve a count (get_popularity_decay).
     double popularity_decay = 0;
+    /// --route-tail-skip (live: route_tail_skip): the routing rank from which an expert missing from the GPUs is
+    /// skipped when every token of a verify window ranks it that low (PagedModel::set_route_tail_skip); 0: never;
+    /// -1: the model's default.
+    int64_t route_tail_skip = -1;
+    /// --draft-confidence-pct and --draft-cumulative-pct (live: draft_confidence_pct, draft_cumulative_pct): the
+    /// least confidence, in percent, of each drafted token and of the drafted tokens together for the step to verify
+    /// them (spec::DraftLimits); -1: the model's.  A change applies from the next request.
+    int64_t draft_confidence_pct = -1, draft_cumulative_pct = -1;
     int64_t lookup_chain = 0, lookup_chain_min = 3; ///< Existing lookup-chain length and match floor.
     int64_t suffix_draft = 0; ///< --suffix-draft: minimum repeated context; 0 disables prompt lookup.
     bool drafter = true;                           ///< --drafter on|off: its weights loaded (with --lookahead)
@@ -133,7 +142,7 @@ struct PagedSettings {
 /// paused conversations, its conversation layout the whole model's regions): carves each conversation's state on each
 /// card, then answers the server's commands until QUIT or the end of stdin.  `copy_back_gain`: how many times faster
 /// copying an expert a GPU's pool evicts to `ram` is than reading it from the SSD (open_ram_pool), which decides
-/// whether the copy is made (is_copy_back_worth). Gets the exit status.
+/// whether the copy is made under --copy-back auto (get_copy_back_gain_for). Gets the exit status.
 int serve_paged_model(PagedModel& model, PagedCards& cards, strata::core::RamExperts& ram, double copy_back_gain,
                       const PagedSettings& settings);
 
@@ -213,7 +222,7 @@ std::vector<strata::core::ExpertKey> get_ram_ranking(const std::vector<strata::c
 /// Opens the RAM's page pool `ram` over `files` (the experts on the SSD) and gets how many times faster copying an
 /// expert a GPU's pool evicts back to it is than reading it from the SSD (`copy_back_gain`, get_copy_back_gain: by the
 /// speeds of copying from `gpu_bytes`, the start of `card`'s pool's first chunk, and of reading the SSD, measured
-/// here; --copy-back on makes it huge, off 0).  The pool takes --ram-mib, by default
+/// here, whatever --copy-back says).  The pool takes --ram-mib, by default
 /// get_ram_room(`headroom`) but no more than every expert and its staging ring of `ring` buffers take; its
 /// conversations are `layout`'s, its pages `card`'s (get_ram_pool_config), its chunks at least the `prompt_bytes`
 /// the model's prompt paths borrow from it at most (PagedModel::get_prompt_buffers).  It opens
@@ -224,6 +233,15 @@ bool open_ram_pool(const std::string& program, const PagedSettings& s, strata::c
                    const std::vector<uint64_t>& blob_bytes, int64_t n_expert,
                    const std::vector<strata::core::ExpertKey>& profile, const uint8_t* gpu_bytes,
                    uint64_t prompt_bytes, strata::core::RamExperts& ram, double& copy_back_gain, std::string& err);
+/// Gets the gain is_copy_back_worth weighs under --copy-back `mode`: huge for on, 0 for off, the `measured` one
+/// (open_ram_pool's) for auto.
+double get_copy_back_gain_for(const std::string& mode, double measured);
+/// Gets the factor per decode step that halves the experts' routing counts in `half_life` steps; 0 gets 1, which
+/// keeps them.  PagedSettings::popularity_decay's other unit.
+double get_popularity_decay(int64_t half_life);
+/// Gets the decode steps in which the factor `decay` per step halves a routing count, rounded to the live protocol's
+/// range (1 to INT32_MAX); 0 for 1, when counts never fade.
+int64_t get_half_life(double decay);
 
 /// Gets why the engine cannot decode with `s` on a model whose steps run at most `max_rows` rows (empty: it can).
 std::string get_step_settings_problem(const strata::spec::StepSettings& s, int max_rows);

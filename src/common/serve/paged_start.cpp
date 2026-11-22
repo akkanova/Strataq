@@ -89,6 +89,7 @@ int take_paged_options(int& argc, char** argv, const std::string& program, Paged
         std::string* text = nullptr;   ///< instead of `value`, for a word
     };
     int64_t rows = s.step.rows, lookahead = -1, concurrent = -1, mtp_rows = 0;   // -1: chosen after parsing
+    int64_t half_life = -1;   // -1: --expert-popularity-decay's
     std::string drafter = "on", save_on_shutdown = "off", gpu_mib, popularity_decay;
     std::string batch_groups = std::to_string(s.batch_groups);
     const Own own[] = {{"--tokens-min", &s.tokens_min},       {"--tokens-max", &s.tokens_max},
@@ -108,6 +109,9 @@ int take_paged_options(int& argc, char** argv, const std::string& program, Paged
                        {"--drafter", nullptr, &drafter},      {"--remote-experts", nullptr, &s.remote_experts},
                        {"--save-on-shutdown", nullptr, &save_on_shutdown},
                        {"--expert-popularity-decay", nullptr, &popularity_decay},
+                       {"--expert-half-life", &half_life},    {"--route-tail-skip", &s.route_tail_skip},
+                       {"--draft-confidence-pct", &s.draft_confidence_pct},
+                       {"--draft-cumulative-pct", &s.draft_cumulative_pct},
                        {"--step-profile", &s.step_profile}};
     const char* const name = program.c_str();
     int out = 1;
@@ -161,6 +165,22 @@ int take_paged_options(int& argc, char** argv, const std::string& program, Paged
     if (!popularity_decay.empty() &&
         !((s.popularity_decay = std::strtod(popularity_decay.c_str(), nullptr)) > 0 && s.popularity_decay <= 1)) {
         std::fprintf(stderr, "%s: --expert-popularity-decay takes a factor above 0 and at most 1\n", name);
+        return 2;
+    }
+    if (half_life < -1 || half_life > INT32_MAX) {
+        std::fprintf(stderr, "%s: --expert-half-life takes decode steps from 0 (never fades) to %d\n", name,
+                     INT32_MAX);
+        return 2;
+    }
+    if (half_life >= 0)
+        s.popularity_decay = get_popularity_decay(half_life);
+    if (s.route_tail_skip < -1 || s.route_tail_skip > 9) {
+        std::fprintf(stderr, "%s: --route-tail-skip takes a rank from 1 to 9, or 0 for off\n", name);
+        return 2;
+    }
+    if (std::min(s.draft_confidence_pct, s.draft_cumulative_pct) < -1 ||
+        std::max(s.draft_confidence_pct, s.draft_cumulative_pct) > 100) {
+        std::fprintf(stderr, "%s: --draft-confidence-pct and --draft-cumulative-pct take 0 to 100\n", name);
         return 2;
     }
     if (s.remote_experts != "auto" && s.remote_experts != "on" && s.remote_experts != "off") {
@@ -417,21 +437,32 @@ bool open_ram_pool(const std::string& program, const PagedSettings& s, strata::c
         ssd = std::max(ssd, ram.time_ssd_reads(round));
         back = std::max(back, ram.time_copy_in(gpu_bytes, timed));
     }
-    copy_back_gain = s.copy_back == "on"    ? HUGE_VAL
-                     : s.copy_back == "off" ? 0.0
-                                            : strata::core::get_copy_back_gain(back, ssd);
+    copy_back_gain = strata::core::get_copy_back_gain(back, ssd);
+    const double gain = get_copy_back_gain_for(s.copy_back, copy_back_gain);
     std::fprintf(stderr, "%s: the RAM's page pool: %.2f GiB%s, opened in %.1f s; it takes experts while the engine "
                          "serves, and an expert it does not hold is read from the SSD without the file cache.  An "
                          "expert the GPU evicts is %s (copying it back: %.1f GB/s, reading the SSD: %.1f GB/s; "
                          "--copy-back %s)\n",
                  program.c_str(), (double) (ram.pages().pool().report().total.bytes) / 1073741824.0,
                  ram.is_page_locked() ? ", page-locked" : "", open_s,
-                 strata::core::is_copy_back_worth(copy_back_gain, false) ? "copied back to RAM"
-                 : strata::core::is_copy_back_worth(copy_back_gain, true)
+                 strata::core::is_copy_back_worth(gain, false) ? "copied back to RAM"
+                 : strata::core::is_copy_back_worth(gain, true)
                      ? "copied back to RAM when a prompt's buffers evict it, else dropped"
                      : "dropped",
                  back, ssd, s.copy_back.c_str());
     return true;
+}
+
+double get_copy_back_gain_for(const std::string& mode, double measured) {
+    return mode == "on" ? HUGE_VAL : mode == "off" ? 0.0 : measured;
+}
+
+double get_popularity_decay(int64_t half_life) {
+    return half_life > 0 ? std::pow(0.5, 1.0 / (double) half_life) : 1.0;
+}
+
+int64_t get_half_life(double decay) {
+    return decay < 1 ? std::clamp<int64_t>(std::llround(std::log(0.5) / std::log(decay)), 1, INT32_MAX) : 0;
 }
 
 namespace {
