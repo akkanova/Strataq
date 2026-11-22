@@ -5,11 +5,11 @@
 
 #include "ds4_model.hpp"
 #include "ds4_images.hpp"
-#include "expert_files.hpp"
 #include "strata/base/gpu/on_device.hpp"
 #include "strata/base/gpu/runtime.hpp"
 #include "strata/base/gpu/traffic.hpp"
 #include "strata/base/platform/os.hpp"
+#include "strata/common/experts/expert_files.hpp"
 #include "strata/common/experts/ram_experts.hpp"
 #include "strata/common/experts/card_rules.hpp"
 #include "strata/common/sample/row_runs.hpp"
@@ -540,7 +540,7 @@ int run_paged_engine(int argc, char** argv) {
         if (o.gpus.empty())
             o.gpus = {0};
     }
-    ExpertFiles files;
+    strata::core::ExpertFiles files;
     strata::core::RamExperts ram;
     o.expert_pages = &ram;
     Model m;

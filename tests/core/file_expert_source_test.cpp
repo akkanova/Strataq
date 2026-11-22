@@ -1,4 +1,5 @@
 #include "strata/base/platform/env.hpp"
+#include "strata/common/experts/expert_files.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/common/kernels/cpu/expert.hpp"
@@ -645,6 +646,48 @@ void test_unbuffered_reads() {
     source.close();
 }
 
+// strata-q38 reads its experts after the load through ExpertFiles over get_file_layout's description: the same bytes as
+// the mapping, in one batch, also once the source is closed.
+void test_file_layout() {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    constexpr int64_t layers = 2;
+    constexpr int64_t experts = 3;
+    const uint64_t total = (uint64_t) (layers * experts) * BLOB;
+    TempDirectory dir(fs::current_path());   // (not a tmpfs /tmp: ExpertFiles reads unbuffered where it can)
+    std::string err;
+    require(expert_layout_load(dir.path.string(), layers, experts, err), "could not load canonical layout: " + err);
+    std::vector<uint8_t> bytes((size_t) total);
+    for (size_t i = 0; i < bytes.size(); ++i)
+        bytes[i] = (uint8_t) (i * 2654435761u >> 11);
+    {
+        std::ofstream out(dir.path / "experts.bin", std::ios::binary | std::ios::trunc);
+        out.write((const char*) bytes.data(), (std::streamsize) bytes.size());
+        require((bool) out, "could not write the synthetic experts.bin");
+    }
+    FileExpertSource source;
+    require(source.open(dir.path.string(), layers, experts, err), "could not map the synthetic pack: " + err);
+    std::vector<std::string> paths;
+    std::vector<ExpertFileLayout> described;
+    require(source.get_file_layout(paths, described) && described.size() == (size_t) layers,
+            "get_file_layout describes every layer");
+    ExpertFiles files;
+    require(files.open(paths, std::move(described), err, source.model_inputs()), "ExpertFiles opens: " + err);
+    require(files.model_inputs() == source.model_inputs(), "ExpertFiles keeps the source's model inputs");
+    source.close();   // (the files' reads need nothing of it)
+    std::vector<uint8_t> out((size_t) total);
+    std::vector<int32_t> ls, es;
+    std::vector<uint8_t*> dst;
+    for (int32_t l = 0; l < layers; ++l)
+        for (int32_t e = 0; e < experts; ++e) {
+            ls.push_back(l);
+            es.push_back(e);
+            dst.push_back(out.data() + (size_t) ((l * experts + e) * (int64_t) BLOB));
+        }
+    require(files.copy_blobs(ls.data(), es.data(), dst.data(), dst.size()) && out == bytes,
+            "ExpertFiles over get_file_layout reads the file's bytes");
+}
+
 // #633: the host RAM probe with fake /proc and cgroup trees: v2 (a limit, "max", a missing or malformed limit), v1
 // (a limit, unlimited), and no cgroup line at all.  Elsewhere than Linux it reads the machine's RAM.
 void test_host_memory() {
@@ -1053,6 +1096,7 @@ int main(int argc, char** argv) {
         test_host_memory();
         test_canonical_layout();
         test_unbuffered_reads();
+        test_file_layout();
         test_io_prefetch();
 #if defined(STRATA_NATIVE_EXPERTS)
         test_native_variable_layout();

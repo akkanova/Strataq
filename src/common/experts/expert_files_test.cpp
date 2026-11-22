@@ -1,7 +1,7 @@
-// DeepSeek's routed experts read without the file cache (expert_files.hpp) from a file of known bytes: matrices at
-// offsets and of sizes that are not sector multiples, several layers and files, batches larger than the reader's,
-// each expert's bytes landing at its blob offsets and nothing else of the blob touched.  No GPU, no model files.
-#include "expert_files.hpp"
+// Routed experts read without a file mapping (expert_files.hpp) from a file of known bytes: matrices at offsets and
+// of sizes that are not sector multiples, several layers and files, batches larger than the reader's, each expert's
+// bytes landing at its blob offsets and nothing else of the blob touched.  No GPU, no model files.
+#include "strata/common/experts/expert_files.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -10,7 +10,7 @@
 #include <thread>
 #include <vector>
 
-using namespace strata::ds4;
+using namespace strata::core;
 
 namespace {
 
@@ -41,7 +41,7 @@ void write_file(const std::string& path, int file, uint64_t bytes) {
 }  // namespace
 
 int main() {
-    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "ds4_expert_files_test";
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "expert_files_test";
     std::filesystem::create_directories(dir);
     const std::vector<std::string> paths = {(dir / "a.bin").string(), (dir / "b.bin").string()};
     write_file(paths[0], 0, 3u << 20);
@@ -124,6 +124,6 @@ int main() {
     }
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
-    std::printf("ds4_expert_files_test: %d checks passed\n", checks);
+    std::printf("expert_files_test: %d checks passed\n", checks);
     return 0;
 }

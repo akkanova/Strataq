@@ -52,6 +52,8 @@ struct ExpertLayout;
 
 namespace strata::core {
 
+struct ExpertFileLayout;   // (strata/common/experts/expert_files.hpp)
+
 class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hpp)
 class RemoteExperts;
 struct LoadStats;
@@ -789,6 +791,10 @@ public:
     /// 32 measured 2.35 GB/s with experts.bin mapped and 3.57 GB/s without.  After this every file read goes through
     /// read_direct (mapped_blob answers nullptr).  Returns whether the view was closed; `why` says why not.
     bool drop_mapping(std::string& why);
+    /// Describes where every layer's experts lie in the files it opened, as ExpertFiles reads them (`paths`, which
+    /// the layouts' file numbers index): strata-q38 reads its experts that way once its load is done, and closes this
+    /// source.  False when no files are open.
+    bool get_file_layout(std::vector<std::string>& paths, std::vector<ExpertFileLayout>& layers) const;
     /// Windows, experts.bin, a file tier that reads through the file cache (--resident-experts): the startup reads -
     /// the GPU cache's fill from the profile and the RAM copy (pin_cache_complement) - go unbuffered (read_direct)
     /// with the view closed meanwhile.  Through the mapping they put the file's pages in the working set beside the

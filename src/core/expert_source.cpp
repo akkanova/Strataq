@@ -2,6 +2,7 @@
 #include "strata/base/gpu/managed_memory.hpp"
 #include "strata/base/platform/env.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/common/experts/expert_files.hpp"
 #include "strata/common/kernels/expert_nibble.hpp"
 #include "strata/common/state/conversation_memory.hpp"
 #include "strata/core/foresight_swap.hpp"
@@ -2315,6 +2316,32 @@ bool FileExpertSource::map_view(std::string& why) {
     why = "Windows only";
     return false;
 #endif
+}
+
+bool FileExpertSource::get_file_layout(std::vector<std::string>& paths, std::vector<ExpertFileLayout>& layers) const {
+    if (paths_.empty())
+        return false;
+    paths = paths_;
+    layers.assign((size_t) n_layers_, {});
+    for (int64_t l = 0; l < n_layers_; ++l) {
+        ExpertFileLayout& x = layers[(size_t) l];
+        x.n_exp = (int) n_expert_;
+        if (role_ptr_.empty()) {   // experts.bin: the blob is one contiguous range, as matrix 0
+            x.file[0] = 0;
+            x.off[0] = layer_offsets_[(size_t) l];
+            x.blob = x.stride[0] = x.bytes[0] = layer_blob_bytes_[(size_t) l];
+            continue;
+        }
+        for (int r = 0; r < 3; ++r) {   // the GGUF in place: three tensors' slices, one after another in the blob
+            const size_t i = (size_t) (3 * l + r);
+            x.file[r] = role_file_[i];
+            x.off[r] = (uint64_t) (role_ptr_[i] - maps_[(size_t) role_file_[i]].base);
+            x.stride[r] = x.bytes[r] = role_bytes_[i];
+            x.tr[r] = x.blob;
+            x.blob += role_bytes_[i];
+        }
+    }
+    return true;
 }
 
 bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {

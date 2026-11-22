@@ -46,6 +46,7 @@
 // change nothing.
 #pragma once
 
+#include "strata/common/experts/expert_files.hpp"
 #include "strata/common/experts/layer_split.hpp"
 #include "strata/common/experts/ram_experts.hpp"
 #include "strata/common/serve/paged_model.hpp"
@@ -256,7 +257,7 @@ std::vector<strata::core::ExpertKey> get_ram_ranking(const std::vector<strata::c
 /// the model's prompt paths borrow from it at most (PagedModel::get_prompt_buffers).  It opens
 /// empty: the engine's start-up fill brings in the experts in get_ram_ranking's order as far as they fit.  Says on
 /// stderr after `program` what it took.
-bool open_ram_pool(const std::string& program, const PagedSettings& s, strata::core::ExpertSource& files,
+bool open_ram_pool(const std::string& program, const PagedSettings& s, strata::core::ExpertFiles& files,
                    uint64_t headroom, int ring, const strata::core::StateLayout& layout, const PagedCard& card,
                    const std::vector<uint64_t>& blob_bytes, int64_t n_expert,
                    const std::vector<strata::core::ExpertKey>& profile, const uint8_t* gpu_bytes,

@@ -12,6 +12,7 @@
 #include "strata/base/gpu/traffic.hpp"
 #include "strata/models/common/prompt_images.hpp"
 #include "strata/common/experts/card_rules.hpp"
+#include "strata/common/experts/expert_files.hpp"
 #include "strata/common/experts/expert_pages.hpp"
 #include "strata/common/experts/expert_swaps.hpp"
 #include "strata/common/experts/ram_experts.hpp"
@@ -172,7 +173,8 @@ public:
     /// `drafter`: null when drafting is off; `sessions`: the conversations the engine holds (its batch slots and
     /// "main").
     PagedQwen(Model& m, Conversation& conv, const PagedCards& cards, ModelCards& model_cards, SplitDrive& split,
-              const strata::core::RamExperts& ram, ConversationDrafter* drafter, int sessions, int prompt_rows);
+              const strata::core::RamExperts& ram, const strata::core::ExpertFiles& files,
+              ConversationDrafter* drafter, int sessions, int prompt_rows);
 
     bool prepare_images(const strata::serve::RequestLine& request, const std::vector<int64_t>& ids,
                         std::vector<strata::core::ConversationImageKey>& images, std::string& err) override;
@@ -224,7 +226,7 @@ public:
         config.u64("paged state layout", 4);
         config.u64("rewind slots", (uint64_t) m_.o.prompt_cache);
         id.config = config.digest();
-        return get_session_model_fingerprint(m_, &m_.src, id.model, err);
+        return get_session_model_fingerprint(m_, &files_, id.model, err);
     }
     void forget_drafts(int session) override { drafter_->forget(session); }
     int64_t get_prompt_chunk(int64_t tokens, bool alone) const override {
@@ -319,6 +321,7 @@ private:
     ModelCards& cards_;
     SplitDrive& split_;
     const strata::core::RamExperts& ram_;
+    const strata::core::ExpertFiles& files_;   ///< the experts on the SSD, which the RAM's pool reads through
     ConversationDrafter* const drafter_;
     const int sessions_;
     const int prompt_rows_; ///< The legacy verify width used for short prompt reads.
@@ -333,8 +336,10 @@ std::vector<uint64_t> get_blob_bytes(const Model& m);
 PagedCard& add_card(Model& m, Conversation& conv, PagedCards& cards, ModelCards& model_cards, GpuStage* stage);
 bool open_pages(Model& m, PagedCard& card, ModelCard& mc, const PagedSettings& s, int64_t max_experts,
                 std::string& err);
+bool open_files(Model& m, strata::core::ExpertFiles& files, std::string& err);
 bool open_ram(Model& m, const PagedCards& cards, const ModelCards& model_cards, const PagedSettings& s,
-              strata::core::RamExperts& ram, double& copy_back_gain, std::string& err);
+              strata::core::ExpertFiles& files, strata::core::RamExperts& ram, double& copy_back_gain,
+              std::string& err);
 bool init_card_paths(Model& m, Conversation& conv, PagedCards& cards, ModelCards& model_cards, SplitDrive& split,
                      int handoff_rows, std::string& err);
 std::string get_unsupported_reason(const Model& m);
@@ -427,10 +432,6 @@ int run_paged_engine(int argc, char** argv) {
     PagedCards cards;
     ModelCards model_cards;
     m.open_expert_pages = [&](int64_t max_experts, std::string& err) {
-        // from here on the experts are read from the files without the file cache
-        if (std::string why; !m.src.read_unbuffered(why))
-            std::fprintf(stderr, "strata-q38: WARNING: the experts are read through the file cache (%s)\n",
-                         why.c_str());
         PagedCard& card = add_card(m, conv, cards, model_cards, nullptr);
         return open_pages(m, card, model_cards[card.index], settings, max_experts, err);
     };
@@ -461,9 +462,10 @@ int run_paged_engine(int argc, char** argv) {
     if (o.adapt_every > 0 && o.adapt_swaps > 0)   // the routings the engine's adaptive tier counts
         m.drive.d.usage.assign((size_t) (m.g.n_layers * m.g.n_expert), 0.0f);
     std::string err;
+    strata::core::ExpertFiles files;
     strata::core::RamExperts ram;
     double copy_back_gain = 0;
-    if (!open_ram(m, cards, model_cards, settings, ram, copy_back_gain, err)) {
+    if (!open_files(m, files, err) || !open_ram(m, cards, model_cards, settings, files, ram, copy_back_gain, err)) {
         std::fprintf(stderr, "strata-q38: %s\n", err.c_str());
         return 1;
     }
@@ -486,7 +488,7 @@ int run_paged_engine(int argc, char** argv) {
             mc.ver->set_batch_graph_limit(kWindowGraphs);
     if (drafting && !settings.drafter)   // loaded for the pool's layout of the drafter's K/V, switched on later
         m.unload_drafter();
-    PagedQwen model(m, conv, cards, model_cards, split, ram, drafting ? &drafter : nullptr, slots,
+    PagedQwen model(m, conv, cards, model_cards, split, ram, files, drafting ? &drafter : nullptr, slots,
                     window_rows.total);
     return strata::serve::serve_paged_model(model, cards, ram, copy_back_gain, settings);
 }
@@ -494,9 +496,10 @@ int run_paged_engine(int argc, char** argv) {
 namespace {
 
 PagedQwen::PagedQwen(Model& m, Conversation& conv, const PagedCards& cards, ModelCards& model_cards,
-                     SplitDrive& split, const strata::core::RamExperts& ram, ConversationDrafter* drafter,
-                     int sessions, int prompt_rows)
-    : m_(m), conv_(conv), pcards_(cards), cards_(model_cards), split_(split), ram_(ram), drafter_(drafter),
+                     SplitDrive& split, const strata::core::RamExperts& ram, const strata::core::ExpertFiles& files,
+                     ConversationDrafter* drafter, int sessions, int prompt_rows)
+    : m_(m), conv_(conv), pcards_(cards), cards_(model_cards), split_(split), ram_(ram), files_(files),
+      drafter_(drafter),
       sessions_(sessions), prompt_rows_(prompt_rows) {
     const Options& o = m.o;
     facts.name = kProgram;
@@ -772,7 +775,7 @@ void PagedQwen::report_hops() const {
                              "plan=%.3f jobs=%.3f ms\n", (long long) d.multi_misses,
                      (long long) d.cache_hits, d.ms_run, d.ms_plan, d.ms_jobs);
         std::fprintf(stderr, "strata-q38: file totals: reads=%lld bytes=%llu time=%.3f ms\n",
-                     (long long) m_.src.reads(), (unsigned long long) m_.src.file_read_bytes(), m_.src.file_ms());
+                     (long long) files_.reads(), (unsigned long long) files_.get_read_bytes(), files_.get_read_ms());
         for (const ModelCard& card : cards_) {
             const auto& v = *card.ver;
             std::fprintf(stderr, "strata-q38: verify totals: windows=%lld wait=%.3f pool=%.3f host=%.3f "
@@ -1463,12 +1466,27 @@ bool open_pages(Model& m, PagedCard& card, ModelCard& mc, const PagedSettings& s
     return true;
 }
 
+/// Opens `files` over the files `m`'s load read its experts from, and closes the load's source of them (m.src) with its
+/// file mappings, so that from here on every expert read goes through `files`.
+bool open_files(Model& m, strata::core::ExpertFiles& files, std::string& err) {
+    std::vector<std::string> paths;
+    std::vector<strata::core::ExpertFileLayout> layers;
+    if (!m.src.get_file_layout(paths, layers)) {
+        err = "the experts' files are not open";
+        return false;
+    }
+    const bool opened = files.open(paths, std::move(layers), err, m.src.model_inputs());
+    m.src.close();
+    return opened;
+}
+
 /// Opens the RAM's page pool `ram` beside the cards' (open_ram_pool) and gets how many times faster copying an expert
 /// a GPU's pool evicts back to it is than an SSD read (`copy_back_gain`); it takes the profile's experts once the
 /// engine serves.  Its conversation layout has the whole model's regions, so that a paused conversation is one
 /// conversation in it wherever the layer cut is (PagedQwen::get_ram_span).
 bool open_ram(Model& m, const PagedCards& cards, const ModelCards& model_cards, const PagedSettings& s,
-              strata::core::RamExperts& ram, double& copy_back_gain, std::string& err) {
+              strata::core::ExpertFiles& files, strata::core::RamExperts& ram, double& copy_back_gain,
+              std::string& err) {
     std::vector<strata::core::ExpertKey> profile;
     for (const auto& [l, e] : m.profile_all.empty() ? m.profile : m.profile_all)
         profile.push_back({l, e});
@@ -1478,7 +1496,7 @@ bool open_ram(Model& m, const PagedCards& cards, const ModelCards& model_cards, 
     for (size_t k = 0; k < model_cards.size(); ++k)
         prompt += get_prompt_bytes(m, model_cards[k], m.o.prefill_chunk, k + 1 < model_cards.size()).host;
     return get_card_layout(m, cards.back(), model_cards.back(), 0, m.g.n_layers, layout, err) &&
-           strata::serve::open_ram_pool(kProgram, s, m.src, m.o.resident_headroom, ring, layout, cards[0],
+           strata::serve::open_ram_pool(kProgram, s, files, m.o.resident_headroom, ring, layout, cards[0],
                                         get_blob_bytes(m), m.g.n_expert, profile, m.xcache.device_slot(0), prompt,
                                         ram, copy_back_gain, err);
 }

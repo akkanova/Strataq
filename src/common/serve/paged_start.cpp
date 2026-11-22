@@ -470,7 +470,7 @@ std::vector<strata::core::ExpertKey> get_ram_ranking(const std::vector<strata::c
     return ranking;
 }
 
-bool open_ram_pool(const std::string& program, const PagedSettings& s, strata::core::ExpertSource& files,
+bool open_ram_pool(const std::string& program, const PagedSettings& s, strata::core::ExpertFiles& files,
                    uint64_t headroom, int ring, const strata::core::StateLayout& layout, const PagedCard& card,
                    const std::vector<uint64_t>& blob_bytes, int64_t n_expert,
                    const std::vector<strata::core::ExpertKey>& profile, const uint8_t* gpu_bytes,
@@ -500,11 +500,12 @@ bool open_ram_pool(const std::string& program, const PagedSettings& s, strata::c
     copy_back_gain = strata::core::get_copy_back_gain(back, ssd);
     const double gain = get_copy_back_gain_for(s.copy_back, copy_back_gain);
     std::fprintf(stderr, "%s: the RAM's page pool: %.2f GiB%s, opened in %.1f s; it takes experts while the engine "
-                         "serves, and an expert it does not hold is read from the SSD without the file cache.  An "
-                         "expert the GPU evicts is %s (copying it back: %.1f GB/s, reading the SSD: %.1f GB/s; "
-                         "--copy-back %s)\n",
+                         "serves, and an expert it does not hold is read from the SSD %s.  An expert the GPU evicts "
+                         "is %s (copying it back: %.1f GB/s, reading the SSD: %.1f GB/s; --copy-back %s)\n",
                  program.c_str(), (double) (ram.pages().pool().report().total.bytes) / 1073741824.0,
                  ram.is_page_locked() ? ", page-locked" : "", open_s,
+                 files.is_direct() ? "without the file cache"
+                                   : "THROUGH the file cache (the files cannot be read unbuffered here)",
                  strata::core::is_copy_back_worth(gain, false) ? "copied back to RAM"
                  : strata::core::is_copy_back_worth(gain, true)
                      ? "copied back to RAM when a prompt's buffers evict it, else dropped"
