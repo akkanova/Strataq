@@ -71,12 +71,10 @@ constexpr double kRefillBudgetMs = 10.0;
 /// chunk's end, so each chunk ends in a run too short for any expert: 0.36% of the Strix Halo's GPU pool in chunks of
 /// this size (docs/MEMORY_MANAGER_PLAN.md, M2f).
 constexpr uint64_t kChunkBytes = 256ull << 20;
-/// The GPU memory in MiB that the pools leave unallocated on each GPU when --vram-reserve-mib is not given (the old
-/// engines keep 700, strata-dsv41 600).  A provisional choice, not measured: above the 323 MiB
-/// free at which Windows paged a 20 GB card's memory and slowed decode (the old engine, #1376; see kWddmAutoReserveMib
-/// in src/models/qwen38/model.cpp), and two of the pools' chunks.  These engines lend the prompt paths their buffers
-/// from the pools, so less is allocated outside the pools than in the old engines.
-constexpr int64_t kDefaultVramReserveMib = 512;
+/// The GPU memory in MiB the pools leave unallocated on each GPU for other programs when --vram-reserve-mib is
+/// absent. Prompt buffers come from the pools; PagedModel::get_gpu_keep covers model buffers outside them.
+/// One pool chunk, chosen without hardware measurements.
+constexpr int64_t kDefaultVramReserveMib = 256;
 /// The smallest prompt chunk the engine lends buffers for, and the step between the chunks it tries
 /// (lend_prompt_buffers in paged_engine.cpp).
 constexpr int64_t kPromptChunkStep = 256;

@@ -1079,11 +1079,19 @@ shared ones; the pool does not reorder them. `dedicated_full` says
 that the last growth stopped where the dedicated memory ended. Linux and discrete GPUs have no such check: their pools
 grow until the runtime has no more.
 
-The new engines leave `--vram-reserve-mib` free on each GPU, for other programs and for what they allocate outside
-their pools. The default is 512 MiB, less than the old engines' 700 (strata-dsv41's 600, which it calls
-`--reserve-mib`; the new engines take both names). The 512 is a choice, not a measurement: it is above the 323 MiB free at
-which Windows paged a 20 GB card's memory and slowed decode (the old engine, #1376), and the new engines lend the
-prompt buffers from their pools. At start, strata-q38's pools also leave room for what it allocates after them: 256 MiB
+The new engines leave `--vram-reserve-mib` free on each GPU for other programs. The default is 256 MiB, one pool
+chunk, less than the old engines' 700 (strata-dsv41's 600, which it calls `--reserve-mib`; the new engines take both
+names). The 256 is a choice, not a hardware measurement. The old engines allocated prompt buffers after the expert
+cache; the new engines lend them from their pools. The old engine's Windows paging at 323 MiB free on a 20 GB card
+(#1376) does not establish a safe reserve for the new engines.
+
+For strata-q38, the desktop app's Performance profile keeps at least 512 MiB on a display card, or 2,048 when its
+picture reader runs on the GPU. A headless card keeps 256 MiB, or 2,048 with the GPU reader. Work also keeps a fifth
+of a dedicated display card, capped at 1,536 MiB on cards up to 16 GB. Explicit reserves still take precedence.
+The old engines' display floors stay at 1,024 above 16 GB and 1,536 at 16 GB or less. DeepSeek loads bypass the app's
+resource profiles, so strata-ds41 uses its engine default unless a reserve is set in its config or arguments.
+
+At start, strata-q38's pools also leave room for what it allocates after them: 256 MiB
 a card (352 on a later card of a layer split), what the old engine measured after its expert cache (#4474), and the
 drafter's head. The Memory panel changes the reserve while the engine runs ("VRAM kept free for other programs",
 `vram_reserve_mib`). A change counts from the next growth: in the largest size the panel offers, and in what a growth
