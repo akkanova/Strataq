@@ -71,6 +71,25 @@ const SETTINGS = {context: "Per-conversation token limit", concurrent: "Conversa
                   slots: "Maximum conversations at once"};
 /** The settings that are switches: the engine reports them as 1 or 0 and takes "on" or "off". */
 const SWITCHES = ["drafter", "save_on_shutdown"];
+/** The draft acceptance rules offered (the engine's `draft_rule` detail and setting) and their labels; an asterisk
+ * marks a rule that trades the answers' distribution for speed (DRAFT_RULE_HELP).
+ * @type {[rule: string, label: string][]} */
+const DRAFT_RULES = [["exact", "Exact"], ["speculative", "Speculative sampling"],
+  ["typical", "Typical acceptance (Medusa) *"], ["lower-temperature", "Lower temperature *"],
+  ...[75, 90, 98].map((n) => /** @type {[string, string]} */ ([`top-${n}`, `Top ${n}% *`]))];
+/** The draft acceptance choice's tooltip: what every rule in DRAFT_RULES does. */
+const DRAFT_RULE_HELP = [
+  "Which of the drafter's guessed words an answer keeps. At temperature 0 all options give the same answers.",
+  "Exact: keeps a guess only when it is the word the model would pick anyway, so answers are word for word " +
+    "the same as without guessing.",
+  "Speculative sampling: keeps more guesses. The words can differ from Exact's, but each word is exactly as " +
+    "likely as without guessing, so answers are just as good.",
+  "Typical acceptance (Medusa): also keeps a guess the model finds likely enough; the less sure the model is, " +
+    "the more guesses pass.",
+  "Lower temperature: also keeps a guess the model finds at least as likely as the word it picked.",
+  "Top N%: as Lower temperature, and also keeps a guess among the model's likeliest words that together hold " +
+    "N% of its probability.",
+  "* this option can change the output distribution"].join("\n");
 /** Guidance shared by the per-conversation limit's tooltip and capacity error. */
 const CONTEXT_CAPACITY_HELP = "To raise this limit, increase --max-context in the model's engine arguments, " +
   "then reload the model.";
@@ -144,7 +163,7 @@ export function drawMemoryPanel(element, view, onChange) {
  *   identity_group?: string, ids?: number[]}} MemoryBlock
  * @typedef {{id: string, place: string, state: string, count: number, capacity: number, bytes: number,
  *   used: number, last_tokens_at?: number, name?: string, preview?: string}} HeldConversation
- * @typedef {Record<string, number | boolean>} SettingsChange  POST /v1/memory's "set": MiB for the sizes.
+ * @typedef {Record<string, number | boolean | string>} SettingsChange  POST /v1/memory's "set": MiB for the sizes.
  * @callback ChangeSettings  Sends a change to the engine's server (POST /v1/memory) and says how it went: `view` is
  *   the reading after it, `error` the server's reason for not changing anything (a refusal, 409).
  * @param {SettingsChange} set
@@ -293,7 +312,9 @@ function finishDrag(element, panel) {
  * @param {HTMLInputElement} input */
 function changeControl(element, panel, input) {
   const key = input.dataset.setting ?? "";
-  if (key === "drafter") {
+  if (key === "draft_rule")
+    panel.pending.draft_rule = input.value;
+  else if (key === "drafter") {
     panel.pending.drafter = input.value === "on";
     if (panel.view.settings.suffix_draft != null) {
       panel.pending.suffix_draft = input.value === "suffix" ? 3 : 0;
@@ -329,9 +350,12 @@ async function applyControls(element, panel, save) {
     return render(element, panel);
   }
   const editable = new Set(getEditableControls(s).map(([key]) => key));
+  const rule = panel.view.details?.draft_rule;
   const set = save === "default" ? Object.fromEntries(Object.entries(s).filter(([key]) =>
     editable.has(key) || key.startsWith("memory_mib.") ||
     ["ssd_pause_mib", "suffix_draft", "lookup_chain", ...SWITCHES].includes(key))) : {...panel.pending};
+  if (save === "default" && rule != null)
+    set.draft_rule = s.draft_rule ?? rule;
   if (!Object.keys(set).length || (save === "default" && !panel.view.config))
     return;
   for (const key of SWITCHES)
@@ -393,6 +417,9 @@ function drawControls(panel) {
   });
   if (s.drafter != null)
     fields.push(drawDrafterControl(s, panel.view.details, off));
+  const rule = /** @type {string | undefined} */ (panel.pending.draft_rule) ?? panel.view.details?.draft_rule;
+  if (rule != null)
+    fields.push(drawDraftRuleControl(rule, off));
   if (s.save_on_shutdown != null) {
     const help = esc(getControlHelp("save_on_shutdown", s));
     fields.push(`<label class="mem-switch" data-control="save_on_shutdown" title="${help}"><input type="checkbox" ` +
@@ -426,6 +453,18 @@ function drawDrafterControl(settings, details = {}, disabled = "") {
     `<select class="st-input mem-input" data-setting="drafter"${disabled}>` +
     `<option value="off"${!settings.drafter && !suffix ? " selected" : ""}>No MTP</option>` +
     `${model}${lookup}</select></label>`;
+}
+
+/** Gets the choice of which guesses a sampled answer keeps, with `rule` (the engine's draft_rule text) selected; a
+ * rule the panel does not offer (set by --draft-rule, so a top-N one) is listed under its own name.
+ * @param {string} rule
+ * @param {string} disabled */
+function drawDraftRuleControl(rule, disabled = "") {
+  const rules = DRAFT_RULES.some(([r]) => r === rule) ? DRAFT_RULES : [...DRAFT_RULES, [rule, `${rule} *`]];
+  return `<label data-control="draft_rule" title="${esc(DRAFT_RULE_HELP)}">Draft acceptance ` +
+    `<select class="st-input mem-input" data-setting="draft_rule"${disabled}>` +
+    rules.map(([r, label]) => `<option value="${esc(r)}"${r === rule ? " selected" : ""}>${esc(label)}</option>`)
+      .join("") + "</select></label>";
 }
 
 /** Gets controls supported by this engine; context_capacity advertises a live per-conversation limit.

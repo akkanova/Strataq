@@ -6,6 +6,8 @@
 // top_p cuts before min_p.  `src/common/kernels/cuda/sampler.cu` has the details and `sampler_parity` pins them.
 #pragma once
 
+#include "strata/common/kernels/draft_rule.hpp"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -27,6 +29,7 @@ struct SamplerParams {
     bool greedy = false;
     const float* logit_bias = nullptr; // optional device array [n_vocab], added BEFORE penalties/filters; -inf bans
     bool gumbel = false;         // STRATA_SPEC_GUMBEL=1: Gumbel-max pick keyed by (seed, counter, token id) - see sampler.cu
+    DraftRule draft_rule;        // which drafts the verifiers that take drafts keep; sample_tokens ignores it
 };
 
 // logits (n_tokens, n_vocab) -> one sampled token id per row in `out`.
@@ -75,14 +78,15 @@ void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const
 void spec_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const int32_t* id_to_sub, int id_vocab,
                        const SamplerParams* params, int32_t* ring, int cap, int j, const int32_t* step_rec,
                        void* scratch, int32_t* out_id, float* out_prob, int32_t* qrows, int gate_pick, float tscale, void* stream);
-// The verify window's head under rejection sampling: row t (< n_tokens - 1) judges the draft dtok[t] (n_tokens - 1
-// ids, device); rows < n_q have the drafter's list at qbuf + t * kSpecQStride (device), the others are point masses.
-// out[t] = the draft when kept, the residual sample when not, a plain sample on the last row; `p.counter` is the
-// window's first position, as sample_tokens.  False (nothing launched) where the split sampler cannot run - the
-// caller then calls sample_tokens (exact match).
+// The verify window's head under p.draft_rule (draft_rule.hpp): row t (< n_tokens - 1) judges the draft dtok[t]
+// (n_tokens - 1 ids, device); rows < n_q have the drafter's list at qbuf + t * kSpecQStride (device), the others are
+// point masses.  out[t] = the draft when kept, another token when not, a plain sample on the last row; `p.counter`
+// is the window's first position, as sample_tokens.  False (nothing launched) where the split sampler cannot run -
+// the caller then calls sample_tokens (exact match). `last_has_draft` also judges dtok[n_tokens - 1],
+// for a batch run split before its window ends (for example by different penalty-history lengths).
 bool sample_tokens_spec(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                         const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
-                        void* stream);
+                        void* stream, bool last_has_draft = false);
 // Explicit gated measure: rows<n_q use mu; n_q==n_tokens means a NULL tail.
 // n_q == 0 permits null qbuf: point-only rows, or plain sampling for T1.
 // Same device-buffer layout as sample_tokens_spec. False is a hard failure:

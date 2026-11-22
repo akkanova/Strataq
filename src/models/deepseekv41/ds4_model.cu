@@ -1153,6 +1153,7 @@ struct Model::Impl {
     int* d_ints = nullptr;            // on the head device: drafts in, picks out
     int64_t verified_p0 = 0;          // the first position of the window verify_rows ran, and its rows
     int verified_rows = 0;
+    strata::kernels::DraftRule draft_rule;   // which drafts pick_verified_rows keeps for a sampled request
     // a sampled round's drafts: the distribution q each one was drawn from (its kept list, on the head device) for
     // verify()'s rule - a point at the draft for the drafter's argmax; and the chain they were drawn with (verify()
     // checks it is its own)
@@ -11909,8 +11910,8 @@ struct Model::Impl {
         return pick_verified_rows(0, p0, drafts, temperature, top_p, top_k, min_p, seed, counter, picks, err);
     }
 
-    /// Applies the existing speculative sampler to one conversation's logit rows, from row0 on; p0 is the position of
-    /// that window's first row (where the penalties' history of its picks ends).
+    /// Picks the tokens of one conversation's verify rows from its logit rows, from row0 on, under draft_rule; p0 is
+    /// the position of that window's first row (where the penalties' history of its picks ends).
     bool pick_verified_rows(int row0, int64_t p0, const std::vector<int>& drafts, float temperature, float top_p,
                             int top_k, float min_p, uint64_t seed, uint64_t counter, std::vector<int>& picks,
                             std::string& err) {
@@ -11921,11 +11922,17 @@ struct Model::Impl {
         if ((!d_ints && !dalloc(hd, d_ints, 64, err)) || (!d_specq && !dalloc(hd, d_specq, kWin, err)))
             return false;
         int m = 0;
+        strata::dsv41k::SamplerParams sp;
+        sp.greedy = temperature <= 0.0f;
+        sp.temperature = temperature;
+        sp.top_p = top_p;
+        sp.top_k = top_k;
+        sp.min_p = min_p;
+        sp.seed = seed;
+        sp.counter = counter;
+        sp.draft_rule = draft_rule;
         // (penalties: row t counts the tokens up to its own position - y and the drafts before it, toks[0 .. p0 + 1 + t))
-        if (temperature <= 0.0f) {
-            strata::dsv41k::SamplerParams sp;
-            sp.greedy = true;
-            sp.temperature = 0.0f;
+        if (sp.greedy || draft_rule.kind == strata::kernels::DraftRule::Exact) {   // each row's plain pick
             int h = 0;
             const int* hr = pen_rows(p0 + 1, T, sp, h);
             strata::dsv41k::sample_tokens(hd.logits + (size_t) row0 * V, T, V, hr, h, sp, d_ints + 16, hd.st);
@@ -11937,10 +11944,11 @@ struct Model::Impl {
             while (m < n && h_idx[m] == drafts[(size_t) m]) ++m;
             picks.assign(h_idx, h_idx + m + 1);
         } else {
-            // row i keeps draft i with probability min(1, p(d) / q(d)), else draws from the residual max(0, p - q)
-            // (never d itself): each row a token distributed as the model's own draw at that position, p through the
-            // request's chain - the top_k / top_p / min_p cut included (the drafter's argmax can lie outside it: p(d) 0,
-            // never kept); past the first rejection the rows do not count
+            // row i keeps draft i or writes another token under the draft rule (draft_rule.hpp; speculative: with
+            // probability min(1, p(d) / q(d)), else a draw from the residual max(0, p - q), each row a token
+            // distributed as the model's own draw at that position), p through the request's chain - the top_k / top_p
+            // / min_p cut included (the drafter's argmax can lie outside it: p(d) 0, never kept); past the first
+            // rejection the rows do not count
             const bool own = drafts_q && dq_temp == temperature && dq_top_p == top_p && dq_top_k == top_k &&
                              dq_min_p == min_p && dq_seed == seed && dq_counter == counter;
             if (!own) {   // the drafter's argmax: q a point at each draft
@@ -11954,14 +11962,6 @@ struct Model::Impl {
             }
             for (int i = 0; i < n; ++i) h_idx[i] = drafts[(size_t) i];
             CK(cudaMemcpyAsync(d_ints + 32, h_idx, (size_t) n * 4, cudaMemcpyHostToDevice, hd.st));
-            strata::dsv41k::SamplerParams sp;
-            sp.greedy = false;
-            sp.temperature = temperature;
-            sp.top_p = top_p;
-            sp.top_k = top_k;
-            sp.min_p = min_p;
-            sp.seed = seed;
-            sp.counter = counter;
             int h = 0;
             const int* hr = pen_rows(p0 + 1, n, sp, h);
             strata::dsv41k::sample_verify(hd.logits + (size_t) row0 * V, n, V, sp, d_specq,
@@ -16186,6 +16186,7 @@ int Model::poll_group(int stage, std::string& err) { return p_->poll_group(stage
 bool Model::finish_group(int group, const std::function<void(int)>& select, std::string& err) {
     return p_->finish_group(group, select, err);
 }
+void Model::set_draft_rule(strata::kernels::DraftRule rule) { p_->draft_rule = rule; }
 int Model::sample_row(int row, float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter) {
     return p_->sample_row(row, t, tp, tk, mp, seed, counter, nullptr, p_->row_positions[row] + 1);
 }

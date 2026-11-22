@@ -11,6 +11,7 @@
 #include "strata/base/gpu/links.hpp"
 #include "strata/common/experts/expert_pages.hpp"
 #include "strata/common/experts/layer_split.hpp"
+#include "strata/common/kernels/draft_rule.hpp"
 #include "strata/common/serve/request.hpp"
 #include "strata/common/spec/step.hpp"
 #include "strata/common/state/conversation_file.hpp"
@@ -96,6 +97,8 @@ struct PagedModelFacts {
     int max_rows = 0;                       ///< the most rows one step may run (its verify windows' room)
     std::vector<int64_t> end_tokens;        ///< the tokens that end an answer
     Sampling sampling;                      ///< a request's sampling before its keys (the old engine's defaults)
+    /// which drafts a sampled request's verify rows keep when --draft-rule is not given (its old engine's rule)
+    strata::kernels::DraftRule draft_rule;
     /// a drafter guesses tokens (propose), its state in the conversations' pages; without one the engine never calls
     /// forget_drafts, propose or switch_drafter
     strata::spec::DraftLimits draft_limits; ///< Defaults for the shared confidence and scheduling rules.
@@ -357,6 +360,8 @@ public:
                         std::string& err, strata::spec::DraftContext* draft) = 0;
     /// Loads (`on`) or gives back the drafter's weights; false (and `err`) when loading failed.
     virtual bool switch_drafter(bool on, std::string& err) = 0;
+    /// Sets which drafts the verify rows of sampled requests keep from the next step on (draft_rule.hpp).
+    virtual void set_draft_rule(strata::kernels::DraftRule rule) = 0;
     /// Prints the INFO lines that start the protocol: `slots` batch slots, `spec` rows a conversation's step may run
     /// (0: no drafting).
     virtual void print_info(int slots, int spec) const = 0;

@@ -617,6 +617,34 @@ test('suffix mode uses engine labels and is submitted as one mutually exclusive 
   assert.deepEqual(calls, [[{drafter: false, suffix_draft: 3, lookup_chain: 0}, 'session']]);
 });
 
+test('the draft acceptance rule is a choice beside the drafter, sent and saved as its text', async () => {
+  const view = {...live, details: {draft_rule: 'exact'}};
+  const {calls, onChange} = recorder(), {element, fire} = mount(view, onChange);
+  /** Gets the rule the drawn choice has selected, and its label. */
+  const selected = root => {
+    const option = root.querySelector('[data-setting="draft_rule"] option[selected]');
+    return [option?.getAttribute('value'), option?.textContent];
+  };
+  assert.deepEqual(selected(element), ['exact', 'Exact']);
+  for (const label of ['Speculative sampling', 'Typical acceptance (Medusa) *', 'Lower temperature *', 'Top 75% *',
+                       'Top 90% *', 'Top 98% *'])
+    assert.ok(element.innerHTML.includes(`>${label}</option>`), label);
+  assert.match(element.innerHTML, /At temperature 0 all options give the same answers/);
+  assert.match(element.innerHTML, /\* this option can change the output distribution"/);
+  fire('change', {target: control('[data-setting]', {dataset: {setting: 'draft_rule'}, value: 'top-90'})});
+  drawMemoryPanel(element, view, onChange);
+  assert.deepEqual(selected(element), ['top-90', 'Top 90% *']);
+  apply(fire);
+  await settle();
+  assert.deepEqual(calls, [[{draft_rule: 'top-90'}, 'session']]);
+  apply(fire, 'default');
+  await settle();
+  assert.equal(calls[1][0].draft_rule, 'exact');
+  const other = mount({...live, details: {draft_rule: 'top-50'}}, onChange).element;
+  assert.deepEqual(selected(other), ['top-50', 'top-50 *']);
+  assert.doesNotMatch(mount(live, onChange).element.innerHTML, /data-setting="draft_rule"/);
+});
+
 test('a drafter the engine did not load is shown, with its words, but cannot be chosen', () => {
   const view = {...live, settings: {...live.settings, drafter: 0, has_drafter: 0},
     details: {drafter_label: 'No MTP drafter loaded'}};

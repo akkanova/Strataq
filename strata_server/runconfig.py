@@ -55,9 +55,11 @@ LIVE_FLAGS = {"memory_mib.gpu0": "--gpu-mib", "memory_mib.ram": "--ram-mib", "to
               "tokens_max": "--tokens-max", "ssd_pause_mib": "--ssd-pause-mib", "rows": "--rows",
               "suffix_draft": "--suffix-draft", "lookup_chain": "--lookup-chain",
               "lookahead": "--lookahead", "concurrent": "--concurrent", "drafter": "--drafter",
-              "save_on_shutdown": "--save-on-shutdown"}
+              "save_on_shutdown": "--save-on-shutdown", "draft_rule": "--draft-rule"}
 # The live settings that are switches: CHANGE_SETTINGS and the run config spell them "on" or "off".
 _LIVE_SWITCHES = ("drafter", "save_on_shutdown")
+# The texts the live draft_rule setting takes (include/strata/common/kernels/draft_rule.hpp, parse_draft_rule).
+_DRAFT_RULE = re.compile(r"exact|speculative|typical|lower-temperature|top-[1-9][0-9]?")
 # The numeric live settings whose range is not "at least 0": (least, most); the engine checks the rest (concurrent
 # against its batch slots, lookahead against rows, rows against its verify windows: 8, or 16 in a wide build).
 _LIVE_RANGE = {"rows": (1, 16), "concurrent": (1, None), "context": (1, None), "vram_conversations": (1, None)}
@@ -95,9 +97,10 @@ def view(cfg: dict, path: str | Path) -> dict:
 
 def check_live(changes, to_default: bool, cards: list[str] | None = None) -> dict:
     """Checks POST /v1/memory's "set" ({setting: value}): gets the values as CHANGE_SETTINGS spells them (whole
-    numbers; _LIVE_SWITCHES "on" or "off"), or raises a ValueError naming the first bad setting or value.  `to_default`:
-    the values are to be saved to the run config too, so only settings with a flag there are accepted; `cards`: the
-    engine's GPU pool settings (get_card_settings), which --gpu-mib holds (one size per card)."""
+    numbers; _LIVE_SWITCHES "on" or "off"; draft_rule its text), or raises a ValueError naming the first bad setting
+    or value.  `to_default`: the values are to be saved to the run config too, so only settings with a flag there are
+    accepted; `cards`: the engine's GPU pool settings (get_card_settings), which --gpu-mib holds (one size per
+    card)."""
     if not isinstance(changes, dict) or not changes:
         raise ValueError('send {"set": {"<setting>": <value>, ...}}')
     out = {}
@@ -111,6 +114,11 @@ def check_live(changes, to_default: bool, cards: list[str] | None = None) -> dic
             if not isinstance(v, bool) and v not in ("on", "off"):
                 raise ValueError(f'{key}: expected true, false, "on" or "off", not {v!r}')
             out[key] = "on" if v in (True, "on") else "off"
+        elif key == "draft_rule":
+            if not isinstance(v, str) or not _DRAFT_RULE.fullmatch(v):
+                raise ValueError(f"draft_rule: expected exact, speculative, typical, lower-temperature or top-1 to "
+                                 f"top-99, not {v!r}")
+            out[key] = v
         else:
             out[key] = _number(key, v, True, *_LIVE_RANGE.get(key, (0, None)))
     return out

@@ -3609,21 +3609,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         // STRATA_SPEC_PROB: the drafter's q lists for this window, judged by rejection sampling (spec_prob.hpp)
         bool judged = false;
         if (sampled && (measure || (spec_q_ != nullptr && spec_nq_ > 0 && T > 1)) && T <= kVerifyMaxT) {
-            if (d_spec_ == nullptr &&
-                strata::core::allocate_device((void**) &d_spec_, (size_t) kVerifyMaxT * (1 +
-                    strata::core::kSpecQStride) * sizeof(int32_t),
-                    {"other", "Device allocations", "Verifier"}) !=
-                    cudaSuccess) {
-                (void) cudaGetLastError();
-                d_spec_ = nullptr;
-            }
-            if (d_spec_ != nullptr) {
+            if (stage_drafts(tokens + 1, T - 1) != nullptr) {
                 const int nq = measure ? spec_nq_ : std::min(spec_nq_, T - 1);
                 int32_t* d_q = d_spec_ + kVerifyMaxT;
-                if ((T == 1 || cudaMemcpyAsync(d_spec_, tokens + 1, (size_t) (T - 1) * sizeof(int32_t), cudaMemcpyHostToDevice, cs_) ==
-                        cudaSuccess) &&
-                    (nq == 0 || cudaMemcpyAsync(d_q, spec_q_, (size_t) nq * strata::core::kSpecQStride * sizeof(int32_t),
-                                               cudaMemcpyHostToDevice, cs_) == cudaSuccess))
+                if (nq == 0 || cudaMemcpyAsync(d_q, spec_q_, (size_t) nq * strata::core::kSpecQStride *
+                                               sizeof(int32_t), cudaMemcpyHostToDevice, cs_) == cudaSuccess)
                     judged = measure
                         ? sample_tokens_proposal(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp,
                                                  d_spec_, d_q, nq, m_out_, cs_)
@@ -4964,6 +4954,7 @@ bool Verifier::sample_rows(int S, std::string& err) {
                 return false;
             }
         }
+        int32_t* drafts = nullptr;   // device: drafts[t] is the token row t + 1 feeds, the draft row t judges
         strata::sample::for_each_row_run(S, last_rows_, last_pos_b_, lengths.data(),
                                          [&](int t, int end, uint64_t counter) {
             strata::kernels::SamplerParams sp = slot_sp_[(size_t) last_rows_[t]];
@@ -4971,12 +4962,23 @@ bool Verifier::sample_rows(int S, std::string& err) {
             if ((sp.greedy || sp.temperature <= 0.0f) && h == 0 && sp.logit_bias == nullptr)
                 return;
             sp.counter = counter;
+            sp.draft_rule = draft_rule_;
             if (h == 0)
                 sp.penalty_last_n = 0;
-            strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, end - t, (int) n_vocab_,
-                                           h ? batch_history_device_ + offsets[(size_t) t] : nullptr, h, sp,
-                                           m_out_ + t, cs_);
+            const float* logits = head_logits_ + (size_t) t * (size_t) n_vocab_;
+            const int32_t* hist = h ? batch_history_device_ + offsets[(size_t) t] : nullptr;
             any = true;
+            // Penalty histories can split a window before its last draft.
+            const bool last_has_draft = strata::sample::has_next_window_row(S, last_rows_, last_pos_b_, end - 1);
+            if ((end - t > 1 || last_has_draft) && draft_rule_.kind != strata::kernels::DraftRule::Exact) {
+                if (drafts == nullptr)
+                    drafts = stage_drafts(last_tokens_ + 1, S - 1);
+                if (drafts != nullptr && strata::kernels::sample_tokens_spec(logits, end - t, (int) n_vocab_, hist, h,
+                                                                             sp, drafts + t, nullptr, 0, m_out_ + t,
+                                                                             cs_, last_has_draft))
+                    return;
+            }
+            strata::kernels::sample_tokens(logits, end - t, (int) n_vocab_, hist, h, sp, m_out_ + t, cs_);
         });
     }
     const cudaError_t e = any ? cudaStreamSynchronize(cs_) : cudaSuccess;
@@ -4986,6 +4988,21 @@ bool Verifier::sample_rows(int S, std::string& err) {
     }
     return true;
 #endif
+}
+
+int32_t* Verifier::stage_drafts(const int32_t* drafts, int n) {
+    if (d_spec_ == nullptr &&
+        strata::core::allocate_device((void**) &d_spec_, (size_t) strata::kernels::kVerifyMaxT *
+            (1 + strata::core::kSpecQStride) * sizeof(int32_t), {"other", "Device allocations", "Verifier"}) !=
+            cudaSuccess) {
+        (void) cudaGetLastError();
+        d_spec_ = nullptr;
+    }
+    if (d_spec_ == nullptr ||
+        (n > 0 && cudaMemcpyAsync(d_spec_, drafts, (size_t) n * sizeof(int32_t), cudaMemcpyHostToDevice, cs_) !=
+                      cudaSuccess))
+        return nullptr;
+    return d_spec_;
 }
 
 bool Verifier::prepare_slot_rows(const int* rows, int S, int base, const int32_t* tokens, const int64_t* pos,

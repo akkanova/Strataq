@@ -42,7 +42,7 @@ int take_paged_options(int& argc, char** argv, const std::string& program, Paged
         std::string* text = nullptr;   ///< instead of `value`, for a word
     };
     int64_t rows = s.step.rows, lookahead = -1, concurrent = -1, mtp_rows = 0;   // -1: chosen after parsing
-    std::string drafter = "on", save_on_shutdown = "off", gpu_mib, popularity_decay;
+    std::string drafter = "on", save_on_shutdown = "off", gpu_mib, popularity_decay, draft_rule;
     const Own own[] = {{"--tokens-min", &s.tokens_min},       {"--tokens-max", &s.tokens_max},
                        {"--conversation-tokens", &s.conversation_context},
                        {"--vram-conversations", &s.vram_conversations},
@@ -57,6 +57,7 @@ int take_paged_options(int& argc, char** argv, const std::string& program, Paged
                        {"--concurrent", &concurrent}, {"--batch-groups", nullptr, &s.batch_groups},
                        {"--pause-dir", nullptr, &s.pause_dir}, {"--copy-back", nullptr, &s.copy_back},
                        {"--drafter", nullptr, &drafter},      {"--remote-experts", nullptr, &s.remote_experts},
+                       {"--draft-rule", nullptr, &draft_rule},
                        {"--save-on-shutdown", nullptr, &save_on_shutdown},
                        {"--prompt-order", nullptr, &s.prompt_order},
                        {"--expert-popularity-decay", nullptr, &popularity_decay},
@@ -117,6 +118,13 @@ int take_paged_options(int& argc, char** argv, const std::string& program, Paged
             std::fprintf(stderr, "%s: %s takes %s\n", name, flag, words);
             return 2;
         }
+    if (strata::kernels::DraftRule rule; !draft_rule.empty()) {
+        if (!strata::kernels::parse_draft_rule(draft_rule, rule)) {
+            std::fprintf(stderr, "%s: --draft-rule takes %s\n", name, strata::kernels::kDraftRuleChoices);
+            return 2;
+        }
+        s.draft_rule = rule;
+    }
     if (std::string err; !gpu_mib.empty() && !parse_i64_list(gpu_mib.c_str(), s.gpu_mib, err)) {
         std::fprintf(stderr, "%s: --gpu-mib takes MiB, one per card of a layer split: %s\n", name, err.c_str());
         return 2;

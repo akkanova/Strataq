@@ -25,6 +25,12 @@ int main() {
             check(parse_option(flag, value) == (valid ? -1 : 2), "word-choice acceptance");
         }
     }
+    for (const char* value : {"exact", "speculative", "typical", "lower-temperature", "top-75", "top-0", "top-100",
+                              "on", ""}) {
+        const std::string v = value;
+        const bool valid = v != "top-0" && v != "top-100" && v != "on";   // (empty: the model's rule)
+        check(parse_option("--draft-rule", value) == (valid ? -1 : 2), "draft-rule acceptance");
+    }
     const char* const names[] = {"STRATA_PREFILL_LAYER_MAJOR", "STRATA_LM_HIP", "DS4_LAYER_MAJOR"};
     for (const char* order : {"auto", "layer", "chunk"}) {
         strata::serve::PagedSettings settings;

@@ -252,6 +252,7 @@ public:
     int propose(strata::serve::PagedPart& last, int session, int32_t, int64_t, int n, int32_t* out,
                 std::string& err, strata::spec::DraftContext* draft) override;
     bool switch_drafter(bool on, std::string& err) override;
+    void set_draft_rule(strata::kernels::DraftRule rule) override { conv_.ver.set_draft_rule(rule); }
     bool wait_state(std::string& err) override;
     void print_info(int slots, int spec) const override;
     void print_done(const strata::serve::RequestDone& done) const override;
@@ -494,6 +495,7 @@ PagedQwen::PagedQwen(Model& m, Conversation& conv, const PagedCards& cards, Mode
     facts.max_rows = strata::kernels::kVerifyMaxT;
     facts.end_tokens = o.eos_ids;
     facts.has_drafter = drafter != nullptr;
+    facts.draft_rule.kind = strata::kernels::DraftRule::Exact;
     // (a shared start is pinned, which needs room for the chain's root and leaf beside it, as for the old engine's pin)
     strata::core::ConversationStateSizes sizes;
     std::string err;

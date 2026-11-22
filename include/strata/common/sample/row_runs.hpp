@@ -23,4 +23,9 @@ void for_each_row_run(int n, const int* owners, const int64_t* pos, const int* h
                                   [&](int first, int end) { draw(first, end, get_row_counter(pos[first])); });
 }
 
+/// Reports whether row r has another input in its verify window, independently of penalty-history run boundaries.
+inline bool has_next_window_row(int n, const int* owners, const int64_t* pos, int r) {
+    return r + 1 < n && owners[r + 1] == owners[r] && pos[r + 1] > pos[r] && pos[r + 1] - 1 == pos[r];
+}
+
 }  // namespace strata::sample

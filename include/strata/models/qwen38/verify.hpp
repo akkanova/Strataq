@@ -336,6 +336,12 @@ public:
         }
         if (next_) next_->set_slot_sampling(slot, sp);
     }
+    /// Sets which drafts the batch window's sampled rows keep (strata-q38's draft rule; draft_rule.hpp).  Set on the
+    /// first stage, it reaches the last.
+    void set_draft_rule(strata::kernels::DraftRule rule) {
+        draft_rule_ = rule;
+        if (next_) next_->set_draft_rule(rule);
+    }
     /// Reserves the sampler's device history before a pipeline wave starts.
     bool reserve_batch_history(size_t tokens, std::string& err);
     /// Supplies host penalty histories in the order of the next batch window's rows (strata-q38; set_slot_history is
@@ -567,6 +573,8 @@ private:
     int32_t* slot_hist_d_ = nullptr;                     ///< the penalty-history rows of the current batch window (device)
     size_t slot_hist_cap_ = 0;
     bool sample_rows(int S, std::string& err);   ///< applies sampling and penalties to the last batch window
+    /// Copies `n` drafts to the head of d_spec_ (allocated on first use) on cs_; null when it cannot.
+    int32_t* stage_drafts(const int32_t* drafts, int n);
     int slot_row_draw(int S, int t, strata::kernels::SamplerParams& sp, const int32_t*& hist, int& hlen, std::vector<int32_t>& hrows, std::string& err);   ///< one row's draw from its slot's reply tail
     int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
     int32_t* commitb_ = nullptr;
@@ -637,6 +645,8 @@ private:
     int spec_nq_ = 0;
     bool spec_measure_ = false;   ///< explicit per-call measure borrow
     int32_t* d_spec_ = nullptr;          ///< device: kVerifyMaxT draft ids, then kVerifyMaxT q rows
+    /// set_draft_rule; Exact: a sampled batch row is drawn as without drafts and compared with its draft
+    strata::kernels::DraftRule draft_rule_{strata::kernels::DraftRule::Exact};
     int hist_len_ = 0;
     bool head_sampling_ = true;          ///< set_head_sampling
 #if defined(STRATA_GPU_METAL)

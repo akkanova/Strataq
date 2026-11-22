@@ -355,6 +355,7 @@ public:
     bool has_batched_drafter() const override { return true; }
     bool propose_batch(std::vector<strata::spec::DraftRequest>& requests, std::string& err) override;
     bool switch_drafter(bool on, std::string& err) override;
+    void set_draft_rule(strata::kernels::DraftRule rule) override { m_.set_draft_rule(rule); }
     void print_info(int slots, int) const override {
         for (const std::string& line : m_.info_lines())
             std::printf("%s\n", line.c_str());

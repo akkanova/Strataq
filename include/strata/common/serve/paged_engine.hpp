@@ -37,7 +37,8 @@
 // `memory_mib.gpu<N>.<card>` for a later card on the GPU of an earlier one,
 // `memory_mib.ram`: a pool takes and gives back memory in chunks of 256 MiB; a shrink evicts the experts of the
 // chunks it gives back and moves or pauses the conversations there), `tokens_min`, `tokens_max`, `context`,
-// `ssd_pause_mib`, `drafter` (off gives its weights back), `concurrent`, `vram_conversations`, `rows` and `lookahead`.
+// `ssd_pause_mib`, `drafter` (off gives its weights back), `draft_rule` (draft_rule.hpp's text), `concurrent`,
+// `vram_conversations`, `rows` and `lookahead`.
 // The GPU residency count includes idle caches and their fixed regions, and cannot fall below `concurrent`.
 // Pool shrinks must accommodate the biggest decoding conversation at the end of its request and the token minimum.
 // The combined GPU token budget is independent of page padding. The per-conversation limit cannot exceed it or the
@@ -52,6 +53,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -106,6 +108,8 @@ struct PagedSettings {
     int64_t lookup_chain = 0, lookup_chain_min = 3; ///< Existing lookup-chain length and match floor.
     int64_t suffix_draft = 0; ///< --suffix-draft: minimum repeated context; 0 disables prompt lookup.
     bool drafter = true;                           ///< --drafter on|off: its weights loaded (with --lookahead)
+    /// --draft-rule: which drafts a sampled request's verify rows keep; unset: the model's (PagedModelFacts)
+    std::optional<strata::kernels::DraftRule> draft_rule;
     /// --save-on-shutdown on|off: when the engine ends, its conversations in the GPUs' and the RAM's pools go to the
     /// SSD (by request priority, then the most recently used, up to --ssd-pause-mib) and stay there for the next
     /// start to adopt.

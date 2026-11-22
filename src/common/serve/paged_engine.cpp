@@ -667,6 +667,9 @@ PagedEngine::PagedEngine(PagedModel& model, PagedCards& cards, strata::core::Ram
             facts_.extra_resident_vram);
     }
     apply_step_settings();
+    if (!settings_.draft_rule)
+        settings_.draft_rule = facts_.draft_rule;
+    model_.set_draft_rule(*settings_.draft_rule);
     if (settings_.conversation_context < 0)
         settings_.conversation_context = std::min(facts_.context, settings_.tokens_max);
     (void) gpu_token_budget_.try_set_limit((uint64_t) settings_.tokens_max);
@@ -2414,7 +2417,8 @@ strata::serve::MemoryReport PagedEngine::describe_memory() const {
                       {"drafter_details", facts_.has_drafter ? "Discovered drafter: " + facts_.drafter_label :
                        "No model drafter was loaded on startup; restart with " + facts_.drafter_start},
                       {"suffix_label", "Use suffix drafter (0 GiB)"},
-                      {"kv_quantization", facts_.kv_quantization}};
+                      {"kv_quantization", facts_.kv_quantization},
+                      {"draft_rule", strata::kernels::get_draft_rule_name(*settings_.draft_rule)}};
     report.settings.emplace_back("has_drafter", facts_.has_drafter ? 1 : 0);
     report.per_conversation = true;
     return report;
@@ -2429,6 +2433,13 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
             if (text != "on" && text != "off")
                 return name + " takes on or off, not " + text;
             (name == "drafter" ? s.drafter : s.save_on_shutdown) = text == "on";
+            continue;
+        }
+        if (name == "draft_rule") {
+            strata::kernels::DraftRule rule;
+            if (!strata::kernels::parse_draft_rule(text, rule))
+                return std::string("draft_rule takes ") + strata::kernels::kDraftRuleChoices + ", not " + text;
+            s.draft_rule = rule;
             continue;
         }
         char* end = nullptr;
@@ -2521,6 +2532,8 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
     settings_.decode_share_percent = s.decode_share_percent;
     settings_.prompt_turn_ms = s.prompt_turn_ms;
     settings_.save_on_shutdown = s.save_on_shutdown;
+    settings_.draft_rule = s.draft_rule;
+    model_.set_draft_rule(*s.draft_rule);
     std::string err;
     if (!s.drafter && settings_.drafter)
         (void) switch_drafter(false, err);

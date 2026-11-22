@@ -2213,6 +2213,19 @@ request keys; a negative floor uses the engine's default. Model adapters run the
 return raw proposals and confidences. DeepSeek's plain step after a rejected model proposal is scheduled here too.
 `--lookahead 0` disables all drafting. `--drafter off` switches off only the model drafter.
 
+**Draft acceptance** (`--draft-rule`, the Memory panel's choice of the same name, `CHANGE_SETTINGS draft_rule=`)
+decides which guesses a sampled request keeps. A greedy request always compares its guesses with the most likely
+token. `exact` keeps a guess only when it is the token the model draws without guesses, so the answers are those of
+decoding without drafts. `speculative` keeps a guess with probability min(1, p/q) and otherwise draws from what is
+left of p (Leviathan et al. 2023, Chen et al. 2023): each token is still distributed as the model's own draw, so the
+answers are as good, though their words can differ from `exact`'s. Three rules keep more guesses and change the
+answers: `typical` (Medusa's typical acceptance, ε = 0.09, δ = 0.3) keeps a guess the model finds likely enough,
+`top-<N>` (N from 1 to 99; the panel offers 75, 90 and 98) one inside the top N% of the model's probability or at
+least as likely as the model's own draw, and `lower-temperature` (top-0) only the latter. A guess they reject is
+replaced by the token decoding without guesses writes there. The defaults are each engine's earlier rule: `exact` in
+`strata-q38`, `speculative` in `strata-ds41`. Both engines decide in one shared function, `pick_verified_token` in
+`include/strata/common/kernels/draft_rule.hpp`. How much each rule changes speed has not been measured yet.
+
 In `strata-ds41`, the Memory panel's Drafter switch (`CHANGE_SETTINGS drafter=off|on`) also releases and
 reloads DSpark's dense tensors. `--drafter off` and `--dspark off` start with those tensors released;
 `--dspark none` loads no DSpark at all. A request's `spec=0` disables proposals for that request only.

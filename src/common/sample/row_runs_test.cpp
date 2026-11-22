@@ -18,6 +18,17 @@ int main() {
         std::fputs("row_runs regression: wrong runs (first, end, counter)\n", stderr);
         return 1;
     }
+    // A history-length change splits a sampler call, but its final row still judges the next input as its draft.
+    std::vector<int> drafts;
+    strata::sample::for_each_row_run(7, owners, pos, history, [&](int first, int end, uint64_t) {
+        const bool last_has_draft = strata::sample::has_next_window_row(7, owners, pos, end - 1);
+        for (int r = first; r < end; ++r)
+            drafts.push_back(r + 1 < end || last_has_draft ? r + 1 : -1);
+    });
+    if (drafts != std::vector<int>{1, 2, -1, 4, -1, 6, -1}) {
+        std::fputs("row_runs regression: drafts crossed a window or stopped at a history boundary\n", stderr);
+        return 1;
+    }
     // Compare against Qwen's original adjacent-row loop, including repeated and decreasing positions.
     for (unsigned pattern = 0; pattern < 65536; ++pattern) {
         int owner[4], length[4];

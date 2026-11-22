@@ -989,22 +989,22 @@ spec_draft_merge_kernel(const int2* __restrict__ cand, int n_blocks, int nv, int
 }
 
 /// THE VERIFIER (one warp per window row): the row's post-chain distribution p from the split sampler's block lists,
-/// then spec_prob.hpp's rule - accept the row's draft d with min(1, p(d)/q(d)) (q from the drafter's list for rows
-/// < n_q, a point mass otherwise), and write out[t] = d on an accept, the residual sample on a reject (never d), the
-/// plain sample on the window's last row.  The host's `while (window[a+1] == out[a]) ++a` is unchanged.  Rows are
-/// independent: each draws its own uniforms from its position (p.counter + t).  `dtok` holds the T-1 drafts.
+/// then pick_verified_token under p.draft_rule (draft_rule.hpp) for the row's draft d (q from the drafter's list for
+/// rows < n_q, a point mass otherwise): out[t] = d when kept, another token when not, the plain sample on the window's
+/// last row.  The host's `while (window[a+1] == out[a]) ++a` is unchanged.  Rows are independent: each draws its own
+/// uniforms from its position (p.counter + t).  `dtok` holds the T-1 drafts.
 template<bool Augmented>
 __global__ void __launch_bounds__(32)
 spec_verify_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_vocab, const SamplerParams p, int k, int T,
                          const int32_t* __restrict__ dtok, const int32_t* __restrict__ qbuf, int n_q,
-                         int* __restrict__ out) {
+                         int* __restrict__ out, bool last_has_draft) {
     const int t = blockIdx.x;
     const int lane = (int) threadIdx.x;
     __shared__ int2 lists[kSplitMaxBlocks * kSelMax];
     __shared__ int sel_ids[kSelMax];
     __shared__ float sel_logit[kSelMax];
     __shared__ double ex[kSelMax];
-    __shared__ double rw[kSelMax];
+    __shared__ double qex[kSelMax];
     const int2* src = cand + (size_t) t * n_blocks * k;
     for (int e = lane; e < n_blocks * k; e += 32) lists[e] = src[e];
     __syncwarp();
@@ -1014,95 +1014,43 @@ spec_verify_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_voca
     __syncwarp();
     const int n_keep = sampled_probs_warp(sel_logit, k, p, ex);
     const uint64_t pos = p.counter + (uint64_t) t;
-    const int d = t < T - 1 ? dtok[t] : -1;
+    const int d = t < T - 1 || last_has_draft ? dtok[t] : -1;
     const bool has_q = t < n_q;
     const int32_t* qid = has_q ? qbuf + (size_t) t * strata::core::kSpecQStride : nullptr;
     const float* qpr = has_q ? (const float*) (qid + strata::core::kSpecQEntries) : nullptr;
-    const auto kind = strata::core::proposal::rowkind(t, T, n_q);
-    // lane 0: p(d), q(d) and the accept decision.  dec: 0 plain sample, 1 accept, 2 reject; point: no usable q(d)
-    int dec = 0, point = 1;
-    if (lane == 0 && d >= 0) {
-        double pd = 0.0;
-        for (int i = 0; i < n_keep; ++i)
-            if (sel_ids[i] == d) { pd = ex[i]; break; }
-        double qd = -1.0;
-        if (has_q)
-            for (int i = 0; i < strata::core::kSpecQEntries && qid[i] >= 0; ++i)
-                if (qid[i] == d) { qd = (double) qpr[i]; break; }
-        point = qd > 0.0 ? 0 : 1;
-        const float u = philox_uniform(p.seed, pos | strata::core::kSpecCtrAccept);
-        dec = (pd > 0.0 && (point ? (double) u < pd : (double) u * qd < pd)) ? 1 : 2;
-        if constexpr (Augmented) {
-            // An explicit mu candidate cannot silently become a point proposal.
-            if (has_q && (!(qd > 0.0) || !isfinite(qd))) dec = 3;
-        }
-    }
-    if constexpr (Augmented) {
-        if (lane == 0 && kind == strata::core::proposal::RowKind::MuOffer && (d < 0 || d >= n_vocab)) dec = 3;
-        if (lane == 0 && kind == strata::core::proposal::RowKind::NullTail) {
-            // Last row (including T=1) has d=-1, no dtok read or acceptance draw.
-            dec = 2; point = 0;
-        }
-    }
-    dec = __shfl_sync(kFullMask, dec, 0);
-    point = __shfl_sync(kFullMask, point, 0);
-    if (dec == 2) {   // the residual weights over p's support: max(0, p - q), or p without d for a point mass
-        for (int i = lane; i < n_keep; i += 32) {
-            double wi;
-            if (point) {
-                wi = sel_ids[i] == d ? 0.0 : ex[i];
-            } else {
-                double qi = 0.0;
-                for (int j = 0; j < strata::core::kSpecQEntries && qid[j] >= 0; ++j)
-                    if (qid[j] == sel_ids[i]) { qi = (double) qpr[j]; break; }
-                wi = ex[i] - qi;
-                if (wi < 0.0) wi = 0.0;
-            }
-            rw[i] = wi;
-        }
+    // q of the drafter's list at id (0 when the list does not hold it)
+    auto q_at = [&](int id) {
+        for (int j = 0; j < strata::core::kSpecQEntries && qid[j] >= 0; ++j)
+            if (qid[j] == id) return (double) qpr[j];
+        return 0.0;
+    };
+    if (has_q) {   // q over p's kept list, which a residual reads
+        for (int i = lane; i < n_keep; i += 32) qex[i] = q_at(sel_ids[i]);
         __syncwarp();
     }
-    if (lane == 0) {
-        int tok;
-        if (dec == 3) {
+    if (lane != 0) return;
+    const auto kind = strata::core::proposal::rowkind(t, T, n_q);
+    const double qd = has_q && d >= 0 ? q_at(d) : -1.0;
+    auto q_of = [&](int i) { return qex[i]; };
+    const DraftUniforms u{philox_uniform(p.seed, pos), philox_uniform(p.seed, pos | strata::core::kSpecCtrAccept),
+                          philox_uniform(p.seed, pos | strata::core::kSpecCtrResid)};
+    int tok;
+    if constexpr (Augmented) {
+        // An explicit mu candidate cannot silently become a point proposal; the last row of a NULL tail (including
+        // T=1) has no draft, so it draws from the residual directly.
+        if ((has_q && d >= 0 && (!(qd > 0.0) || !isfinite(qd))) ||
+            (kind == strata::core::proposal::RowKind::MuOffer && (d < 0 || d >= n_vocab)))
             tok = strata::core::proposal::kProposalSamplerErrorToken;
-        } else if (dec == 0) {   // no draft on this row: the plain sample, the exact-match sampler's own draw
-            const float u = philox_uniform(p.seed, pos);
-            double cum = 0.0;
-            tok = sel_ids[n_keep > 0 ? n_keep - 1 : 0];
-            for (int i = 0; i < n_keep; ++i) {
-                cum += ex[i];
-                if ((double) u < cum) { tok = sel_ids[i]; break; }
-            }
-        } else if (dec == 1) {
-            tok = d;
-        } else {
-            double sum = 0.0;
-            for (int i = 0; i < n_keep; ++i) sum += rw[i];
-            if (!(sum > 0.0)) {
-                if constexpr (Augmented) {
-                    tok = kind == strata::core::proposal::RowKind::NullTail
-                        ? strata::core::proposal::kProposalSamplerErrorToken : d;
-                } else {
-                    tok = d;   // preserve the legacy non-NULL rounding behavior
-                }
-            } else {
-                const float u = philox_uniform(p.seed, pos | strata::core::kSpecCtrResid);
-                double cum = 0.0;
-                int last = -1;
-                tok = sel_ids[0];
-                bool done = false;
-                for (int i = 0; i < n_keep; ++i) {
-                    if (!(rw[i] > 0.0)) continue;
-                    last = i;
-                    cum += rw[i] / sum;
-                    if ((double) u < cum) { tok = sel_ids[i]; done = true; break; }
-                }
-                if (!done && last >= 0) tok = sel_ids[last];
-            }
-        }
-        out[t] = tok;
+        else if (kind == strata::core::proposal::RowKind::NullTail)
+            tok = draw_residual(sel_ids, ex, n_keep, d, false, q_of, u.resid);
+        else
+            tok = pick_verified_token(p.draft_rule, sel_ids, ex, n_keep, d, qd, q_of, u);
+        if (tok < 0)   // (a NULL tail's residual without mass)
+            tok = strata::core::proposal::kProposalSamplerErrorToken;
+    } else {
+        tok = pick_verified_token(p.draft_rule, sel_ids, ex, n_keep, d, qd, q_of, u);
     }
+    out[t] = tok;
 }
 
 // Which sampled path runs, read once: `STRATA_OLD_SAMPLER=1` is `sampler_kernel` (engine 0.1.20),
@@ -1353,7 +1301,7 @@ void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const
 template<bool Augmented>
 static bool sample_tokens_spec_impl(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                         const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
-                        void* stream) {
+                        void* stream, bool last_has_draft) {
     if constexpr (Augmented) {
         if (n_tokens < 1 || n_q < 0 || n_q > n_tokens || (n_q > 0 && qbuf == nullptr) ||
             (n_tokens > 1 && dtok == nullptr)) return false;
@@ -1370,7 +1318,7 @@ static bool sample_tokens_spec_impl(const float* logits, int n_tokens, int n_voc
     sampler_split_part_kernel<<<dim3((unsigned) n_blocks, (unsigned) n_tokens), kSplitWarps * 32, 0,
                                 (cudaStream_t) stream>>>(logits, n_vocab, history, history_len, p, k, n_blocks, scratch);
     spec_verify_merge_kernel<Augmented><<<(unsigned) n_tokens, 32, 0, (cudaStream_t) stream>>>(scratch, n_blocks, n_vocab, p, k,
-                                                                                    n_tokens, dtok, qbuf, n_q, out);
+                                                                                    n_tokens, dtok, qbuf, n_q, out, last_has_draft);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         if constexpr (Augmented) return false;
@@ -1386,14 +1334,16 @@ static bool sample_tokens_spec_impl(const float* logits, int n_tokens, int n_voc
 
 bool sample_tokens_spec(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                         const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
-                        void* stream) {
-    return sample_tokens_spec_impl<false>(logits, n_tokens, n_vocab, history, history_len, p, dtok, qbuf, n_q, out, stream);
+                        void* stream, bool last_has_draft) {
+    return sample_tokens_spec_impl<false>(logits, n_tokens, n_vocab, history, history_len, p, dtok, qbuf, n_q, out, stream,
+                                           last_has_draft);
 }
 
 bool sample_tokens_proposal(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                         const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
                         void* stream) {
-    return sample_tokens_spec_impl<true>(logits, n_tokens, n_vocab, history, history_len, p, dtok, qbuf, n_q, out, stream);
+    return sample_tokens_spec_impl<true>(logits, n_tokens, n_vocab, history, history_len, p, dtok, qbuf, n_q, out,
+                                          stream, false);
 }
 
 void spec_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const int32_t* id_to_sub, int id_vocab,
