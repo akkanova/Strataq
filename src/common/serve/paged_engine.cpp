@@ -2237,7 +2237,8 @@ strata::serve::MemoryReport PagedEngine::describe_memory() const {
         gpu.pool_shared = r.outside.bytes;
         gpu.dedicated_full = card.index < dedicated_full_.size() && dedicated_full_[card.index];
         gpu.kept_free = settings_.get_vram_reserve_bytes();
-        gpu.beyond_dedicated = get_unusable_share(card.dev);
+        if (has_found_share_end(card.dev))
+            gpu.dedicated_room = get_dedicated_room(card.dev);
         report.experts_pending += filling_since_ ? card.experts.get_missing_count() : 0;
     }
     strata::serve::Memory& ram = report.at("ram");

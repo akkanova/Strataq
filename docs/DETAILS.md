@@ -1031,8 +1031,10 @@ the GPU keeps the size the runtime reports.
 `GET /v1/memory` returns `{"available", "loaded", "machine": {"ram_total", "ram_free", "gpus"}, "busy", "error", "at",
 "memories": [{"id", "name", "total", "free", "unified", "uses": {<use>: bytes}, "paused_count", "paused_budget",
 "other"}], "settings": {<key>: number}}`; the page-pool engines' GPUs also have `kept_free` (the reserve) and
-`beyond_dedicated` (the part of the share found unusable) in bytes, from their `MEMORY` lines' `kept_free=<B>` and
-`beyond_dedicated=<B>` (`null` when the line has none). `machine` is the server's own reading of the RAM and of the GPUs
+`dedicated_room` (the space left below the measured dedicated-memory limit after all programs' current use) in bytes,
+from their `MEMORY` lines' `kept_free=<B>` and `dedicated_room=<B>` (`null` when the line has none).
+`dedicated_room` is absent until a growth finds the limit; zero means no room remains.
+`machine` is the server's own reading of the RAM and of the GPUs
 (the hardware sampler of `GET /metrics`). The engine's `ram` gets the machine's size and free RAM; `other` is what is in
 use in a memory beyond the uses the engine names (other programs, buffers the engine does not count). A value the engine
 does not know is `null` or left out of `uses`. `busy` and `available` mean what they mean for `GET /api/context`.
@@ -1081,10 +1083,13 @@ a card (352 on a later card of a layer split), what the old engine measured afte
 drafter's head. The Memory panel changes the reserve while the engine runs ("VRAM kept free for other programs",
 `vram_reserve_mib`). A change counts from the next growth: in the largest size the panel offers, and in what a growth
 gives back or holds to keep it free in dedicated memory. Saved as the default, it counts from the next start. It does
-not
-resize a pool by itself. The GPU's bar shows the reserve as "Kept free for other programs", at the start of the free
-memory (no more than is free). After a growth found where the dedicated memory ends, the part of the share that was
-still free then but could not be used shows as "Not usable as dedicated memory", at the end of the free memory.
+not resize a pool by itself. The GPU's bar shows the reserve as "Kept free for other programs", at the start of the free
+memory (no more than is free and usable). After a growth found where the dedicated memory ends, the free memory past
+that end shows as "Not usable as dedicated memory", at the end of the free memory. The engine finds the end with D3DKMT
+statistics and the bar's free memory comes from the performance counters, which count other programs about 0.58 GiB
+higher on the Strix Halo (2026-11-22, strata-q38), so the engine says how much dedicated memory is still usable
+(`dedicated_room`) and the panel draws the rest of the free memory as unusable: 0.58 GiB there, where 63.23 of the
+63.83 GiB share was the most ever in use.
 
 The engine's command (include/strata/common/serve/memory_report.hpp; the engine's `READY` line says `memory`):
 

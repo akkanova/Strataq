@@ -143,8 +143,10 @@ export function drawMemoryPanel(element, view, onChange) {
  * `setting`: the size of the engine's page pool there now, which `memory_mib.<id>` changes; `smallest`, `largest`:
  * the sizes it accepts now (a GPU's `largest`: what its dedicated memory holds, as last measured).  `pool_shared`: the
  * bytes of the pool in a GPU's shared memory; `dedicated_full`: its last growth stopped where the dedicated memory
- * ended.  `kept_free`: what the engine's pools leave free there for other programs; `beyond_dedicated`: the part of
- * a GPU's dedicated memory its pool's last growth found unusable.  Bytes.
+ * ended.  `kept_free`: what the engine's pools leave free there for other programs; `dedicated_room`: bytes below
+ * the measured dedicated-memory limit minus all programs' current use, from Windows' D3DKMT statistics. Absent
+ * until a growth finds the limit; zero means full. The bar's free-memory counter can differ, so room is capped
+ * at `free` and the rest of `free` is drawn as unusable.  Bytes.
  * @typedef {{id: string, name: string | null, total: number | null, free: number | null, unified: boolean,
  *   uses: Record<string, number>, paused_count: number | null, paused_budget: number | null,
  *   other?: number, other_apps?: number,
@@ -152,7 +154,7 @@ export function drawMemoryPanel(element, view, onChange) {
  *   in_share?: number, borrowed?: number | null, gpu_borrowed?: number, allocated_pct?: number | null,
  *   fragmented_pct?: number | null, setting?: number | null, pool_offset?: number | null, smallest?: number | null,
  *   largest?: number | null, pool_shared?: number | null, dedicated_full?: boolean, kept_free?: number | null,
- *   beyond_dedicated?: number | null}} MemoryUse
+ *   dedicated_room?: number | null}} MemoryUse
  * @typedef {{category: string, pool: string, label: string, bytes: number,
  *   identity_group?: string, ids?: number[]}} MemoryBlock
  * @typedef {{id: string, place: string, state: string, count: number, capacity: number, bytes: number,
@@ -542,9 +544,9 @@ function layOut(x) {
     parts.push({use: "borrowed", bytes: x.gpu_borrowed});
   if (x.free != null) {
     // (the reserve at the start of the free memory, the dedicated memory found unusable at its end)
-    const kept = Math.min(x.kept_free ?? 0, x.free), beyond = Math.min(x.beyond_dedicated ?? 0, x.free - kept);
-    parts.push(...[{use: "kept_free", bytes: kept}, {use: "free", bytes: x.free - kept - beyond},
-                   {use: "beyond_dedicated", bytes: beyond}].filter((p) => p.use === "free" || p.bytes > 0));
+    const room = Math.min(x.dedicated_room ?? x.free, x.free), kept = Math.min(x.kept_free ?? 0, room);
+    parts.push(...[{use: "kept_free", bytes: kept}, {use: "free", bytes: room - kept},
+                   {use: "beyond_dedicated", bytes: x.free - room}].filter((p) => p.use === "free" || p.bytes > 0));
   }
   const outside = x.other_apps ?? x.other;
   if (outside)

@@ -164,12 +164,11 @@ strata::core::ChunkMemory get_gpu_chunk_memory(int dev, uint64_t chunk_bytes, bo
 /// Strix Halo (Windows 11, a 63.83 GiB share, 2026-11-21, two rounds) a test program held 54.50 GiB with 256 MiB
 /// pieces and 58.06-58.08 GiB with 256 then 16 MiB pieces. No value for another GPU, or on Linux.
 std::optional<uint64_t> get_share_top(int dev);
-/// Gets the bytes of integrated GPU `dev`'s dedicated memory that no program used when one of get_gpu_chunk_memory's
-/// chunks last went to shared memory instead: the share's size less get_share_top.  0 before any chunk did, for another
-/// GPU and on Linux.
-uint64_t get_unusable_share(int dev);
-/// Gets an estimate of the bytes integrated GPU `dev`'s dedicated memory still takes: get_share_top less every
-/// program's bytes there now.  No value for another GPU, or on Linux.
+/// Reports whether a chunk from get_gpu_chunk_memory has reached integrated GPU `dev`'s shared memory,
+/// establishing a measured dedicated-memory limit for get_share_top.
+bool has_found_share_end(int dev);
+/// Estimates the room below get_share_top after all programs' current use of integrated GPU `dev`'s dedicated memory.
+/// Returns zero when full, or no value if the Windows statistics are unavailable.
 std::optional<uint64_t> get_dedicated_room(int dev);
 /// While it lives, holds `bytes` (rounded up to kPieceBytes) of integrated GPU `dev`'s free dedicated memory, or as
 /// much as fits, with placeholder allocations (those that land there, until one does not), so that a pool growing into shared memory

@@ -612,18 +612,26 @@ test('the VRAM kept free for other programs is a number box the engine changes l
 
 test('free memory shows the reserve at its start and unusable dedicated memory at its end', () => {
   const card = {id: 'gpu0', total: 16 * GIB, free: 3 * GIB, uses: {weights: 4 * GIB, experts: 9 * GIB},
-    kept_free: 512 * MIB, beyond_dedicated: GIB};
+    kept_free: 512 * MIB, dedicated_room: 2 * GIB};
   const [row] = rows(draw({available: true, memories: [card], settings: {}}));
   const uses = [...row.matchAll(/class="mem-seg" data-use="([^"]*)"/g)].map(m => m[1]);
   assert.deepEqual(uses.slice(-3), ['kept_free', 'free', 'beyond_dedicated']);
   assert.deepEqual(widths(row).slice(-3), [100 / 32, 100 * 1.5 / 16, 100 / 16]);
   assert.match(row, /title="Kept free for other programs: 512 MiB\. Memory Strata leaves free/);
   assert.match(row, /title="Not usable as dedicated memory: 1.00 GiB\. Free in the graphics chip's own memory/);
-  // bounded by what is free: the reserve first
+  // Room is capped by free memory, and the reserve by usable room.
   const [short] = rows(draw({available: true, memories: [{...card, free: 256 * MIB}], settings: {}}));
   assert.deepEqual([...short.matchAll(/class="mem-seg" data-use="([^"]*)"/g)].map(m => m[1]).slice(-2),
     ['kept_free', 'free']);
   assert.match(short, /Kept free for other programs 256 MiB[^]*Free 0 MiB/);
+  const [limited] = rows(draw({available: true, memories: [{...card, dedicated_room: 256 * MIB}], settings: {}}));
+  assert.deepEqual(widths(limited).slice(-3), [100 / 64, 0, 100 * 2.75 / 16]);
+  const [full] = rows(draw({available: true, memories: [{...card, dedicated_room: 0}], settings: {}}));
+  assert.doesNotMatch(full, /data-use="kept_free"/);
+  assert.deepEqual(widths(full).slice(-2), [0, 100 * 3 / 16]);
+  const [unknown] = rows(draw({available: true, memories: [{...card, dedicated_room: null}], settings: {}}));
+  assert.doesNotMatch(unknown, /data-use="beyond_dedicated"/);
+  assert.deepEqual(widths(unknown).slice(-2), [100 / 32, 100 * 2.5 / 16]);
   const [scaled] = rows(draw({available: true, settings: {}, memories: [{...card,
     uses: {weights: 8 * GIB, experts: 16 * GIB}, in_share: 12 * GIB, other_apps: GIB}]}));
   assert.equal(widths(scaled).reduce((a, b) => a + b, 0), 100);

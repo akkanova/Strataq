@@ -287,10 +287,9 @@ std::optional<uint64_t> get_share_top(int dev) {
     return it != share_tops.end() ? it->second : share.size;
 }
 
-uint64_t get_unusable_share(int dev) {
-    strata::platform::GpuLocalMemory share;
-    const std::optional<uint64_t> top = get_share_top(dev);
-    return top && strata::core::read_share_use(dev, share) ? share.size - std::min(*top, share.size) : 0;
+bool has_found_share_end(int dev) {
+    const std::lock_guard<std::mutex> lock(share_tops_mutex);
+    return share_tops.count(dev) > 0;
 }
 
 std::optional<uint64_t> get_dedicated_room(int dev) {

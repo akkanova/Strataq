@@ -85,10 +85,13 @@ int main() {
               "largest=2048 name=card\nSETTINGS\nEND_MEMORY\n",
           "a pool's setting and its range, before the name");
     card.kept_free = 512;
-    card.beyond_dedicated = 64;
-    check(format_memory_report(pool, {}).find("largest=2048 kept_free=512 beyond_dedicated=64 name=card\n") !=
+    card.dedicated_room = 64;
+    check(format_memory_report(pool, {}).find("largest=2048 kept_free=512 dedicated_room=64 name=card\n") !=
               std::string::npos,
-          "the reserve and the unusable dedicated memory, before the name");
+          "the reserve and the usable dedicated memory, before the name");
+    card.dedicated_room = 0;
+    check(format_memory_report(pool, {}).find("dedicated_room=0 name=card\n") != std::string::npos,
+          "no dedicated room is distinct from an unknown limit");
     budget.at("ram").mapped = 7;
     budget.shortfall = "the GPU's pool: out of memory";
     check(format_memory_report(budget, {}) == "MEMORY ram paused_count=0 paused_budget=5 mapped=7\nSETTINGS\n"

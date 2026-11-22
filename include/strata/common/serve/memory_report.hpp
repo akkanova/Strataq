@@ -5,7 +5,7 @@
 //   GET_MEMORY_USE
 //     MEMORY <id> [total=<B>] [free=<B>] [unified=1] [<use>=<B> ...] [paused_count=<n>] [paused_budget=<B>]
 //            [pool_pages=<n> allocated_pages=<n> fragmented_pages=<n>] [setting=<B> smallest=<B> largest=<B>]
-//            [pool_shared=<B>] [dedicated_full=1] [kept_free=<B>] [beyond_dedicated=<B>] [mapped=<B>]
+//            [pool_shared=<B>] [dedicated_full=1] [kept_free=<B>] [dedicated_room=<B>] [mapped=<B>]
 //            [name=<text>]                                                               one line per memory, then
 //     [MEMORY_BLOCK <memory-id> <bytes> <category> <pool> <label> [<identity-group> <ids>]] labelled allocations
 //     [PAUSE_DIRECTORY <path>]                                                  folder for automatic SSD pauses
@@ -34,11 +34,13 @@
 // integrated GPU's pool that went to shared memory; dedicated_full=1: the pool's last growth stopped
 // where the dedicated memory ended (CHANGE_SETTINGS' shared_memory=on lets the next one go on).  kept_free: the bytes
 // the engine's pools leave unallocated on the GPU for other programs (its `vram_reserve_mib` setting).
-// beyond_dedicated: the bytes of an integrated GPU's dedicated memory that no program used when a pool's chunk last
-// went to shared memory instead, which no pool can take as dedicated memory.  mapped: the
-// bytes of it that are page-locked for the GPUs to read (strata-q38's RAM pool); Windows counts them in a GPU's shared
-// use too, so a reader takes them off that.  name: the device's name, to the end of the line.  settings: the context
-// in tokens, the conversations decoded at once, the rows one step computes, the most guesses one conversation adds in
+// dedicated_room: the bytes still available below an integrated GPU's measured dedicated-memory limit, after all
+// programs' current use (Windows' D3DKMT statistics). Absent until a pool's growth finds that limit; 0 means full.
+// Readers using another counter for free memory clamp this to their free bytes and draw the rest as unusable.
+// mapped: the bytes of it that are page-locked for the GPUs to read (strata-q38's RAM pool); Windows counts them in a
+// GPU's shared use too, so a reader takes them off that. name: the device's name, to the end of the line.
+// settings: the context in tokens, the conversations decoded at once, the rows one step computes,
+// the most guesses one conversation adds in
 // a step, the conversation tokens kept free of experts, and what else the engine can change.  EXPERT_FILL (the paged
 // engines, which fill their expert pools after READY): loaded=1 when no pool can take more experts now, which an
 // eviction or a grown pool turns back to 0; pending: the experts the pools should hold and do not, counting those that
@@ -88,7 +90,8 @@ struct Memory {
     uint64_t pool_shared = 0;     ///< the bytes of the GPU's pool in shared memory instead of dedicated
     bool dedicated_full = false;  ///< the pool's last growth stopped at the end of the GPU's dedicated memory
     uint64_t kept_free = 0;          ///< the bytes the pools leave unallocated on the GPU for other programs
-    uint64_t beyond_dedicated = 0;   ///< the bytes of the GPU's dedicated memory found unusable (get_unusable_share)
+    /// Bytes below the measured dedicated-memory limit minus all programs' use; absent until that limit is found.
+    std::optional<uint64_t> dedicated_room;
 
     /// Adds `bytes` to use `use`; a zero adds nothing.
     void add(const std::string& use, uint64_t bytes) {
@@ -206,8 +209,8 @@ inline std::string format_memory_report(MemoryReport report, const std::vector<c
             put("dedicated_full", 1);
         if (m.kept_free > 0)
             put("kept_free", m.kept_free);
-        if (m.beyond_dedicated > 0)
-            put("beyond_dedicated", m.beyond_dedicated);
+        if (m.dedicated_room)
+            put("dedicated_room", *m.dedicated_room);
         if (m.mapped > 0) put("mapped", m.mapped);
         if (!m.name.empty()) s += " name=" + m.name;
         s += '\n';
