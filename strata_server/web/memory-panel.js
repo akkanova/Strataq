@@ -77,7 +77,7 @@ const SETTINGS = {context: "Per-conversation token limit", concurrent: "Conversa
                   step_profile: "Log each step's timing",
                   vram_reserve_mib: "Reserve free VRAM (MiB)",
                   slots: "Maximum conversations at once", batch_groups: "Batch groups (0: auto)",
-                  route_tail_skip: "Minimum experts per layer",
+                  route_tail_skip: "⚠ Minimum experts per layer",
                   route_prior_pct: "⚠ Bias toward loaded experts (%)",
                   draft_confidence_pct: "Min draft confidence per token (%)",
                   draft_cumulative_pct: "Minimum draft confidence (%)",
@@ -648,7 +648,10 @@ function describeControl(key, settings, details) {
       "the top N are always used. A lower-ranked expert that is not in the GPU is left out (neither read nor " +
       "computed) when it is outside the top N for every token of the step; the others keep their original weights. " +
       "This speeds up decoding when experts are missing from the GPU, and changes the answers slightly. Smaller " +
-      "numbers leave out more. It does nothing while every expert is in the GPU. " +
+      "numbers leave out more. If you use it with Qwen3.8-Flash-Next, we recommend at least 7. At 7, the most " +
+      "likely next token matched a run without skipping 97.5-98.2% of the time (top-1 agreement; perplexity " +
+      "x1.005-1.011). Measured with engine 0.1.42 on 28 chat prompts: RTX 3060 12 GB, IQ3_XXS, and RTX A4000 " +
+      "16 GB, Q2_0. It does nothing while every expert is in the GPU. " +
       "Empty or 0 uses all the experts the model picks.";
   if (key === "route_prior_pct")
     return ROUTE_PRIOR_WARNING + " When the experts are picked, one already on the GPU counts as this many " +
