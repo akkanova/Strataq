@@ -258,10 +258,13 @@ class FadingSums {
       for (const k of new Set([...Object.keys(sums), ...Object.keys(values)]))
         sums[k] = (sums[k] || 0) * keep ** seconds + (values[k] || 0);
   }
-  /** Gets sum `a` over sum `b` times `scale` from the slow sums or the live ones, or null while `b` has nothing. */
+  /**
+   * Gets sum `a` over sum `b` times `scale` from the slow sums or the live ones, or null while `b` has nothing or
+   * `a` was never added (a STATS key an older engine does not send).
+   */
   ratio(a, b, slow, scale = 1) {
     const sums = slow ? this.slow : this.now;
-    return sums[b] > 0 ? scale * (sums[a] || 0) / sums[b] : null;
+    return sums[b] > 0 && a in sums ? scale * sums[a] / sums[b] : null;
   }
 }
 /** The Generation and Prefill cards' moving averages (trackSpeeds), and what they were last computed from. */
@@ -337,13 +340,14 @@ function showSpeeds(live, last, totals, {generating, reading}, rowsSetting) {
 
 /**
  * Gets the Generation card's right-hand lines from a paged engine's decode steps (`sums`, FadingSums of the STATS
- * line's decode totals): rows per step, experts per row, the CPU's experts and how much the rows' shared experts
- * saved, and the share of guesses kept.  `slow`: the recent averages instead of the live ones.  `rowsSetting`: the
- * Memory panel's rows per step.  None for an engine without STATS.
+ * line's decode totals): rows and conversations per step, experts per row, the CPU's experts and how much the rows'
+ * shared experts saved, and the share of guesses kept.  `slow`: the recent averages instead of the live ones.
+ * `rowsSetting`: the Memory panel's rows per step.  None for an engine without STATS.
  */
 function describeDecode(sums, slow, rowsSetting) {
   const ratio = (a, b) => sums.ratio(a, b, slow);
-  const rows = ratio("rows", "steps"), experts = ratio("experts", "routed_rows");
+  const rows = ratio("rows", "steps"), conversations = ratio("conversations", "steps");
+  const experts = ratio("experts", "routed_rows");
   const alone = ratio("routings", "routed_rows");
   const kept = ratio("kept", "guesses"), sharing = experts != null && alone ? 1 - experts / alone : null;
   if (rows == null)
@@ -352,7 +356,9 @@ function describeDecode(sums, slow, rowsSetting) {
   return [
     [`${fmt(rows, 1)} tokens/step`, "Average rows in use. A step is one pass through the model; it computes a " +
       "row for each token: a conversation's next token, or a guessed token being checked. " +
-      (rowsSetting ? `Each pipeline group is set to at most ${rowsSetting} rows per step.` : "")],
+      (rowsSetting ? `Each pipeline group is set to at most ${rowsSetting} rows per step.` : "") +
+      (conversations == null ? "" :
+        `\nNumber of simultaneous conversations: ${fmt(conversations, Number.isInteger(conversations) ? 0 : 1)}`)],
     [`${fmt(experts)} experts/token`, "Routed experts computed per step, divided by the step's rows (a row is one " +
       `token here). ${alone ? `One row alone uses ${fmt(alone)}. ` : ""}The shared expert that every token uses ` +
       "is counted with the Weights, not here. Counted only while some experts are outside VRAM."],

@@ -40,11 +40,11 @@ class MonitorTab(unittest.TestCase):
 
     def polls(self, polls, last=None, totals=None, wait_ms=0):
         """Runs the cards' code over /metrics `polls` (live objects) `wait_ms` apart; returns each poll's cards, by
-        key: [value, sub, idle, tooltip, right-hand lines]."""
+        key: [value, sub, idle, tooltip, right-hand lines, their tooltips]."""
         block = cards_block((WEB / "app.js").read_text(encoding="utf-8"))
         script = ("let shown = {}; const fmt = (n, d = 0) => Number(n).toFixed(d);\n"
                   "const setMetric = (k, v, unit, sub, o = {}) => { shown[k] = [v, sub, !!o.idle, o.tip || \"\"]; };\n"
-                  "const setSide = (k, lines) => shown[k].push(lines.map((l) => l[0]));\n"
+                  "const setSide = (k, lines) => shown[k].push(lines.map((l) => l[0]), lines.map((l) => l[1]));\n"
                   f"{block}\nconst speeds = {{gen: new FadingSums(), decode: new FadingSums(), "
                   "prefill: new FadingSums(), stats: null, at: null};\nconst out = [];\nlet clock = 0; performance.now = () => clock;\n"
                   f"for (const live of {json.dumps(polls)}) {{ shown = {{}}; showSpeeds(live, {json.dumps(last)}, "
@@ -86,21 +86,38 @@ class MonitorTab(unittest.TestCase):
         self.assertEqual(polls[3]["gen"][0], "24.9", "96% of it is kept: (30 * .96 + 20) / 1.96")
 
     @staticmethod
-    def stats(seconds, steps, rows, experts, routings, cpu, guesses, kept, tokens, ms):
-        return {"seconds": seconds, "gpus": [], "prefill": {"tokens": tokens, "ms": ms},
-                "decode": {"steps": steps, "rows": rows, "routed_rows": rows, "routings": routings,
-                           "experts": experts, "cpu_experts": cpu, "guesses": guesses, "kept": kept}}
+    def stats(seconds, steps, rows, experts, routings, cpu, guesses, kept, tokens, ms, conversations=None):
+        """A STATS line's object; `conversations` None leaves that key out, as an older engine does."""
+        decode = {"steps": steps, "rows": rows, "routed_rows": rows, "routings": routings, "experts": experts,
+                  "cpu_experts": cpu, "guesses": guesses, "kept": kept}
+        if conversations is not None:
+            decode["conversations"] = conversations
+        return {"seconds": seconds, "gpus": [], "prefill": {"tokens": tokens, "ms": ms}, "decode": decode}
 
     def test_a_paged_engine_s_totals_give_the_step_lines_and_a_prefill_rate_without_decode_turns(self):
-        first = self.stats(10, 100, 200, 90000, 105600, 0, 100, 50, 4000, 3000)
-        second = self.stats(11, 110, 226, 102350, 119328, 0, 116, 59, 5000, 3500)
+        first = self.stats(10, 100, 200, 90000, 105600, 0, 100, 50, 4000, 3000, 150)
+        second = self.stats(11, 110, 226, 102350, 119328, 0, 116, 59, 5000, 3500, 170)
         polls = self.polls([{"state": "reading", "tok_s": 20.0, "engine_stats": first},
                             {"state": "reading", "tok_s": 20.0, "engine_stats": second}], wait_ms=1000)
         gen, prefill = polls[1]["gen"], polls[1]["prefill"]
         self.assertEqual(gen[4], ["2.6 tokens/step", "475 experts/token", "0 on CPU, 10% PRES", "56% MTP acceptance"],
                          "26 rows in 10 steps; 12350 experts for 26 rows that alone use 528 each; 9 of 16 kept")
+        self.assertTrue(gen[5][0].endswith("\nNumber of simultaneous conversations: 2"), gen[5][0])
         self.assertEqual(prefill[:2], ["2000", "Now"], "1000 tokens in the 500 ms spent reading, not in the second")
         self.assertIn("50% of time reading", prefill[4])
+
+    def test_conversations_per_step_follow_the_live_and_recent_weights(self):
+        def poll(seconds, steps, conversations, state="generating"):
+            return {"state": state, "tok_s": 20 if state == "generating" else None,
+                    "engine_stats": self.stats(seconds, steps, 2 * steps, 0, 0, 0, 0, 0, 0, 0, conversations)}
+        polls = self.polls([poll(10, 0, 0), poll(11, 10, 10), poll(12, 30, 50), poll(12, 30, 50, "idle")],
+                           wait_ms=1000)
+        for p, expected in zip(polls[1:], ("1", "1.8", "1.7")):
+            self.assertTrue(p["gen"][5][0].endswith(f"\nNumber of simultaneous conversations: {expected}"),
+                            "1 in 10 steps, then 2 in 20: (10 * .6 + 40) / (10 * .6 + 20), then 96% kept")
+        older = self.polls([{"state": "generating", "tok_s": 20, "engine_stats": self.stats(*args)}
+                            for args in ((10, 0, 0, 0, 0, 0, 0, 0, 0, 0), (11, 10, 20, 0, 0, 0, 0, 0, 0, 0))])
+        self.assertNotIn("conversations:", older[1]["gen"][5][0], "an older engine sends no count")
 
     def test_an_engine_restart_is_not_a_negative_interval(self):
         polls = self.polls([{"state": "generating", "tok_s": 5.0,

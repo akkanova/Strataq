@@ -476,6 +476,8 @@ private:
     void send_live_stats(std::stop_token stop) const;
     /// Gets the step's view of the model: PagedModel's rows over the conversations' state.
     strata::spec::StepModel get_step_model();
+    /// Adds one prepared group's rows and conversation windows to decode_step's counters.
+    void count_step_rows(const std::vector<strata::spec::StepRow>& rows);
     /// Finds learned costs by token affinity even when the GPU state cannot rewind to that prompt.
     std::optional<strata::spec::DraftPolicy> find_draft_policy(const std::vector<int64_t>& ids,
                                                              const ImageKeys& images) const;
@@ -542,14 +544,17 @@ private:
     /// the model's usage counts before the step that runs now: the experts whose count grows were routed to in the step
     std::vector<float> routed_before_;
     int step_rows_ = 0;                ///< the rows the last step ran
+    int step_conversations_ = 0;       ///< Conversations represented in the last step's rows, across all groups.
     /// Host elapsed times within the current decode step; GPU waits are included in their caller's time.
     double draft_ms_ = 0, verify_ms_ = 0, commit_ms_ = 0, pages_ms_ = 0;
     /// Since the last report: the decode steps that routed on the CPU's side (not every expert on the GPU), their
     /// rows, and the experts they routed to, each counted once a step (docs/DETAILS.md, rows and guesses)
     int64_t routed_steps_ = 0, routed_rows_ = 0, routed_experts_ = 0;
     /// Totals since the engine started, which the STATS lines report (send_live_stats reads them from its thread).
+    /// Counters are individually atomic; a sample can straddle a step's updates.
     struct LiveTotals {
-        std::atomic<int64_t> steps{0}, rows{0};   ///< decode steps, and the rows (tokens, guesses too) they ran
+        /// Completed decode steps and their rows (tokens, guesses too); conversations count once per step.
+        std::atomic<int64_t> steps{0}, rows{0}, conversations{0};
         /// Of the steps whose routings the model counted (get_usage; not when every expert is on the GPU): their
         /// rows, their (row, expert) routings, and the experts those routed to, each counted once a step
         std::atomic<int64_t> routed_rows{0}, routings{0}, experts{0};
@@ -1475,7 +1480,7 @@ bool PagedEngine::decode_step() {
                   kept_before = count_guesses(&strata::spec::Decoding::guessed_right);
     std::string err;
     exit_if_gpu_fatal("");   // (the test hook counts steps here)
-    step_rows_ = 0;
+    step_rows_ = step_conversations_ = 0;
     if (!step_.run(active, err)) {
         print_error_or_exit(err);
         return false;
@@ -1501,8 +1506,10 @@ bool PagedEngine::decode_step() {
         totals_.routings += std::inner_product(usage.begin(), usage.end(), routed_before_.begin(), (int64_t) 0,
             std::plus<>(), [](float now, float before) { return (int64_t) std::lround(now - before); });
     }
-    if (step_rows_ > 0)
+    if (step_rows_ > 0) {
         ++totals_.steps;
+        totals_.conversations += step_conversations_;
+    }
     totals_.rows += step_rows_;
     totals_.cpu_experts += model_.get_cpu_experts() - cpu_before;
     totals_.guesses += count_guesses(&strata::spec::Decoding::guessed) - guessed_before;
@@ -2371,10 +2378,11 @@ void PagedEngine::send_live_stats(std::stop_token stop) const {
             first = false;
         }
         const LiveTotals& t = totals_;
-        print_response("],\"decode\":{\"steps\":%lld,\"rows\":%lld,\"routed_rows\":%lld,\"routings\":%lld,"
-                       "\"experts\":%lld,\"cpu_experts\":%lld,\"guesses\":%lld,\"kept\":%lld},"
+        print_response("],\"decode\":{\"steps\":%lld,\"rows\":%lld,\"conversations\":%lld,\"routed_rows\":%lld,"
+                       "\"routings\":%lld,\"experts\":%lld,\"cpu_experts\":%lld,\"guesses\":%lld,\"kept\":%lld},"
                        "\"prefill\":{\"tokens\":%lld,\"ms\":%.3f}}\n",
-                       (long long) t.steps.load(), (long long) t.rows.load(), (long long) t.routed_rows.load(),
+                       (long long) t.steps.load(), (long long) t.rows.load(), (long long) t.conversations.load(),
+                       (long long) t.routed_rows.load(),
                        (long long) t.routings.load(), (long long) t.experts.load(), (long long) t.cpu_experts.load(),
                        (long long) t.guesses.load(), (long long) t.kept.load(), (long long) t.prompt_tokens.load(),
                        (double) t.prompt_us.load() / 1000.0);
@@ -3147,7 +3155,7 @@ strata::spec::StepModel PagedEngine::get_step_model() {
     };
     model.run = [this](const std::vector<strata::spec::StepRow>& rows, std::vector<int32_t>& picks,
                        std::string& err) {
-        step_rows_ = (int) rows.size();
+        count_step_rows(rows);
         std::vector<const std::vector<int32_t>*> histories;
         histories.reserve(rows.size());
         for (const auto& row : rows)
@@ -3176,9 +3184,8 @@ strata::spec::StepModel PagedEngine::get_step_model() {
             stages.finish = [this](int group, strata::spec::StepGroup& g, std::string& err) {
                 return model_.finish_group(group, g.picks, err);
             };
-            step_rows_ = 0;
             for (const auto& g : groups)
-                step_rows_ += (int) g.rows.size();
+                count_step_rows(g.rows);
             // No admission, page trade, restore or settings command runs until this wave has drained.
             int peak = 0;
             stages.peak_in_flight = &peak;
@@ -3238,6 +3245,11 @@ strata::spec::StepModel PagedEngine::get_step_model() {
             }
         };
     return model;
+}
+
+void PagedEngine::count_step_rows(const std::vector<strata::spec::StepRow>& rows) {
+    step_rows_ += (int) rows.size();
+    strata::spec::for_each_window(rows, [this](size_t, size_t) { ++step_conversations_; });
 }
 
 std::optional<strata::spec::DraftPolicy> PagedEngine::find_draft_policy(const std::vector<int64_t>& ids,

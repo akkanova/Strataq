@@ -90,7 +90,7 @@ own thread, so the lines keep coming during a long prompt chunk. The rest of
 the line is one JSON object:
 
 ```text
-STATS {"seconds":12.004,"gpus":[{"id":"gpu0","to_gpu":81920,"from_gpu":4096}],"decode":{"steps":310,"rows":806,"routed_rows":806,"routings":425568,"experts":382900,"cpu_experts":0,"guesses":496,"kept":278},"prefill":{"tokens":40960,"ms":38211.500}}
+STATS {"seconds":12.004,"gpus":[{"id":"gpu0","to_gpu":81920,"from_gpu":4096}],"decode":{"steps":310,"rows":806,"conversations":620,"routed_rows":806,"routings":425568,"experts":382900,"cpu_experts":0,"guesses":496,"kept":278},"prefill":{"tokens":40960,"ms":38211.500}}
 ```
 
 `seconds` is the time since the engine became ready. Each of `gpus` is one card
@@ -102,7 +102,11 @@ is late.
 
 `decode` and `prefill` are totals too. `decode.steps` counts the decode steps
 (one pass through the model each) and `rows` the rows they ran: a row is one
-token of a conversation, or one guessed token checked. `routings` counts each
+token of a conversation, or one guessed token checked. `conversations` counts the
+conversations each completed step ran rows for, counting each conversation once
+per step. `conversations / steps` is the average number writing together.
+Paused or cancelled conversations and those with no room for a token do not count.
+Steps that fail before finishing are excluded from these totals. `routings` counts each
 row's trip to each routed expert (the shared expert is not counted), and
 `experts` the experts those trips reached, each counted once per layer and
 step, so rows that share an expert count it once. Both are counted only in steps
