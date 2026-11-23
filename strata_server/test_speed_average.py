@@ -86,30 +86,35 @@ class MonitorTab(unittest.TestCase):
         self.assertEqual(polls[3]["gen"][0], "24.9", "96% of it is kept: (30 * .96 + 20) / 1.96")
 
     @staticmethod
-    def stats(seconds, steps, rows, experts, routings, cpu, guesses, kept, tokens, ms, conversations=None):
-        """A STATS line's object; `conversations` None leaves that key out, as an older engine does."""
-        decode = {"steps": steps, "rows": rows, "routed_rows": rows, "routings": routings, "experts": experts,
-                  "cpu_experts": cpu, "guesses": guesses, "kept": kept}
-        if conversations is not None:
-            decode["conversations"] = conversations
-        return {"seconds": seconds, "gpus": [], "prefill": {"tokens": tokens, "ms": ms}, "decode": decode}
+    def stats(seconds, steps, rows, experts, routings, cpu, guesses, kept, tokens, ms, **newer):
+        """A STATS line's object; `newer`: the decode keys an older engine leaves out (conversations, guess_room)."""
+        return {"seconds": seconds, "gpus": [], "prefill": {"tokens": tokens, "ms": ms},
+                "decode": {"steps": steps, "rows": rows, "routed_rows": rows, "routings": routings,
+                           "experts": experts, "cpu_experts": cpu, "guesses": guesses, "kept": kept, **newer}}
 
     def test_a_paged_engine_s_totals_give_the_step_lines_and_a_prefill_rate_without_decode_turns(self):
-        first = self.stats(10, 100, 200, 90000, 105600, 0, 100, 50, 4000, 3000, 150)
-        second = self.stats(11, 110, 226, 102350, 119328, 0, 116, 59, 5000, 3500, 170)
+        first = self.stats(10, 100, 200, 90000, 105600, 0, 100, 50, 4000, 3000, conversations=150, guess_room=300)
+        second = self.stats(11, 110, 226, 102350, 119328, 0, 116, 59, 5000, 3500, conversations=170, guess_room=330)
         polls = self.polls([{"state": "reading", "tok_s": 20.0, "engine_stats": first},
                             {"state": "reading", "tok_s": 20.0, "engine_stats": second}], wait_ms=1000)
         gen, prefill = polls[1]["gen"], polls[1]["prefill"]
         self.assertEqual(gen[4], ["2.6 tokens/step", "475 experts/token", "0 on CPU, 10% PRES", "56% MTP acceptance"],
                          "26 rows in 10 steps; 12350 experts for 26 rows that alone use 528 each; 9 of 16 kept")
         self.assertTrue(gen[5][0].endswith("\nNumber of simultaneous conversations: 2"), gen[5][0])
+        self.assertTrue(gen[5][3].endswith("\nOn average 0.80 draft tokens are being submitted per conversation per "
+                                           "step, and 0.45 are accepted. Per current settings, at most 1.5 tokens "
+                                           "can be submitted; the actual number is reduced to save time when the "
+                                           "drafter is not confident in its guesses.\nNumber of simultaneous "
+                                           "conversations: 2"),
+                        "16 guesses, 9 kept and room for 30 over 20 conversation-steps")
         self.assertEqual(prefill[:2], ["2000", "Now"], "1000 tokens in the 500 ms spent reading, not in the second")
         self.assertIn("50% of time reading", prefill[4])
 
     def test_conversations_per_step_follow_the_live_and_recent_weights(self):
         def poll(seconds, steps, conversations, state="generating"):
             return {"state": state, "tok_s": 20 if state == "generating" else None,
-                    "engine_stats": self.stats(seconds, steps, 2 * steps, 0, 0, 0, 0, 0, 0, 0, conversations)}
+                    "engine_stats": self.stats(seconds, steps, 2 * steps, 0, 0, 0, 0, 0, 0, 0,
+                                               conversations=conversations)}
         polls = self.polls([poll(10, 0, 0), poll(11, 10, 10), poll(12, 30, 50), poll(12, 30, 50, "idle")],
                            wait_ms=1000)
         for p, expected in zip(polls[1:], ("1", "1.8", "1.7")):

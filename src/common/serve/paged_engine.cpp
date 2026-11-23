@@ -559,8 +559,9 @@ private:
         /// rows, their (row, expert) routings, and the experts those routed to, each counted once a step
         std::atomic<int64_t> routed_rows{0}, routings{0}, experts{0};
         std::atomic<int64_t> cpu_experts{0};      ///< of get_cpu_experts, the decode steps' part
-        /// All guesses the steps verified (drafter and suffix lookup), and those accepted.
-        std::atomic<int64_t> guesses{0}, kept{0};
+        /// All guesses the steps verified (drafter and suffix lookup), those accepted, and their row allowance
+        /// (Decoding::guess_room).
+        std::atomic<int64_t> guesses{0}, kept{0}, guess_room{0};
         /// prompt tokens read, and the time reading them (read_prompt's, less the turns it gives decoding)
         std::atomic<int64_t> prompt_tokens{0}, prompt_us{0};
     } totals_;
@@ -1477,7 +1478,8 @@ bool PagedEngine::decode_step() {
     };
     const int64_t cpu_before = model_.get_cpu_experts(),
                   guessed_before = count_guesses(&strata::spec::Decoding::guessed),
-                  kept_before = count_guesses(&strata::spec::Decoding::guessed_right);
+                  kept_before = count_guesses(&strata::spec::Decoding::guessed_right),
+                  room_before = count_guesses(&strata::spec::Decoding::guess_room);
     std::string err;
     exit_if_gpu_fatal("");   // (the test hook counts steps here)
     step_rows_ = step_conversations_ = 0;
@@ -1514,6 +1516,7 @@ bool PagedEngine::decode_step() {
     totals_.cpu_experts += model_.get_cpu_experts() - cpu_before;
     totals_.guesses += count_guesses(&strata::spec::Decoding::guessed) - guessed_before;
     totals_.kept += count_guesses(&strata::spec::Decoding::guessed_right) - kept_before;
+    totals_.guess_room += count_guesses(&strata::spec::Decoding::guess_room) - room_before;
     for (Held* h : going) {
         const strata::serve::RequestOutput output(h->request_id);
         strata::spec::Decoding& d = h->dec;
@@ -2379,12 +2382,14 @@ void PagedEngine::send_live_stats(std::stop_token stop) const {
         }
         const LiveTotals& t = totals_;
         print_response("],\"decode\":{\"steps\":%lld,\"rows\":%lld,\"conversations\":%lld,\"routed_rows\":%lld,"
-                       "\"routings\":%lld,\"experts\":%lld,\"cpu_experts\":%lld,\"guesses\":%lld,\"kept\":%lld},"
+                       "\"routings\":%lld,\"experts\":%lld,\"cpu_experts\":%lld,\"guesses\":%lld,\"kept\":%lld,"
+                       "\"guess_room\":%lld},"
                        "\"prefill\":{\"tokens\":%lld,\"ms\":%.3f}}\n",
                        (long long) t.steps.load(), (long long) t.rows.load(), (long long) t.conversations.load(),
                        (long long) t.routed_rows.load(),
                        (long long) t.routings.load(), (long long) t.experts.load(), (long long) t.cpu_experts.load(),
-                       (long long) t.guesses.load(), (long long) t.kept.load(), (long long) t.prompt_tokens.load(),
+                       (long long) t.guesses.load(), (long long) t.kept.load(), (long long) t.guess_room.load(),
+                       (long long) t.prompt_tokens.load(),
                        (double) t.prompt_us.load() / 1000.0);
     }
 }

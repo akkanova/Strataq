@@ -209,9 +209,13 @@ function setMetric(key, value, unit, sub, {idle = false, tip = ""} = {}) {
   setTip(el, tip);
   $(`ms-${key}`).textContent = sub || "";
 }
-/** Fills a card's right-hand column with `lines`, [text, tooltip] each, keeping its elements so a tooltip stays up. */
-function setSide(key, lines) {
+/**
+ * Fills a card's right-hand column with `lines`, [text, tooltip] each, keeping its elements so a tooltip stays up.
+ * `idle`: the card's work has stopped, so the lines are faded.
+ */
+function setSide(key, lines, idle) {
   const box = $(`mx-${key}`);
+  box.classList.toggle("is-idle", idle);
   while (box.children.length > lines.length) {
     if (box.lastChild === tipped)
       showTip(null);
@@ -327,7 +331,7 @@ function showSpeeds(live, last, totals, {generating, reading}, rowsSetting) {
     : last ? [last.decode_tok_s, "Last request"] : [null, ""];
   setMetric("gen", gen[0] == null ? null : fmt(gen[0], 1), "t/s", gen[1],
             {idle: !generating, tip: recentTip(genRecent)});
-  setSide("gen", describeDecode(speeds.decode, !generating, rowsSetting));
+  setSide("gen", describeDecode(speeds.decode, !generating, rowsSetting), !generating);
 
   const prefillRecent = speeds.prefill.ratio("tokens", "ms", true, 1000);
   const prefill = reading ? [speeds.prefill.ratio("tokens", "ms", false, 1000) ?? live.prefill_tok_s_mean, "Now"]
@@ -335,13 +339,14 @@ function showSpeeds(live, last, totals, {generating, reading}, rowsSetting) {
     : lastPrefill != null ? [lastPrefill, "Last request"] : [null, ""];
   setMetric("prefill", prefill[0] == null ? null : fmt(prefill[0]), "t/s", prefill[1],
             {idle: !reading, tip: recentTip(prefillRecent)});
-  setSide("prefill", describePrefill(live, speeds.prefill, reading));
+  setSide("prefill", describePrefill(live, speeds.prefill, reading), !reading);
 }
 
 /**
  * Gets the Generation card's right-hand lines from a paged engine's decode steps (`sums`, FadingSums of the STATS
  * line's decode totals): rows and conversations per step, experts per row, the CPU's experts and how much the rows'
- * shared experts saved, and the share of guesses kept.  `slow`: the recent averages instead of the live ones.
+ * shared experts saved, and the share of guesses kept, with guesses offered and kept per conversation and step.
+ * `slow`: the recent averages instead of the live ones.
  * `rowsSetting`: the Memory panel's rows per step.  None for an engine without STATS.
  */
 function describeDecode(sums, slow, rowsSetting) {
@@ -353,12 +358,13 @@ function describeDecode(sums, slow, rowsSetting) {
   if (rows == null)
     return [];
   const pct = (x) => (x == null ? "–" : `${fmt(100 * x)}%`);
+  const tenths = (x) => fmt(x, Number.isInteger(x) ? 0 : 1);
+  const room = ratio("guess_room", "conversations");
+  const together = conversations == null ? "" : `\nNumber of simultaneous conversations: ${tenths(conversations)}`;
   return [
     [`${fmt(rows, 1)} tokens/step`, "Average rows in use. A step is one pass through the model; it computes a " +
       "row for each token: a conversation's next token, or a guessed token being checked. " +
-      (rowsSetting ? `Each pipeline group is set to at most ${rowsSetting} rows per step.` : "") +
-      (conversations == null ? "" :
-        `\nNumber of simultaneous conversations: ${fmt(conversations, Number.isInteger(conversations) ? 0 : 1)}`)],
+      (rowsSetting ? `Each pipeline group is set to at most ${rowsSetting} rows per step.` : "") + together],
     [`${fmt(experts)} experts/token`, "Routed experts computed per step, divided by the step's rows (a row is one " +
       `token here). ${alone ? `One row alone uses ${fmt(alone)}. ` : ""}The shared expert that every token uses ` +
       "is counted with the Weights, not here. Counted only while some experts are outside VRAM."],
@@ -367,7 +373,12 @@ function describeDecode(sums, slow, rowsSetting) {
       "traffic the step saved because its rows picked some of the same experts: 1 - experts/token ÷ experts one " +
       "row alone uses. 0% with one row."],
     ...kept == null ? [] : [[`${pct(kept)} MTP acceptance`,
-      "The share of guessed tokens (the MTP drafter's and suffix lookup's) that the model kept."]],
+      "The share of guessed tokens (the MTP drafter's and suffix lookup's) that the model kept." +
+      (conversations == null ? "" : `\nOn average ${fmt(ratio("guesses", "conversations"), 2)} draft tokens are ` +
+        "being submitted per conversation per step, and " +
+        `${fmt(ratio("kept", "conversations"), 2)} are accepted.`) +
+      (room == null ? "" : ` Per current settings, at most ${tenths(room)} tokens can be submitted; the actual ` +
+        "number is reduced to save time when the drafter is not confident in its guesses.") + together]],
   ];
 }
 

@@ -162,6 +162,10 @@ struct Decoding {
     /// Steps take conversations of higher priority first; among equal ones they take turns at the extra guess rows.
     int64_t priority = 0;
     int64_t guessed = 0;         ///< the guesses its steps ran
+    /// The row allowance summed over steps that ran this conversation: spare rows capped by the lookahead and
+    /// remaining output tokens (excluding its next token), or zero when drafting is off. Source limits, confidence
+    /// cuts, cooling and memory constraints may leave some of this allowance unused.
+    int64_t guess_room = 0;
     int64_t guessed_right = 0;   ///< the guesses it kept: the model picked the same tokens
 
     DraftLimits draft_limits; ///< This request's confidence cuts and drafting restrictions.

@@ -226,6 +226,7 @@ void Step::prepare(const std::vector<Decoding*>& active, Work& work, int group) 
             n = 0;
             window = Window{1};
         }
+        d.guess_room += want;
         windows.push_back(window);
         stepping.push_back(&d);
         start.push_back(rows.size());
