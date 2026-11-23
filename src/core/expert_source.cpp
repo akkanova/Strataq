@@ -4483,7 +4483,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);
         pt("fetch", fetches);
-        count_gpu_traffic(P.device, (uint64_t) fetches * bb, 0);   // every --pcie-mode moves the blobs over once
+        // every --pcie-mode moves the blobs over once
+        count_gpu_traffic(P.device, (uint64_t) fetches * bb, 0, (uint64_t) fetches);
         if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
     } else {
         for (int64_t i = 0; i < n; ++i) {

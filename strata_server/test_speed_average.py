@@ -46,7 +46,8 @@ class MonitorTab(unittest.TestCase):
                   "const setMetric = (k, v, unit, sub, o = {}) => { shown[k] = [v, sub, !!o.idle, o.tip || \"\"]; };\n"
                   "const setSide = (k, lines) => shown[k].push(lines.map((l) => l[0]), lines.map((l) => l[1]));\n"
                   f"{block}\nconst speeds = {{gen: new FadingSums(), decode: new FadingSums(), "
-                  "prefill: new FadingSums(), stats: null, at: null};\nconst out = [];\nlet clock = 0; performance.now = () => clock;\n"
+                  "prefill: new FadingSums(), moved: new FadingSums(), stats: null, at: null};\n"
+                  "const out = [];\nlet clock = 0; performance.now = () => clock;\n"
                   f"for (const live of {json.dumps(polls)}) {{ shown = {{}}; showSpeeds(live, {json.dumps(last)}, "
                   f"{json.dumps(totals)}, trackSpeeds(live), 8); out.push(shown); clock += {wait_ms}; }}\n"
                   "console.log(JSON.stringify(out));")
@@ -63,27 +64,35 @@ class MonitorTab(unittest.TestCase):
         self.assertEqual(cards["gen"], ("40.0", "Run average"))
         self.assertEqual(cards["prefill"], ("708", "Run average"), "(90000 - 5000 reused) tokens in 120 s")
 
-    def test_live_values_stay_live(self):
+    def test_first_poll_uses_live_values_until_there_is_a_recent_average(self):
         cards = self.cards({"state": "generating", "tok_s": 31.5, "prefill_tok_s_mean": 600}, self.LAST, self.TOTALS)
-        self.assertEqual(cards["gen"], ("31.5", "Now"))
+        self.assertEqual(cards["gen"], ("31.5", "Now: 31.5 tokens/sec"))
         self.assertEqual(cards["prefill"], ("708", "Run average"), "no prompt is read: the past, in grey")
         self.assertEqual(self.cards({"state": "reading", "prefill_tok_s_mean": 820}, self.LAST, self.TOTALS)["prefill"],
-                         ("820", "Now"))
+                         ("820", "Now: 820 tokens/sec"))
 
     def test_decode_stays_live_beside_a_prompt_read(self):
         cards = self.cards({"state": "reading", "tok_s": 12.0, "prefill_tok_s_mean": 820}, self.LAST, self.TOTALS)
-        self.assertEqual(cards["gen"], ("12.0", "Now"))
-        self.assertEqual(cards["prefill"], ("820", "Now"))
+        self.assertEqual(cards["gen"], ("12.0", "Now: 12.0 tokens/sec"))
+        self.assertEqual(cards["prefill"], ("820", "Now: 820 tokens/sec"))
 
     def test_after_the_work_the_card_greys_and_keeps_the_recent_average(self):
         polls = self.polls([{"state": "generating", "tok_s": 30.0}, {"state": "generating", "tok_s": 20.0},
                             {"state": "idle"}], self.LAST, self.TOTALS, wait_ms=1000)
-        self.assertEqual(polls[1]["gen"][:3], ["20.0", "Now", False], "the first poll has no interval to weigh")
-        self.assertEqual(polls[2]["gen"][:4], ["20.0", "Recent average", True, "Recent average: 20.0 tokens/sec"])
+        self.assertEqual(polls[1]["gen"][:3], ["20.0", "Now: 20.0 tokens/sec", False],
+                         "the first poll has no interval to weigh")
+        self.assertEqual(polls[2]["gen"][:4], ["20.0", "Recent average", True, ""])
         polls = self.polls([{"state": "generating", "tok_s": 30.0}, {"state": "generating", "tok_s": 30.0},
                             {"state": "generating", "tok_s": 20.0}, {"state": "idle"}], wait_ms=1000)
-        self.assertEqual(polls[2]["gen"][0], "23.8", "60% of the older second is kept: (30 * .6 + 20) / 1.6")
+        self.assertEqual(polls[2]["gen"][:2], ["24.9", "Now: 23.8 tokens/sec"],
+                         "the recent average keeps 96% of the older second, (30 * .96 + 20) / 1.96; now keeps 60%")
         self.assertEqual(polls[3]["gen"][0], "24.9", "96% of it is kept: (30 * .96 + 20) / 1.96")
+
+    def test_prefill_shows_the_recent_average_with_the_live_rate_below_it(self):
+        polls = self.polls([{"state": "reading", "prefill_tok_s_mean": rate} for rate in (3000, 3000, 2000)]
+                           + [{"state": "idle"}], wait_ms=1000)
+        self.assertEqual(polls[2]["prefill"][:4], ["2490", "Now: 2375 tokens/sec", False, ""])
+        self.assertEqual(polls[3]["prefill"][:4], ["2490", "Recent average", True, ""])
 
     @staticmethod
     def stats(seconds, steps, rows, experts, routings, cpu, guesses, kept, tokens, ms, **newer):
@@ -107,7 +116,8 @@ class MonitorTab(unittest.TestCase):
                                            "drafter is not confident in its guesses.\nNumber of simultaneous "
                                            "conversations: 2"),
                         "16 guesses, 9 kept and room for 30 over 20 conversation-steps")
-        self.assertEqual(prefill[:2], ["2000", "Now"], "1000 tokens in the 500 ms spent reading, not in the second")
+        self.assertEqual(prefill[:2], ["2000", "Now: 2000 tokens/sec"],
+                         "1000 tokens in the 500 ms spent reading, not in the second")
         self.assertIn("50% of time reading", prefill[4])
 
     def test_conversations_per_step_follow_the_live_and_recent_weights(self):
@@ -141,10 +151,40 @@ class MonitorTab(unittest.TestCase):
                              "engine_stats": self.stats(11, 1, 1, 1, 1, 0, 0, 0, 2000, 1500)}], wait_ms=1000)
         self.assertEqual(polls[1]["prefill"][:3], ["2000", "Recent average", True])
 
+    def test_the_experts_sent_to_the_cards_become_a_rate(self):
+        def live(seconds, *experts):
+            stats = self.stats(seconds, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+            stats["gpus"] = [{"id": f"gpu{i}", "to_gpu": 0, "from_gpu": 0, **({} if n is None else {"experts": n})}
+                             for i, n in enumerate(experts)]
+            return {"state": "idle", "engine_stats": stats}
+        block = cards_block((WEB / "app.js").read_text(encoding="utf-8"))
+        cases = (([live(10, 100, 50), live(12, 260, 90)], 100),   # 200 experts over two cards in 2 s
+                 ([live(10, 0), live(11, 100), live(12, 100)], 37.5),   # (100 * .6 + 0) / 1.6: the live average
+                 ([live(10, None), live(11, None)], None),   # an older engine sends no count
+                 ([live(10), live(11)], None))   # no cards
+        for polls, expected in cases:
+            script = (f"{block}\nconst speeds = {{gen: new FadingSums(), decode: new FadingSums(), "
+                      "prefill: new FadingSums(), moved: new FadingSums(), stats: null, at: null};\n"
+                      f"for (const live of {json.dumps(polls)}) trackSpeeds(live);\n"
+                      "console.log(JSON.stringify(speeds.moved.ratio('experts', 'seconds', false)));")
+            self.assertEqual(run_node(script), expected, polls)
+
+    def test_transfers_puts_experts_before_per_card_rates(self):
+        source = function_source((WEB / "app.js").read_text(encoding="utf-8"), "showTransfers")
+        script = ("const fmt = (n, d) => Number(n).toFixed(d); const $ = () => ({});\n"
+                  "const setMetric = () => {}; const setTip = () => {}; const out = [];\n"
+                  "const setSide = (key, lines) => out.push(lines.map((line) => line[0]));\n"
+                  f"{source}\n"
+                  "const card = {index: 0, source: 'driver', to: {moving: 10}, from: {moving: 20}};\n"
+                  "showTransfers([card], 30, 100); showTransfers([card, card], 60, 100);\n"
+                  "showTransfers([card], 30, null); console.log(JSON.stringify(out));")
+        self.assertEqual(run_node(script), [["100 experts/s"],
+                                           ["100 experts/s", "30 MB/s", "30 MB/s"], []])
+
     def test_repainting_the_same_poll_does_not_add_another_speed_sample(self):
         block = cards_block((WEB / "app.js").read_text(encoding="utf-8"))
         script = (f"{block}\nconst speeds = {{gen: new FadingSums(), decode: new FadingSums(), "
-                  "prefill: new FadingSums(), stats: null, at: null};\n"
+                  "prefill: new FadingSums(), moved: new FadingSums(), stats: null, at: null};\n"
                   "let clock = 0; performance.now = () => clock;\n"
                   "trackSpeeds({state: 'generating', tok_s: 30}); clock = 1000;\n"
                   "const live = {state: 'generating', tok_s: 30}; trackSpeeds(live);\n"

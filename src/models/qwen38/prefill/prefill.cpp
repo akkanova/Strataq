@@ -1395,7 +1395,7 @@ struct Prefill::Impl {
         cudaMemcpyAsync(stage_dev[sl], blob, bytes, cudaMemcpyHostToDevice, copy);
         if (job >= 0)
             stager->issued_one(job, copy);
-        core::count_gpu_traffic(device, bytes, 0);
+        core::count_gpu_traffic(device, bytes, 0, 1);
         return job < 0;
     }
     /// Queues an unpinned expert for the prefill walks and returns its job index.
@@ -3897,7 +3897,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (P.plive[sl]) cudaStreamWaitEvent(P.s_cp, P.pused[sl], 0);
                 const size_t bytes = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(en.l);
                 cudaMemcpyAsync(P.pstage[sl], en.blob, bytes, cudaMemcpyHostToDevice, P.s_cp);
-                core::count_gpu_traffic(P.dev, bytes, 0);
+                core::count_gpu_traffic(P.dev, bytes, 0, 1);
                 cudaEventRecord(P.pcopied[sl], P.s_cp);
                 P.plive[sl] = 1;
                 ++P.p_issued;

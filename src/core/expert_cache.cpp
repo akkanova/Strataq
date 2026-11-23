@@ -650,7 +650,7 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
         err = std::string("ExpertCache::fill_slot: ") + cudaGetErrorString(e);
         return false;
     }
-    count_gpu_traffic(device_, n, 0);
+    count_gpu_traffic(device_, n, 0, 1);
     ++fills_;
     return true;
 }
@@ -683,7 +683,7 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
         err = std::string("ExpertCache::fill_slot_blocking: ") + cudaGetErrorString(e);
         return false;
     }
-    count_gpu_traffic(device_, n, 0);
+    count_gpu_traffic(device_, n, 0, 1);
     ++fills_;
     return true;
 }
@@ -714,7 +714,7 @@ bool ExpertCache::fill_slot_queued_parts(int32_t slot, const BlobPart* parts, in
             return false;
         }
     }
-    count_gpu_traffic(device_, total, 0);
+    count_gpu_traffic(device_, total, 0, 1);
     ++fills_;
     return true;
 }

@@ -4435,6 +4435,9 @@ struct Model::Impl {
                 ok = ok && cudaMemcpy2DAsync(dst + l.hlay.trellis[2], dh, mat_r(2) + (size_t) m * dh, dr, dh,
                                              (size_t) g.dim, cudaMemcpyHostToDevice, cs) == cudaSuccess;
             }
+            if (ok)
+                strata::core::count_gpu_traffic(devs[(size_t) member(l, m).dev].id, unit(member(l, m)),
+                                                0, m == 0 ? 1 : 0);
             if (!ok) err = "streaming layer " + std::to_string(l.il) + " expert " + std::to_string(e) + " failed";
             return ok;
         }
@@ -4514,6 +4517,9 @@ struct Model::Impl {
             }
             ok = ok && cp(dst + x.hlay.suh[2], parts[0] + l.hl.suh[2] + (size_t) f0 * 2, (size_t) fn * 2);
         }
+        if (ok)
+            strata::core::count_gpu_traffic(devs[(size_t) member(l, m).dev].id, unit(member(l, m)),
+                                            0, m == 0 ? 1 : 0);
         if (!ok) err = "streaming layer " + std::to_string(l.il) + " expert " + std::to_string(e) + " failed";
         return ok;
     }
@@ -4646,7 +4652,6 @@ struct Model::Impl {
                                    sb != nullptr ? sb + (size_t) i * c.stage_stride : nullptr))
                     return false;
                 c.stream_bytes += (double) unit(member(l0, mi));
-                strata::core::count_gpu_traffic(d.id, unit(member(l0, mi)), 0);
             }
             c.dbg_dma_ms += now_ms() - t_dma;
             CK(cudaEventRecord(c.filled[half], c.cs));
@@ -4991,7 +4996,7 @@ struct Model::Impl {
             if (it.direct) {   // (already in the slot)
                 CK(cudaEventRecord(c.ring_fill[r], c.cs));
                 c.stream_bytes += (double) unit(l);
-                strata::core::count_gpu_traffic(devs[(size_t) c.dev].id, unit(l), 0);
+                strata::core::count_gpu_traffic(devs[(size_t) c.dev].id, unit(l), 0, it.mi == 0 ? 1 : 0);
                 ++c.n_dma;
                 continue;
             }
@@ -5007,7 +5012,7 @@ struct Model::Impl {
             CK(cudaEventRecord(c.ring_fill[r], c.cs));
             if (it.stage >= 0) CK(cudaEventRecord(c.stage_ev[(size_t) it.stage], c.cs));
             c.stream_bytes += (double) unit(l);
-            strata::core::count_gpu_traffic(devs[(size_t) c.dev].id, unit(l), 0);
+            strata::core::count_gpu_traffic(devs[(size_t) c.dev].id, unit(l), 0, it.mi == 0 ? 1 : 0);
             ++c.n_dma;
         }
         return true;
@@ -8965,7 +8970,9 @@ struct Model::Impl {
                 const Dev& d = devs[(size_t) l.dev];
                 cudaSetDevice(d.id);
                 cudaStream_t cs = B.st[(size_t) l.dev];
-                cudaMemcpyAsync(sat(l, l, l.spare_vram, l.blob), B.a, l.blob, cudaMemcpyHostToDevice, cs);
+                if (cudaMemcpyAsync(sat(l, l, l.spare_vram, l.blob), B.a, l.blob,
+                                    cudaMemcpyHostToDevice, cs) == cudaSuccess)
+                    strata::core::count_gpu_traffic(d.id, l.blob, 0, 1);
                 if (!file_experts)
                     cudaMemcpyAsync(B.b, sat(l, l, l.slot[(size_t) sw.out], l.blob), l.blob,
                                     cudaMemcpyDeviceToHost, cs);
@@ -9047,6 +9054,8 @@ struct Model::Impl {
             ok = cudaMemcpyAsync(sat(l, x, l.spare_vram, unit(l)), l.nm > 1 ? sw_h : sw_a, unit(l),
                                  cudaMemcpyHostToDevice, cs) == cudaSuccess &&
                  cudaStreamSynchronize(cs) == cudaSuccess;
+            if (ok)
+                strata::core::count_gpu_traffic(devs[(size_t) x.dev].id, unit(l), 0, m == 0 ? 1 : 0);
         }
         if (sw.ram >= 0) {   // `out` from its VRAM slot (each member its part) into the spare RAM slot
             bool got = ok;
@@ -10293,7 +10302,7 @@ struct Model::Impl {
         J.t0 = now_ms();
         J.t_done = 0;
         J.t_dev = 0;
-        strata::core::count_gpu_traffic(devs[(size_t) di].id, (uint64_t) n * unit(l), 0);
+        strata::core::count_gpu_traffic(devs[(size_t) di].id, (uint64_t) n * unit(l), 0, (uint64_t) n);
         if (n > 0) ln_pool->start(n, ln_fn);
     }
     unsigned lane_wait() {

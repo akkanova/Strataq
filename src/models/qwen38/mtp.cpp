@@ -4,6 +4,7 @@
 #include "strata/models/qwen38/mtp.hpp"
 #include "strata/common/spec/confidence.hpp"
 #include "strata/base/gpu/pin_budget.hpp"
+#include "strata/base/gpu/traffic.hpp"
 #include "strata/models/qwen38/kernels/qsa_prompt_attn.hpp"
 #include "strata/common/kernels/coupled_draft.hpp"
 #include "strata/common/kernels/spec_prob.hpp"
@@ -655,6 +656,7 @@ bool MtpDrafter::experts_lend(std::string& err) {
         err = "mtp: copying the 512 experts to host memory failed (they stay the decode's)";
         return false;
     }
+    strata::core::count_gpu_traffic(device_, 0, bytes);
     experts_lent_ = true;
     return true;
 }
@@ -669,6 +671,7 @@ bool MtpDrafter::experts_reclaim(std::string& err) {
         err = "mtp: copying the 512 experts back failed";
         return false;
     }
+    strata::core::count_gpu_traffic(device_, experts_host_bytes_, 0, (uint64_t) g_->n_expert);
     experts_lent_ = false;
     return true;
 }

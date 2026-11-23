@@ -440,7 +440,7 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, 
         if (!ck(cudaMemcpyAsync(cache_.device_slot(slot), b, (size_t) lay.blob_bytes(s.layer), cudaMemcpyHostToDevice,
                                 refill_), "refill", err))
             return false;
-        count_gpu_traffic(device_, lay.blob_bytes(s.layer), 0);
+        count_gpu_traffic(device_, lay.blob_bytes(s.layer), 0, 1);
         if (gated) {
             (*gate_has_)[(size_t) s.layer] = 1;
             *gate_last_ = std::max(*gate_last_, s.layer);

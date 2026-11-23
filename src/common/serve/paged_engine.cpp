@@ -2298,7 +2298,7 @@ bool PagedEngine::load_experts(const PagedCard& card, const strata::core::Expert
                       " to " + card.id + " failed";
                 return false;
             }
-            strata::core::count_gpu_traffic(card.dev, bytes[i], 0);
+            strata::core::count_gpu_traffic(card.dev, bytes[i], 0, 1);
         }
         return true;
     });
@@ -2376,8 +2376,9 @@ void PagedEngine::send_live_stats(std::stop_token stop) const {
                             [&](const PagedCard& c) { return c.dev == cards_[k].dev; }))
                 continue;
             const strata::core::GpuTraffic t = strata::core::get_gpu_traffic(cards_[k].dev);
-            print_response("%s{\"id\":\"%s\",\"to_gpu\":%llu,\"from_gpu\":%llu}", first ? "" : ",", cards_[k].id.c_str(),
-                           (unsigned long long) t.to_gpu, (unsigned long long) t.from_gpu);
+            print_response("%s{\"id\":\"%s\",\"to_gpu\":%llu,\"from_gpu\":%llu,\"experts\":%llu}", first ? "" : ",",
+                           cards_[k].id.c_str(), (unsigned long long) t.to_gpu, (unsigned long long) t.from_gpu,
+                           (unsigned long long) t.experts);
             first = false;
         }
         const LiveTotals& t = totals_;

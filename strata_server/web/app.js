@@ -174,10 +174,11 @@ function spark(id, values, max) {
   svg.querySelector(".area").setAttribute("d", `${line}L100,32L0,32Z`);
 }
 /**
- * Fills the Transfers card from `cards` (the sampler's `moved`: each card's traffic with host memory, in MB/s) and
- * their total `mbS`: the total on the left, each card's on the right when there are several, the cards' links below.
+ * Fills the Transfers card from `cards` (the sampler's `moved`: each card's traffic with host memory, in MB/s), their
+ * total `mbS` and `experts`, the experts sent to the cards per second (null without a paged engine's STATS): the total
+ * on the left, experts on the right (plus per-card traffic with several cards), the cards' links below.
  */
-function showTransfers(cards, mbS) {
+function showTransfers(cards, mbS, experts) {
   const rate = (x) => fmt(x, x != null && x < 10 ? 1 : 0);
   const link = (c, gen = c.pcie_gen_max || c.pcie_gen, width = c.pcie_width_max || c.pcie_width) =>
     gen ? `Gen${gen}${width ? ` x${width}` : ""}` : "";
@@ -194,8 +195,12 @@ function showTransfers(cards, mbS) {
   setMetric("moved", mbS == null ? null : rate(mbS), "MB/s", new Set(links).size === 1 ? links[0] : links.join(" · "),
             {tip: cards.length === 1 ? tip(cards[0]) : cards.length ? "Both ways, all cards together" : ""});
   setTip($("ms-moved"), cards.map((c) => `${link(c) || "Link unknown"}: ${c.name || `GPU ${c.index}`}`).join("\n"));
-  setSide("moved", cards.length > 1 ? cards.map((c) => [c.source && c.to.moving != null && c.from.moving != null
-    ? `${rate(c.to.moving + c.from.moving)} MB/s` : "–", tip(c)]) : []);
+  setSide("moved", [
+    ...experts == null ? [] : [[`${rate(experts)} experts/s`, "Experts sent from RAM to the GPUs each second, all " +
+      "cards together: copied into their memory, or read by them over PCIe. An expert sent again counts again. " +
+      "The MB/s counts all traffic, both ways; read from the driver, it includes other programs' traffic too."]],
+    ...cards.length > 1 ? cards.map((c) => [c.source && c.to.moving != null && c.from.moving != null
+      ? `${rate(c.to.moving + c.from.moving)} MB/s` : "–", tip(c)]) : []]);
 }
 /**
  * Shows a card's reading: `value` (null: none) and its `unit` large, `sub` below them. `idle`: the value is a past
@@ -250,8 +255,8 @@ function showTip(el) {
 }
 
 /**
- * Sums whose old parts fade as time passes, kept twice: `now` keeps 60% of a second ago (the cards' live numbers),
- * `slow` keeps 96% (the recent average shown once the work stops).  The ratio of two sums is a moving average
+ * Sums whose old parts fade as time passes, kept twice: `now` keeps 60% of a second ago (the live rates),
+ * `slow` keeps 96% (the speed cards' main numbers).  The ratio of two sums is a moving average
  * weighted toward the last seconds.  The Generation and Prefill cards add to them only while that work runs.
  */
 class FadingSums {
@@ -271,15 +276,17 @@ class FadingSums {
     return sums[b] > 0 && a in sums ? scale * sums[a] / sums[b] : null;
   }
 }
-/** The Generation and Prefill cards' moving averages (trackSpeeds), and what they were last computed from. */
+/** The Monitor cards' moving averages (trackSpeeds), and what they were last computed from. */
 const speeds = {
-  gen: new FadingSums(), decode: new FadingSums(), prefill: new FadingSums(), stats: null, at: null, live: null,
+  gen: new FadingSums(), decode: new FadingSums(), prefill: new FadingSums(), moved: new FadingSums(), stats: null,
+  at: null, live: null,
 };
 
 /**
  * Adds a /metrics poll's `live` state to `speeds`: the server's decode rate while conversations write, and from a
- * paged engine's STATS totals (live.engine_stats) the decode steps' counts and the prompt tokens read over the time
- * spent reading them; an older engine's prompt rate otherwise.  Returns whether each card's work runs now.
+ * paged engine's STATS totals (live.engine_stats) the decode steps' counts, the prompt tokens read over the time
+ * spent reading them and the experts sent to the GPUs; an older engine's prompt rate otherwise.  Returns whether each
+ * card's work runs now.
  */
 function trackSpeeds(live) {
   const generating = live.tok_s != null;
@@ -293,6 +300,7 @@ function trackSpeeds(live) {
     speeds.gen = new FadingSums();
     speeds.decode = new FadingSums();
     speeds.prefill = new FadingSums();
+    speeds.moved = new FadingSums();
   }
   speeds.at = at;
   speeds.stats = now || null;
@@ -303,6 +311,9 @@ function trackSpeeds(live) {
     const decode = Object.fromEntries(Object.keys(now.decode).map((k) => [k, now.decode[k] - then.decode[k]]));
     if (decode.steps > 0)
       speeds.decode.add(decode, dt);
+    const sent = (stats) => stats.gpus.reduce((n, g) => n + g.experts, 0);
+    if (now.gpus.length && now.gpus.every((g) => g.experts != null))
+      speeds.moved.add({experts: sent(now) - sent(then), seconds: dt}, dt);
     if (ms > 0)
       speeds.prefill.add({tokens: now.prefill.tokens - then.prefill.tokens, ms, wall_ms: dt * 1000}, dt);
   } else if (!now && reading && live.prefill_tok_s_mean > 0 && seconds > 0)
@@ -311,12 +322,12 @@ function trackSpeeds(live) {
 }
 
 /**
- * Fills the Generation and Prefill cards.  While the work runs: its live moving average, in white.  Otherwise, in
- * grey: the recent average, or before any was seen the run's average from the server's totals (token-weighted, the
- * figure the engine's DONE lines and Prometheus report; one request is noisy), or the last request's.
+ * Fills the Generation and Prefill cards with the recent average speed: in white while the work runs, with the live
+ * moving average below it, else in grey.  Before any recent average was seen, an idle card shows the run's average
+ * from the server's totals (token-weighted, the figure the engine's DONE lines and Prometheus report; one request is
+ * noisy), or the last request's.
  */
 function showSpeeds(live, last, totals, {generating, reading}, rowsSetting) {
-  const recentTip = (rate) => (rate == null ? "" : `Recent average: ${fmt(rate, 1)} tokens/sec`);
   const avgDecode = totals && totals.decode_ms > 0 && totals.output_tokens > 0
     ? totals.output_tokens / (totals.decode_ms / 1000) : null;
   const readTokens = totals ? totals.prompt_tokens - (totals.reused || 0) : 0;
@@ -324,22 +335,27 @@ function showSpeeds(live, last, totals, {generating, reading}, rowsSetting) {
     ? readTokens / (totals.prompt_ms / 1000) : null;
   const lastPrefill = last && last.prompt_ms > 0
     ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
-
-  const genRecent = speeds.gen.ratio("tokens", "seconds", true);
-  const gen = generating ? [speeds.gen.ratio("tokens", "seconds", false) ?? live.tok_s, "Now"]
-    : genRecent != null ? [genRecent, "Recent average"] : avgDecode != null ? [avgDecode, "Run average"]
+  const genPast = avgDecode != null ? [avgDecode, "Run average"]
     : last ? [last.decode_tok_s, "Last request"] : [null, ""];
-  setMetric("gen", gen[0] == null ? null : fmt(gen[0], 1), "t/s", gen[1],
-            {idle: !generating, tip: recentTip(genRecent)});
-  setSide("gen", describeDecode(speeds.decode, !generating, rowsSetting), !generating);
-
-  const prefillRecent = speeds.prefill.ratio("tokens", "ms", true, 1000);
-  const prefill = reading ? [speeds.prefill.ratio("tokens", "ms", false, 1000) ?? live.prefill_tok_s_mean, "Now"]
-    : prefillRecent != null ? [prefillRecent, "Recent average"] : avgPrefill != null ? [avgPrefill, "Run average"]
+  const prefillPast = avgPrefill != null ? [avgPrefill, "Run average"]
     : lastPrefill != null ? [lastPrefill, "Last request"] : [null, ""];
-  setMetric("prefill", prefill[0] == null ? null : fmt(prefill[0]), "t/s", prefill[1],
-            {idle: !reading, tip: recentTip(prefillRecent)});
+
+  showSpeed("gen", generating, speeds.gen.ratio("tokens", "seconds", false) ?? live.tok_s,
+            speeds.gen.ratio("tokens", "seconds", true), genPast, 1);
+  setSide("gen", describeDecode(speeds.decode, !generating, rowsSetting), !generating);
+  showSpeed("prefill", reading, speeds.prefill.ratio("tokens", "ms", false, 1000) ?? live.prefill_tok_s_mean,
+            speeds.prefill.ratio("tokens", "ms", true, 1000), prefillPast, 0);
   setSide("prefill", describePrefill(live, speeds.prefill, reading), !reading);
+
+  /**
+   * Fills a showSpeeds card. `past` is [speed, subtitle] for an idle card without a recent average;
+   * `digits` sets the decimal places.
+   */
+  function showSpeed(key, running, now, recent, past, digits) {
+    const [speed, sub] = running ? [recent ?? now, now == null ? "" : `Now: ${fmt(now, digits)} tokens/sec`]
+      : recent != null ? [recent, "Recent average"] : past;
+    setMetric(key, speed == null ? null : fmt(speed, digits), "t/s", sub, {idle: !running});
+  }
 }
 
 /**
@@ -776,7 +792,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   spark("sp-vram", vram.source === "telemetry" ? h.gpu_mem_used : vramSamples.map(sample => sample.used), vram.total);
   setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W", hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : "");
   spark("sp-power", h.gpu_power, hw.gpu_power_limit);
-  showTransfers(hw.moved || [], hw.moved_mb_s);
+  showTransfers(hw.moved || [], hw.moved_mb_s, speeds.moved.ratio("experts", "seconds", false));
   spark("sp-moved", h.moved_mb_s);
   setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "");
   spark("sp-cpu", h.cpu, 100);

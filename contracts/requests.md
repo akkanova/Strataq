@@ -90,13 +90,16 @@ own thread, so the lines keep coming during a long prompt chunk. The rest of
 the line is one JSON object:
 
 ```text
-STATS {"seconds":12.004,"gpus":[{"id":"gpu0","to_gpu":81920,"from_gpu":4096}],"decode":{"steps":310,"rows":806,"conversations":620,"routed_rows":806,"routings":425568,"experts":382900,"cpu_experts":0,"guesses":496,"kept":278,"guess_room":1240},"prefill":{"tokens":40960,"ms":38211.500}}
+STATS {"seconds":12.004,"gpus":[{"id":"gpu0","to_gpu":81920,"from_gpu":4096,"experts":12}],"decode":{"steps":310,"rows":806,"conversations":620,"routed_rows":806,"routings":425568,"experts":382900,"cpu_experts":0,"guesses":496,"kept":278,"guess_room":1240},"prefill":{"tokens":40960,"ms":38211.500}}
 ```
 
 `seconds` is the time since the engine became ready. Each of `gpus` is one card
 (`id` as in `GET_MEMORY_USE`). `to_gpu` and `from_gpu` are the bytes that moved
 from host memory to the card and back since the engine started: copies, and the card's reads
-and writes of host memory in place. They are totals, so the difference between
+and writes of host memory in place. `experts` is how many experts were among the
+bytes sent to the card; an expert sent again counts again, and one split over
+several cards counts once, on the card that gets its first part. Older engines
+leave it out. They are totals, so the difference between
 two lines over the difference of their `seconds` is the rate, even when a line
 is late.
 
