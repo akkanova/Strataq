@@ -8,6 +8,7 @@
 #include "strata/base/gpu/runtime.hpp"
 #include "strata/base/gpu/traffic.hpp"
 #include "strata/common/experts/card_rules.hpp"
+#include "strata/common/kernels/routing_stats.hpp"
 #include "strata/common/experts/expert_swaps.hpp"
 #include "strata/common/experts/ram_tier.hpp"
 #include "strata/common/kernels/window_limits.hpp"
@@ -555,9 +556,6 @@ private:
     struct LiveTotals {
         /// Completed decode steps and their rows (tokens, guesses too); conversations count once per step.
         std::atomic<int64_t> steps{0}, rows{0}, conversations{0};
-        /// Of the steps whose routings the model counted (get_usage; not when every expert is on the GPU): their
-        /// rows, their (row, expert) routings, and the experts those routed to, each counted once a step
-        std::atomic<int64_t> routed_rows{0}, routings{0}, experts{0};
         std::atomic<int64_t> cpu_experts{0};      ///< of get_cpu_experts, the decode steps' part
         /// All guesses the steps verified (drafter and suffix lookup), those accepted, and their row allowance
         /// (Decoding::guess_room).
@@ -1485,11 +1483,13 @@ bool PagedEngine::decode_step() {
     std::string err;
     exit_if_gpu_fatal("");   // (the test hook counts steps here)
     step_rows_ = step_conversations_ = 0;
-    if (!step_.run(active, err)) {
+    strata::kernels::set_routing_counting(true);   // (a step's routing is done when it returns: its picks are known)
+    const bool ran = step_.run(active, err);
+    strata::kernels::set_routing_counting(false);
+    if (!ran) {
         print_error_or_exit(err);
         return false;
     }
-    // The usage table merges pipeline groups; shared experts across groups count once for the whole wave.
     const std::vector<int32_t>& residency = model_.get_residency();
     int64_t routed = 0;
     for (size_t i = 0; i < usage.size(); ++i) {
@@ -1505,10 +1505,6 @@ bool PagedEngine::decode_step() {
         routed_experts_ += routed;
         routed_rows_ += step_rows_;
         ++routed_steps_;
-        totals_.experts += routed;
-        totals_.routed_rows += step_rows_;
-        totals_.routings += std::inner_product(usage.begin(), usage.end(), routed_before_.begin(), (int64_t) 0,
-            std::plus<>(), [](float now, float before) { return (int64_t) std::lround(now - before); });
     }
     if (step_rows_ > 0) {
         ++totals_.steps;
@@ -2384,13 +2380,14 @@ void PagedEngine::send_live_stats(std::stop_token stop) const {
             first = false;
         }
         const LiveTotals& t = totals_;
+        const strata::kernels::RoutingCounts r = strata::kernels::get_routing_counts();
         print_response("],\"decode\":{\"steps\":%lld,\"rows\":%lld,\"conversations\":%lld,\"routed_rows\":%lld,"
                        "\"routings\":%lld,\"experts\":%lld,\"cpu_experts\":%lld,\"guesses\":%lld,\"kept\":%lld,"
                        "\"guess_room\":%lld},"
                        "\"prefill\":{\"tokens\":%lld,\"ms\":%.3f}}\n",
                        (long long) t.steps.load(), (long long) t.rows.load(), (long long) t.conversations.load(),
-                       (long long) t.routed_rows.load(),
-                       (long long) t.routings.load(), (long long) t.experts.load(), (long long) t.cpu_experts.load(),
+                       (long long) t.rows.load(),   // routed_rows: for Monitors that know older engines
+                       (long long) r.routings, (long long) r.experts, (long long) t.cpu_experts.load(),
                        (long long) t.guesses.load(), (long long) t.kept.load(), (long long) t.guess_room.load(),
                        (long long) t.prompt_tokens.load(),
                        (double) t.prompt_us.load() / 1000.0);

@@ -14,6 +14,7 @@
 //   h = post * moe + comb^T h;  pre = f_pre
 // and after the last layer logits = head(rmsnorm(sum_s pre[s] h[s])).
 #include "strata/common/experts/ram_tier.hpp"
+#include "strata/common/kernels/routing_stats.hpp"
 #include "strata/common/state/restore_points.hpp"
 #include "strata/common/artifact/tensor_directory.hpp"
 #include "ds4_ring_link.hpp"
@@ -15234,6 +15235,8 @@ struct Model::Impl {
             route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
                           d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
                           na[1]);
+            if (mi == 0 && !l.mtp)
+                strata::kernels::count_routing(d.ridx, T, l.k_exp, kPicks, l.il, s);
             if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
             swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
             if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;
@@ -15357,6 +15360,8 @@ struct Model::Impl {
         vb.w[0] = l.mtp ? 0u : wp.vl;
         route(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, d.ridx, d.rw, s, l.gate_bias_vl,
               vb.w[0] != 0 ? &vb : nullptr);
+        if (mi == 0 && !l.mtp)
+            strata::kernels::count_routing(d.ridx, T, l.k_exp, kPicks, l.il, s);
         CK(cudaMemcpyAsync(h_idx, d.ridx, (size_t) T * kPicks * 4, cudaMemcpyDeviceToHost, s));
         CK(cudaMemcpyAsync(h_w, d.rw, (size_t) T * kPicks * 4, cudaMemcpyDeviceToHost, s));
         CK(cudaMemcpyAsync(h_x, d.x, (size_t) T * D * 4, cudaMemcpyDeviceToHost, s));

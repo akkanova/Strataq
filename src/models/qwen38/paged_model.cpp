@@ -1,3 +1,4 @@
+#include "strata/common/kernels/routing_stats.hpp"
 #include "strata/common/serve/request_output.hpp"
 #include "strata/base/gpu/managed_memory.hpp"
 // src/models/qwen38/paged_model.cpp - strata-q38: Qwen3.8 on the shared paged engine (paged_model.hpp): its start
@@ -506,6 +507,8 @@ PagedQwen::PagedQwen(Model& m, Conversation& conv, const PagedCards& cards, Mode
     facts.name = kProgram;
     facts.n_layers = m.g.n_layers;
     facts.n_expert = m.g.n_expert;
+    facts.shared_experts = 1;
+    strata::kernels::init_routing_counts((int) facts.n_layers, (int) facts.n_expert, (int) facts.shared_experts);
     facts.context = o.max_context;
     facts.extra_resident_vram = 10ull << 30;
     facts.max_rows = strata::kernels::kVerifyMaxT;

@@ -51,6 +51,7 @@
 //     produced - computed in ONE parallel pass over the experts instead of k serial ones.  It is O(n^2)
 //     comparisons and that is the right trade here: n = 512, every comparison is independent, and the old
 //     version was O(k*n) with a serial `exp` inside.
+#include "strata/common/kernels/routing_stats.hpp"
 #include "strata/common/kernels/router_top10.hpp"
 
 #include <cuda_runtime.h>
@@ -494,4 +495,38 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
     }
 }
 
+namespace {
+/// Adds one pass's picks of a layer to its totals while `on` is set (count_routing).
+__global__ void add_routing(const int32_t* ids, int rows, int k, int stride, int experts, int shared,
+                              RoutingCounts* totals, const int64_t* on) {
+    extern __shared__ unsigned seen[];   // a bit per expert
+    __shared__ int distinct;
+    if (!*on)
+        return;
+    for (int i = threadIdx.x; i < (experts + 31) / 32; i += blockDim.x)
+        seen[i] = 0;
+    if (threadIdx.x == 0)
+        distinct = 0;
+    __syncthreads();
+    for (int i = threadIdx.x; i < rows * k; i += blockDim.x) {
+        const int id = ids[i / k * stride + i % k];
+        const unsigned bit = 1u << (id & 31);
+        if (id >= 0 && id < experts && !(atomicOr(seen + id / 32, bit) & bit))
+            atomicAdd(&distinct, 1);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        totals->routings += (int64_t) rows * (k + shared);
+        totals->experts += distinct + shared;
+    }
+}
+}  // namespace
+
+// A separate kernel counts the final picks after multi-block routing and any policy that replaces them.
+void count_routing(const int32_t* ids, int rows, int k, int stride, int layer, void* stream) {
+    using namespace routing_detail;
+    if (device && layer >= 0 && layer < layers)
+        add_routing<<<1, 256, (experts + 31) / 32 * sizeof(unsigned), (cudaStream_t) stream>>>(
+            ids, rows, k, stride, experts, shared, device + layer, reinterpret_cast<const int64_t*>(device + layers));
+}
 }  // namespace strata::kernels

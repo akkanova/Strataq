@@ -93,6 +93,8 @@ struct PagedModelFacts {
     /// temporary folder's subfolder for paused conversations
     std::string name;
     int64_t n_layers = 0, n_expert = 0;
+    /// Counts the experts every row uses in each layer besides its routed ones; stored with the dense weights.
+    int64_t shared_experts = 0;
     int64_t context = 0;                    ///< the most tokens a conversation holds (--max-context)
     int max_rows = 0;                       ///< the most rows one step may run (its verify windows' room)
     std::vector<int64_t> end_tokens;        ///< the tokens that end an answer

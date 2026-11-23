@@ -1,3 +1,4 @@
+#include "strata/common/kernels/routing_stats.hpp"
 #include "strata/common/serve/request_output.hpp"
 // src/models/deepseekv41/paged_model.cpp - strata-ds41: DeepSeek V4.1 on the shared paged engine (paged_model.hpp):
 // its start and its side of the engine's model interface (strata/common/serve/paged_model.hpp).
@@ -633,6 +634,8 @@ PagedDeepSeek::PagedDeepSeek(Model& m, const Options& o, const ProgramOptions& x
     facts.name = kProgram;
     facts.n_layers = g.nl;
     facts.n_expert = g.n_exp;
+    facts.shared_experts = 1;
+    strata::kernels::init_routing_counts((int) facts.n_layers, (int) facts.n_expert, (int) facts.shared_experts);
     facts.row_bytes = (uint64_t) g.dim * sizeof(float);
     facts.context = o.max_context;
     facts.max_rows = kWindowRows;
