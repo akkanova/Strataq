@@ -644,7 +644,6 @@ PagedDeepSeek::PagedDeepSeek(Model& m, const Options& o, const ProgramOptions& x
     facts.drafter_label = "DSpark";
     facts.kv_quantization = "FP8 sliding window, FP4 compressed KV, FP4 index";
     facts.drafter_start = "--dspark on and a --lookahead above 0";
-    facts.prompt_chunk_setting = "prefill_chunk";
     // the engine's tables are the trunk's; the drafter's experts are this model's alone (residency_ has room for them,
     // after the trunk's layers)
     blobs_ = m.get_expert_bytes();

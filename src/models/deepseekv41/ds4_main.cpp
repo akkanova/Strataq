@@ -106,6 +106,7 @@ void usage() {
                  "maya-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--max-context N] [--vram-reserve-mib N]\n"
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--profile-readonly] [--ssd-cache GB] [--ssd-policy lru|lfu|lfulru] [--no-expert-cache] [--verbose]\n"
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none|auto] [--dspark-block N] [--dspark-conf F] [--experts N|auto]\n"
+                 "           --prefill is an alias for --prefill-chunk; auto or auto:N uses the engine's default\n"
                  "           [--vision on|off] [--vision-resident (--serve: keep the picture tower on the card; default: in RAM between pictures)] [--mmap-experts on|off|auto] [--parallel N (--serve: N conversations at once)]\n"
                  "           (--ids I,J,... [--images FILE] [--max-new N] [--dump-logits FILE] | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT\n"

@@ -2495,8 +2495,7 @@ strata::serve::MemoryReport PagedEngine::describe_memory() const {
     report.settings.emplace_back("lookup_chain", settings_.lookup_chain);
     if (const int64_t ceiling = model_.get_prompt_ceiling(); ceiling > 0)
         report.settings.insert(report.settings.end(),
-                               {{facts_.prompt_chunk_setting, settings_.prompt_chunk},
-                                {facts_.prompt_chunk_setting + "_capacity", ceiling}});
+                               {{"prefill_chunk", settings_.prompt_chunk}, {"prefill_chunk_capacity", ceiling}});
     if (const int rank = model_.get_route_tail_skip(); rank >= 0)
         report.settings.emplace_back("route_tail_skip", rank);
     if (const float prior = model_.get_route_prior(); prior >= 0)
@@ -2595,7 +2594,7 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
             s.decode_share_percent = v;
         else if (name == "prompt_turn_ms")
             s.prompt_turn_ms = v;
-        else if (name == facts_.prompt_chunk_setting && settings_.prompt_chunk > 0)
+        else if (name == "prefill_chunk" && settings_.prompt_chunk > 0)
             s.prompt_chunk = v;
         else if (name == "rows")
             s.step.rows = (int) v;
@@ -2641,7 +2640,7 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
     const int64_t prompt_ceiling = model_.get_prompt_ceiling();
     const int64_t prompt_minimum = std::min(kPromptChunkStep, prompt_ceiling);
     if (s.prompt_chunk < prompt_minimum)
-        return facts_.prompt_chunk_setting + " takes " + std::to_string(prompt_minimum) + " tokens or more";
+        return "prefill_chunk takes " + std::to_string(prompt_minimum) + " tokens or more";
     if (const std::string why = strata::serve::get_token_limits_error(s.conversation_context, facts_.context,
             s.tokens_min, s.tokens_max); !why.empty())
         return why;

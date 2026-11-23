@@ -200,7 +200,7 @@ void print_usage() {
                  "  --cvec-dir per-layer|single:L  each layer's own direction (default) or layer L's everywhere (project)\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
-                 "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --model); auto =\n"
+                 "  --prefill-chunk CHUNK (also --prefill) batched prompt processing (needs --model); auto =\n"
                  "                       the largest chunk up to 8192 whose buffers the expert cache can lend;\n"
                  "                       auto:16384 / auto:32768 (or STRATA_PREFILL_AUTO_MAX) allow bigger ones.\n"
                  "                       strata-q38: the largest chunk; each prompt reads in the largest chunk up to\n"
@@ -518,8 +518,8 @@ int parse_options(int argc, char** argv, Options& o, bool& have_tokens) {
         else if (a == "--vram-reserve-mib") { o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib")); o.vram_reserve_given = true; }
         else if (a == "--vram-reserve-later-mib")
             o.vram_reserve_later_mib = std::atoi(next("--vram-reserve-later-mib"));
-        else if (a == "--prefill") {
-            const std::string v = next("--prefill");
+        else if (a == "--prefill-chunk") {
+            const std::string v = next("--prefill-chunk");
             o.prefill_auto = v == "auto" || v.rfind("auto:", 0) == 0;
             // #282: auto:N (N = 16384 or 32768) or STRATA_PREFILL_AUTO_MAX lets auto take chunks above 8192
             const char* env_max = std::getenv("STRATA_PREFILL_AUTO_MAX");

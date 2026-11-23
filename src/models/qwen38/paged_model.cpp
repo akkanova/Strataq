@@ -523,7 +523,6 @@ PagedQwen::PagedQwen(Model& m, Conversation& conv, const PagedCards& cards, Mode
     facts.kv_quantization = core::qsa_kv_q4() ? "Q4_0" : core::qsa_kv_int8() ? "INT8" : "FP16";
     facts.draft_limits.confidence = (float) o.spec_min_p;
     facts.drafter_start = "--mtp and a --lookahead above 0";
-    facts.prompt_chunk_setting = "prefill";
     facts.expert_bytes = get_blob_bytes(m);
     for (size_t i = 0; i < m.profile_all.size() && (int64_t) i < o.expert_cache; ++i)
         facts.split_ranking.push_back({m.profile_all[i].first, m.profile_all[i].second});

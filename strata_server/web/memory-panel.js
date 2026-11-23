@@ -71,7 +71,7 @@ const SETTINGS = {context: "Per-conversation token limit", concurrent: "Conversa
                   conversation_idle_seconds: "Idle conversation eviction age (sec)",
                   decode_share_percent: "Decoding while a prompt is read (%)",
                   prompt_turn_ms: "Prompt reading turn (ms)",
-                  prefill: "Max prompt chunk (tokens)", prefill_chunk: "Max prompt chunk (tokens)",
+                  prefill_chunk: "Max prompt chunk (tokens)",
                   lookahead: "Max lookahead", tokens_min: "Min conversation tokens",
                   tokens_max: "Max conversation tokens", ssd_pause_mib: "SSD for paused conversations (MiB)",
                   drafter: "Drafter", save_on_shutdown: "Save conversations on shutdown",
@@ -130,7 +130,7 @@ const CONTEXT_CAPACITY_HELP = "To raise this limit, increase --max-context in th
 /** Settings the engine reports that the panel shows elsewhere (the bars) or not at all. */
 const UNLISTED = new RegExp("^memory_mib\\.|^(token_bytes|conversation_bytes|context_capacity|" +
   "has_drafter|suffix_draft|lookup_chain|slots|ssd_pause_mib|batch_groups_now|pipeline_stages|" +
-  "prefill_capacity|prefill_chunk_capacity)$");
+  "prefill_chunk_capacity)$");
 /**
  * The number settings the panel's controls change, with the range each accepts given the reading's settings `s`
  * (the engine checks them again).
@@ -142,7 +142,6 @@ const CONTROLS = [["concurrent", () => 1, (s) => Math.min(s.slots ?? 8, s.rows ?
                   ["conversation_idle_seconds", () => 0, () => Infinity],
                   ["decode_share_percent", () => 0, () => Infinity],
                   ["prompt_turn_ms", () => 0, () => Infinity],
-                  ["prefill", (s) => Math.min(256, s.prefill_capacity ?? 256), () => Infinity],
                   ["prefill_chunk", (s) => Math.min(256, s.prefill_chunk_capacity ?? 256), () => Infinity],
                   ["rows", (s) => s.concurrent ?? 1, () => 8],
                   ["lookahead", () => 0, (s) => (s.rows ?? 1) - 1],
@@ -633,12 +632,12 @@ function describeControl(key, settings, details) {
   if (key === "prompt_turn_ms")
     return "The least time a prompt is read before the answering conversations get their turn. 0 means one chunk " +
       "of the prompt. Longer turns switch less often between reading and answering.";
-  if (key === "prefill" || key === "prefill_chunk")
+  if (key === "prefill_chunk")
     return "The most tokens of a prompt read in one pass through the model. Each pass reads every expert the GPU " +
       "lacks, so larger chunks read a long prompt with fewer expert reads, but borrow more of the pools' memory " +
       "(experts may leave the GPU while the prompt is read). Strata takes the largest chunk up to this that the " +
       "pools can lend at the time. A change applies from the next prompt. The prompt reader is sized for up to " +
-      `${fmt(settings[`${key}_capacity`])} tokens now; a larger value makes Strata enlarge it, which takes a ` +
+      `${fmt(settings.prefill_chunk_capacity)} tokens now; a larger value makes Strata enlarge it, which takes a ` +
       "little memory outside the pools. If that fails, the size stays and Strata says why.";
   if (key === "batch_groups")
     return "With the model split over several GPUs, the conversations decoding together can split into groups, so " +

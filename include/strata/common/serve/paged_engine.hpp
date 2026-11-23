@@ -96,8 +96,8 @@ struct PagedSettings {
     /// --prompt-turn-ms: the least time one turn of a prompt read lasts (it ends after a whole chunk); 0: one chunk
     /// per turn.  Longer turns switch less often between reading and decoding.
     int64_t prompt_turn_ms = 0;
-    /// Caps the chunk chosen when borrowing prompt buffers, initially PagedModel::get_prompt_ceiling(); 0 disables
-    /// borrowing. PagedModelFacts::prompt_chunk_setting names its live control.
+    /// (live: prefill_chunk) Caps the chunk chosen when borrowing prompt buffers, initially
+    /// PagedModel::get_prompt_ceiling() (--prefill-chunk, also spelled --prefill); 0 disables borrowing.
     int64_t prompt_chunk = 0;
     /// --gpu-mib, per card of a layer split (one value: every card's); empty: what each GPU has free less what it keeps
     std::vector<int64_t> gpu_mib;

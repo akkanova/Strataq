@@ -105,9 +105,6 @@ struct PagedModelFacts {
     bool has_drafter = false;
     /// what the start needs for a drafter, for the refusal of `drafter on` without one ("--mtp and ...")
     std::string drafter_start;
-    /// Names PagedSettings::prompt_chunk in memory reports and live changes. Uses the model's start option with
-    /// underscores for dashes ("prefill" for --prefill) so saving the default writes that option.
-    std::string prompt_chunk_setting;
     /// Names the loaded prediction model for the Memory settings UI.
     std::string drafter_label = "model";
     /// Describes the formats used for token state in the shared memory report.

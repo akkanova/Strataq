@@ -19,7 +19,8 @@ inline constexpr OptionAlias kOptionAliases[] = {
     {"--slots", "--batch"},                    // deprecated (strata, strata-q38, strata-q36): use --batch
     {"--n", "--max-new"},                      // deprecated (strata-dsv41, strata-q36): use --max-new
     {"--ctx", "--max-context"},                // deprecated (strata-q36): use --max-context
-    {"--chunk", "--prefill"},                  // deprecated (strata-q36): use --prefill
+    {"--chunk", "--prefill-chunk"},            // deprecated (strata-q36): use --prefill-chunk
+    {"--prefill", "--prefill-chunk"},          // Qwen engines' name; setup still writes it (--prefill auto)
     // deprecated (strata, strata-q38, strata-q36): use --model. Setup, the Terminal and the app still write --native
     // because older installed engines know only that name (strata_common/user_args.py MODEL_FLAGS).
     {"--native", "--model"},
