@@ -374,8 +374,11 @@ function describeDecode(sums, slow, rowsSetting) {
   if (rows == null)
     return [];
   const pct = (x) => (x == null ? "–" : `${fmt(100 * x)}%`);
-  const tenths = (x) => fmt(x, Number.isInteger(x) ? 0 : 1);
+  // Fading can leave a whole-number ratio slightly above or below its exact value.
+  const tenths = (x) => fmt(x, Math.round(10 * x) % 10 ? 1 : 0);
   const room = ratio("guess_room", "conversations");
+  // Acceptance alone cannot fade: its numerator and denominator decay at the same rate.
+  const keptNow = ratio("guesses", "steps") >= 0.005 ? kept : null;
   const together = conversations == null ? "" : `\nNumber of simultaneous conversations: ${tenths(conversations)}`;
   return [
     [`${fmt(rows, 1)} tokens/step`, "Average rows in use. A step is one pass through the model; it computes a " +
@@ -388,7 +391,7 @@ function describeDecode(sums, slow, rowsSetting) {
       "computed, because they were not in VRAM.\nPRES (Per Row Expert Sharing): how much expert work and memory " +
       "traffic the step saved because its rows picked some of the same experts: 1 - experts/token ÷ experts one " +
       "row alone uses. 0% with one row."],
-    ...kept == null ? [] : [[`${pct(kept)} MTP acceptance`,
+    ...kept == null ? [] : [[`${pct(keptNow)} MTP acceptance`,
       "The share of guessed tokens (the MTP drafter's and suffix lookup's) that the model kept." +
       (conversations == null ? "" : `\nOn average ${fmt(ratio("guesses", "conversations"), 2)} draft tokens are ` +
         "being submitted per conversation per step, and " +

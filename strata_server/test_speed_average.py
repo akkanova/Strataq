@@ -134,6 +134,29 @@ class MonitorTab(unittest.TestCase):
                             for args in ((10, 0, 0, 0, 0, 0, 0, 0, 0, 0), (11, 10, 20, 0, 0, 0, 0, 0, 0, 0))])
         self.assertNotIn("conversations:", older[1]["gen"][5][0], "an older engine sends no count")
 
+    def test_acceptance_fades_without_guesses_but_freezes_when_decode_stops(self):
+        def poll(second, state="generating"):
+            steps = 10 * second
+            return {"state": state, "tok_s": 20 if state == "generating" else None,
+                    "engine_stats": self.stats(second, steps, steps, 0, 0, 0, min(steps, 10),
+                                               min(steps, 10) // 2, 0, 0, conversations=steps, guess_room=steps)}
+        polls = self.polls([poll(second) for second in range(15)], wait_ms=1000)
+        self.assertEqual(polls[1]["gen"][4][-1], "50% MTP acceptance")
+        self.assertEqual(polls[-1]["gen"][4][-1], "– MTP acceptance")
+        self.assertIn("0.00 draft tokens", polls[-1]["gen"][5][-1])
+        idle = self.polls([poll(0), poll(1), poll(1, "idle")], wait_ms=1000)
+        self.assertEqual(idle[-1]["gen"][4][-1], "50% MTP acceptance")
+
+    def test_draft_room_uses_decimals_only_when_visible_after_rounding(self):
+        for room, expected in ((4.999999999, "5"), (5.000000001, "5"), (5.14, "5.1")):
+            polls = self.polls([
+                {"state": "generating", "tok_s": 20,
+                 "engine_stats": self.stats(second, 10 * second, 20 * second, 0, 0, 0,
+                                            10 * second, 5 * second, 0, 0,
+                                            conversations=10 * second, guess_room=10 * second * room)}
+                for second in (0, 1)], wait_ms=1000)
+            self.assertIn(f"at most {expected} tokens can be submitted", polls[-1]["gen"][5][-1])
+
     def test_an_engine_restart_is_not_a_negative_interval(self):
         polls = self.polls([{"state": "generating", "tok_s": 5.0,
                              "engine_stats": self.stats(49, 8, 8, 8, 8, 8, 8, 8, 8, 8)},

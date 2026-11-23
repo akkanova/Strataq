@@ -1234,9 +1234,10 @@ bool PagedEngine::serve_request(const std::string& line, bool admit) {
         h.dec.max_new = std::min<int64_t>(req.max_new, settings_.conversation_context - n);
         // Mixed sampled windows need per-row proposal distributions before lookup can be enabled.
         const bool lookup = smp.temperature <= 0.0f;
-        if (h.dec.draft_enabled && (facts_.has_drafter ||
-            (lookup && (settings_.suffix_draft > 0 || settings_.lookup_chain > 0))) &&
-            settings_.step.lookahead > 0) {
+        // Eligibility is fixed for this request; enabling a source later takes effect on its next request.
+        h.dec.draft_enabled = h.dec.draft_enabled && settings_.step.lookahead > 0 && (is_model_drafting() ||
+            (lookup && (settings_.suffix_draft > 0 || settings_.lookup_chain > 0)));
+        if (h.dec.draft_enabled) {
             // One conversation's window stays within kVerifyNarrowT rows, what the MTP drafter and its saved rows
             // hold (DraftPolicy::kMaxT is wider, for the old engine's --lookup-max-t); only a step of several
             // conversations uses the rest of max_rows.
