@@ -144,8 +144,8 @@ const METRICS = [
 $("metrics").innerHTML = METRICS.map((m) => `
   <div class="st-card metric-card"><div class="st-metric">
     <span class="st-metric__label">${icon(m.icon, "st-icon st-icon--sm")}${esc(m.label)}</span>
-    <div class="metric-row"><span class="st-metric__value" id="mv-${m.key}" data-tip>–</span>
-      <div class="metric-side" id="mx-${m.key}"></div></div>
+    <span class="st-metric__value" id="mv-${m.key}" data-tip>–</span>
+    <div class="metric-side" id="mx-${m.key}"></div>
     <span class="st-metric__sub" id="ms-${m.key}" data-tip></span>
     <svg class="st-metric__spark" id="sp-${m.key}" viewBox="0 0 100 32" preserveAspectRatio="none"${m.tone ? ` data-tone="${m.tone}"` : ""}>
       <path class="area" fill="currentColor" opacity=".12"/><path class="line" fill="none" stroke="currentColor"

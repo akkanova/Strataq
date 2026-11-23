@@ -101,9 +101,16 @@ main { flex: 1; min-height: 0; display: flex; }
 .st-metric__value small { font-size: var(--st-fs-md); font-weight: var(--st-fw-medium); color: var(--st-ink-muted); margin-left: 4px; }
 .st-metric__sub { font-size: var(--st-fs-xs); color: var(--st-ink-muted); font-variant-numeric: tabular-nums; min-height: 1em; }
 .st-metric__spark { display: block; overflow: visible; }
-.metric-row { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--st-s-3); }
-.metric-side { font-size: var(--st-fs-xs); color: var(--st-ink-muted); text-align: right;
-               font-variant-numeric: tabular-nums; }
+/* A flexible value row keeps long side columns from separating the label and value. */
+.metric-card .st-metric { display: grid; grid-template-columns: minmax(min-content, 1fr) auto;
+                          grid-template-rows: auto 1fr; column-gap: var(--st-s-3); }
+.metric-card .st-metric > * { grid-column: 1 / -1; }
+.metric-card .st-metric > :is(.st-metric__label, .st-metric__value) {
+  grid-column: 1; align-self: start;
+}
+.metric-card .st-metric > .metric-side { grid-column: 2; grid-row: 1 / span 2; font-size: var(--st-fs-xs);
+                                         color: var(--st-ink-muted); text-align: right;
+                                         font-variant-numeric: tabular-nums; }
 .st-metric__value.is-idle { color: var(--st-ink-muted); }
 .live-tip { position: fixed; z-index: 50; max-width: 340px; padding: 6px 8px; white-space: pre-line; pointer-events: none;
             font-size: var(--st-fs-xs); color: var(--st-ink); background: var(--st-surface-2);
