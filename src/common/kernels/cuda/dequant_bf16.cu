@@ -298,7 +298,7 @@ bool dequant_wide_on() {
             cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) { (void) cudaGetLastError(); return false; }
         // sm_80 is the 0.2.7 addition (#3779): STRATA_DEFAULTS=026 gives it the per-group kernels again, as 0.2.6 had
         per_dev[dev] = (major == 6 && minor == 1) || (major == 8 && minor == 6) ||
-                       (major == 8 && minor == 0 && strata::sm80_default_on(nullptr, strata::qwen_defaults_026())) ? 2 : 1;
+                       (major == 8 && minor == 0 && strata::sm80_default_on(nullptr, strata::defaults_026())) ? 2 : 1;
     }
     return per_dev[dev] == 2;
 }

@@ -143,7 +143,7 @@ target_include_directories(strata_includes INTERFACE
 target_compile_options(strata_includes INTERFACE -Wall -Wextra)
 
 # --- CPU-side pieces, identical to the top-level build ------------------------------------------------------------
-strata_resolve(_spec src/common/spec/suffix_drafter.cpp src/common/spec/controller.cpp
+strata_resolve(_spec src/common/spec/suffix_drafter.cpp
                     src/common/spec/draft_policy.cpp src/common/spec/draft_source.cpp)
 add_library(strata_spec STATIC ${_spec})
 target_link_libraries(strata_spec PUBLIC strata_includes)
@@ -221,7 +221,7 @@ if(STRATA_NATIVE_EXPERTS)
 endif()
 
 # --- the GPU engine ------------------------------------------------------------------------------------------------
-strata_resolve(_core src/base/gpu/device.cu src/base/gpu/pinned.cu src/base/gpu/graph.cpp src/base/platform/memory.cpp
+strata_resolve(_core src/base/gpu/device.cu src/base/gpu/pinned.cu src/base/platform/memory.cpp
                      src/core/weights.cpp src/core/layout.cpp)
 add_library(strata_core STATIC ${_core})
 target_link_libraries(strata_core PUBLIC strata_includes)
@@ -266,6 +266,7 @@ strata_resolve(_engine src/models/qwen38/layer.cpp src/models/qwen38/session.cpp
                        src/models/qwen38/conversation_snapshot.cpp src/models/qwen38/conversation_state.cpp
                        src/common/state/conversation_memory.cpp   # 0.1.31: the conversation snapshots (#216)
                        src/core/arch_defaults.cpp
+                       src/base/platform/piece_reads.cpp
                        src/base/gpu/vmm.cpp   # the port's stub: no driver VMM on Level Zero
                        src/common/state/conversation_file.cpp
                        src/common/experts/expert_profile.cpp src/common/experts/ram_tier.cpp

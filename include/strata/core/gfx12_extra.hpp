@@ -48,7 +48,7 @@ inline std::vector<std::pair<std::string, std::string>> gfx12_exact_extra_env(co
     return t;
 }
 inline std::vector<std::pair<std::string, std::string>> gfx12_exact_extra_env(const char* gcn_arch) {
-    return gfx12_exact_extra_env(gcn_arch, strata::qwen_defaults_026());
+    return gfx12_exact_extra_env(gcn_arch, strata::defaults_026());
 }
 
 /// The value-changing defaults of gfx12 (see above).  `defaults026`: STRATA_DEFAULTS=026.
@@ -64,7 +64,7 @@ inline std::vector<std::pair<std::string, std::string>> gfx12_value_changing_env
     return t;
 }
 inline std::vector<std::pair<std::string, std::string>> gfx12_value_changing_env(const char* gcn_arch) {
-    return gfx12_value_changing_env(gcn_arch, strata::qwen_defaults_026());
+    return gfx12_value_changing_env(gcn_arch, strata::defaults_026());
 }
 
 }  // namespace strata::core

@@ -267,6 +267,7 @@ private:
     int64_t mapped_segs_ = 0;           ///< #533: segments [0, mapped_segs_) are backed
     std::unique_ptr<VmmRange> vmm_;    ///< the arena's range when it is in VMM (set_vmm)
     bool external_ = false;            ///< the arena is open's caller's
+    int device_ = -1;                  ///< the GPU current at `open`: the fills count as its host traffic
     std::vector<int32_t> residency_;   ///< [n_layers * n_expert] -> slot or kNotResident
     int64_t slots_ = 0;
     int64_t n_layers_ = 0;

@@ -39,7 +39,11 @@ export function MemoryPanel({ instanceId }: { instanceId: string }) {
     }, [view]);
     return view?.available
         ? <section className="st-card monitor-memory">
-            <h2 className="h4">{tr('Memory')}</h2>
+            {/* the tooltip stays one literal: tests/locale-gaps.test.mjs finds tr() strings by their literal */}
+            <h2 className="h4" title={tr(
+                "Only settings you can edit live are shown here. Most of the important settings are shown here; see additional settings in the model's Expert settings (its run config, strata-<model>.json).")}>
+                {tr('Memory & Settings')}
+            </h2>
             {/* a new element per instance: the panel keeps a drag, a message and an Undo per element */}
             <div ref={element} key={instanceId}/>
         </section>

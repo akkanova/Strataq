@@ -1,15 +1,16 @@
-// DeepSeek's routed experts read without the file cache (expert_files.hpp) from a file of known bytes: matrices at
-// offsets and of sizes that are not sector multiples, several layers and files, batches larger than the reader's,
-// each expert's bytes landing at its blob offsets and nothing else of the blob touched.  No GPU, no model files.
-#include "expert_files.hpp"
+// Routed experts read without a file mapping (expert_files.hpp) from a file of known bytes: matrices at offsets and
+// of sizes that are not sector multiples, several layers and files, batches larger than the reader's, each expert's
+// bytes landing at its blob offsets and nothing else of the blob touched.  No GPU, no model files.
+#include "strata/common/experts/expert_files.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <vector>
 
-using namespace strata::ds4;
+using namespace strata::core;
 
 namespace {
 
@@ -40,7 +41,7 @@ void write_file(const std::string& path, int file, uint64_t bytes) {
 }  // namespace
 
 int main() {
-    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "ds4_expert_files_test";
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "expert_files_test";
     std::filesystem::create_directories(dir);
     const std::vector<std::string> paths = {(dir / "a.bin").string(), (dir / "b.bin").string()};
     write_file(paths[0], 0, 3u << 20);
@@ -70,6 +71,23 @@ int main() {
         check(files.copy_blobs(ls.data(), es.data(), dst.data(), dst.size()), "10 experts are read in batches");
         std::vector<uint8_t> one(layers[1].blob, fill);
         check(files.copy_blob(1, 3, one.data()) && one == blobs[8], "one expert reads as in a batch");
+        std::vector<std::thread> readers;
+        int results[4] = {};
+        for (size_t t = 0; t < 4; ++t)
+            readers.emplace_back([&, t] {
+                std::vector<std::vector<uint8_t>> copies;
+                std::vector<uint8_t*> targets;
+                for (const auto& blob : blobs)
+                    copies.emplace_back(blob.size(), fill);
+                for (auto& copy : copies)
+                    targets.push_back(copy.data());
+                if (files.copy_blobs(ls.data(), es.data(), targets.data(), targets.size()) && copies == blobs)
+                    results[t] = 1;
+            });
+        for (std::thread& reader : readers)
+            reader.join();
+        for (int result : results)
+            check(result == 1, "one ExpertFiles instance serves concurrent batches");
         for (size_t i = 0; i < blobs.size(); ++i) {
             const ExpertFileLayout& l = layers[(size_t) ls[i]];
             bool same = true, untouched = true;
@@ -106,6 +124,6 @@ int main() {
     }
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
-    std::printf("ds4_expert_files_test: %d checks passed\n", checks);
+    std::printf("expert_files_test: %d checks passed\n", checks);
     return 0;
 }

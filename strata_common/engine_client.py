@@ -577,10 +577,10 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
     into RAM and locks part of it for the GPU, and on many PCs everything is slow or frozen for a minute or more -
     people closed the window thinking it had hung.  The warning comes at that step, not after it."""
     gb = 0.0
-    if "--native" in args:                              # about the size of the experts it will read
+    if model := user_args.find_model_file(args):        # about the size of the experts it will read
         try:
-            gb = os.path.getsize(args[args.index("--native") + 1]) / 1e9
-        except (OSError, IndexError):
+            gb = os.path.getsize(model) / 1e9
+        except OSError:
             pass
     size = f"about {gb:.0f} GB" if gb >= 1 else "tens of GB"
     loading = experts_loading_words(args, size)
@@ -875,8 +875,7 @@ class StrataEngine:
         # the all-cards split engine (sFNX, strata-split-N[-arch]): its GEN parser accepts fewer keys than Strata's engine (tests/split/test_split_gen_keys.py pins them)
         self.split_engine = os.path.basename(str(exe)).startswith("strata-split")
         self.session_save_reclaim = '--session-save-reclaim' in args
-        paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
-        self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
+        self.model_path = user_args.find_model_file(args) or dict(zip(args, args[1:])).get("--pack", "pack/full")
         # The engine excludes a temporary effort turn from its reusable history boundary.
         self._tail_role_token = int(args[args.index("--tail-role-token") + 1]) if "--tail-role-token" in args else -1
         self.log_path = log
@@ -894,6 +893,7 @@ class StrataEngine:
         self.terminal_stages: list[dict] = []  # final layer ranges from this engine start's bounded stderr log
         self.terminal_batch_sample: dict | None = None
         self.terminal_stage_sample: dict | None = None
+        self.live_stats: dict | None = None   # a paged engine's last STATS line's object (contracts/requests.md)
         self.prefill_tok_s_mean = None
         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
         self.progress_ms = 0             # PP's own milliseconds since the prompt started (its third field)
@@ -925,6 +925,7 @@ class StrataEngine:
                 self.log.flush()
             except OSError:
                 pass
+        self.live_stats = None
         self.max_context = 0                             # before the new process is visible: never its predecessor's
         pin = {}
         if cpus and hasattr(os, "sched_setaffinity"):    # replicas: this engine's own physical cores (strata_server/replicas.py)
@@ -1075,9 +1076,8 @@ class StrataEngine:
             print(f"[strata] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
                   "(its log says why)", flush=True)
         _bg = args[args.index("--batch-groups") + 1] if "--batch-groups" in args else "default"
-        # no `--batch-groups` (the default on a layer split) or `auto`: the engine picks the groups and says so
-        # (INFO batch_groups=G); a number is the group count asked for (1 = off)
-        groups = int(self.info.get("batch_groups") or 1) if _bg in ("auto", "default") else int(_bg)
+        # No flag or auto (0) uses INFO batch_groups; an explicit positive number requests that count (1 = off).
+        groups = int(self.info.get("batch_groups") or 1) if _bg in ("auto", "0", "default") else int(_bg)
         groups = groups if self.batch and groups > 0 and self.batch % groups == 0 else 1
         gs = self.batch // groups if self.batch else 0
         # slots in the order that spreads requests over the pipeline's groups first: 0, gs, 2gs, .., 1, gs+1, ..
@@ -1183,6 +1183,11 @@ class StrataEngine:
                 if sample is not None and self.proc is proc:
                     self.terminal_batch_sample = {**sample, "observed_monotonic": time.monotonic()}
                 continue                        # control telemetry never enters a request's token stream
+            if line.startswith("STATS "):
+                with contextlib.suppress(ValueError):
+                    if self.proc is proc:
+                        self.live_stats = json.loads(line[6:])
+                continue
             if line.startswith("PSTAT"):
                 sample = parse_stage_in_flight_sample(line)
                 if sample is not None and self.proc is proc:
@@ -1498,7 +1503,11 @@ class StrataEngine:
         allocated, and that are free in runs too short for any expert (strata-q38's pool).  setting: the pool's size
         in bytes now (what CHANGE_SETTINGS' memory_mib.<id> sets); smallest and largest: the range of sizes it
         accepts now.  mapped: the bytes of it the GPUs map (page-locked), which Windows counts in a GPU's shared use
-        too.  A value the engine did not say is None (uses: absent).  The same turn rules as list_conversations."""
+        too.  pool_shared, dedicated_full, kept_free (the memory the pools leave free for other programs) and
+        dedicated_room: as include/strata/common/serve/memory_report.hpp says.  "expert_traffic" (the paged
+        engines): {memory id: {counter: count}}, each expert pool's EXPERT_TRAFFIC counters since the engine started
+        (memory_report.hpp).  A value the engine did not say is None (uses: absent).  The same turn rules as
+        list_conversations."""
         return self._ask_memory_report("GET_MEMORY_USE")
 
     def change_settings(self, values: dict) -> dict:
@@ -1513,17 +1522,20 @@ class StrataEngine:
     def _ask_memory_report(self, command: str, refused: type[Exception] | None = None) -> dict:
         """Sends `command` and parses its GET_MEMORY_USE-style answer for memory() and change_settings()."""
         memories, settings, held, shortfall, pause_directory = [], {}, [], None, None
-        details, expert_fill = {}, {}
+        details, expert_fill, expert_traffic = {}, {}, {}
         for f in self._ask(command, "MEMORY", end="END_MEMORY",
                            timeout=self.MEMORY_QUERY_TIMEOUT_S,
                            also=("SETTINGS", "CONVERSATION", "SHORTFALL", "MEMORY_BLOCK",
-                                 "PAUSE_DIRECTORY", "MEMORY_DETAIL", "EXPERT_FILL"),
+                                 "PAUSE_DIRECTORY", "MEMORY_DETAIL", "EXPERT_FILL", "EXPERT_TRAFFIC"),
                            refused=refused):
             # MEMORY <id> [key=value ...] [name=<text to the end>]  /  CONVERSATION ...  /  SETTINGS [key=value ...]  /
             # SHORTFALL <text>
             if f[0] == "EXPERT_FILL":
                 values = dict(x.split("=", 1) for x in f[1:])
                 expert_fill = {"loaded": bool(int(values["loaded"])), "pending": int(values["pending"])}
+                continue
+            if f[0] == "EXPERT_TRAFFIC":
+                expert_traffic[f[1]] = {k: int(v) for k, _, v in (x.partition("=") for x in f[2:])}
                 continue
             if f[0] == "MEMORY_DETAIL":
                 details[f[1]] = unquote(f[2])
@@ -1562,7 +1574,9 @@ class StrataEngine:
                              "paused_budget": keys.pop("paused_budget", None),
                              "allocated_pct": share["allocated"], "fragmented_pct": share["fragmented"],
                              **{k: keys.pop(k, None) for k in
-                                ("setting", "smallest", "largest", "mapped", "pool_offset")},
+                                ("setting", "smallest", "largest", "mapped", "pool_offset", "pool_shared",
+                                 "kept_free", "dedicated_room")},
+                             "dedicated_full": bool(keys.pop("dedicated_full", 0)),
                              "uses": keys})
         for key in ("concurrent", "tokens_max", "vram_conversations", "conversation_idle_seconds",
                     "save_on_shutdown"):
@@ -1572,6 +1586,7 @@ class StrataEngine:
             self.max_context = settings["context"]
         return {"memories": memories, "settings": settings, **({"details": details} if details else {}),
                 **({"expert_fill": expert_fill} if expert_fill else {}),
+                **({"expert_traffic": expert_traffic} if expert_traffic else {}),
                 **({"conversations": held} if held else {}),
                 **({"shortfall": shortfall} if shortfall else {}),
                 **({"pause_directory": pause_directory} if pause_directory else {})}

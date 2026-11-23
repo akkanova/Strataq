@@ -22,6 +22,7 @@
 #pragma once
 
 #include "strata/base/gpu/emulate.hpp"
+#include "strata/base/platform/env.hpp"
 
 #include <cstdlib>
 
@@ -29,10 +30,7 @@ namespace strata {
 
 /// STRATA_SM120_PERF (read once): unset or anything but "0" = on
 inline bool sm120_series() {
-    static const bool on = [] {
-        const char* e = std::getenv("STRATA_SM120_PERF");
-        return e == nullptr || std::atoi(e) != 0;
-    }();
+    static const bool on = strata::platform::env_tri("STRATA_SM120_PERF") != 0;
     return on;
 }
 
@@ -60,7 +58,7 @@ inline bool sm120_default(int major, int minor) { return is_sm120(major, minor) 
 
 // ---- 0.2.7 defaults of the CUDA speed work (pure rules; the engine reads the device and calls these; tests in arch_defaults_test)
 // `hip`: a HIP build, where a gfx1200 / gfx1201 reports compute capability 12.0 as well and none of these is measured or wanted.
-// `v026`: STRATA_DEFAULTS=026 (defaults_026.hpp qwen_defaults_026()): every one of these is then off, as in v0.2.6.  An explicit variable
+// `v026`: STRATA_DEFAULTS=026 (defaults_026.hpp defaults_026()): every one of these is then off, as in v0.2.6.  An explicit variable
 // (STRATA_ROUTE_PRIOR=2, STRATA_GR_V3=1, ...) is decided by the caller before it asks the rule, so it still wins.
 // `total_bytes`: the card's memory (cudaDeviceProp::totalGlobalMem); `integrated`: a GPU that shares the PC's memory.
 constexpr double kSmallCardGiB = 13.0;   // "a 12 GB card": 12 GB cards report 11.6 - 12.0 GiB, 16 GB ones 15.6 - 16.0

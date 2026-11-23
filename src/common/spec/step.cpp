@@ -103,13 +103,11 @@ bool Step::run(const std::vector<Decoding*>& active, std::string& err) {
     std::vector<Work> work((size_t) count);
     group_turns_.resize((size_t) count);
     std::vector<StepGroup> groups;
-    const int wave_conversations = (int) std::count_if(active.begin(), active.end(),
-        [](const Decoding* d) { return !d->stop; });
     // Picture/suffix answers can differ across live group changes; see docs/DETAILS.md's validation limits.
     for (int i = 0; i < count; ++i) {
         const size_t first = active.size() * (size_t) i / count;
         const size_t end = active.size() * (size_t) (i + 1) / count;
-        prepare({active.begin() + first, active.begin() + end}, work[(size_t) i], i, wave_conversations);
+        prepare({active.begin() + first, active.begin() + end}, work[(size_t) i], i);
         groups.push_back(std::move(work[(size_t) i].group));
     }
     const auto t0 = std::chrono::steady_clock::now();
@@ -125,7 +123,7 @@ bool Step::run(const std::vector<Decoding*>& active, std::string& err) {
     return true;
 }
 
-void Step::prepare(const std::vector<Decoding*>& active, Work& work, int group, int wave_conversations) {
+void Step::prepare(const std::vector<Decoding*>& active, Work& work, int group) {
     std::vector<Decoding*> going;
     for (Decoding* d : active) {
         d->emitted.clear();
@@ -152,11 +150,9 @@ void Step::prepare(const std::vector<Decoding*>& active, Work& work, int group, 
     auto& stepping = work.stepping;
     auto& start = work.start;
     std::vector<int32_t> guesses((size_t) std::max(settings.rows, 1));
-    const bool draft = settings.max_draft_conversations == 0 ||
-                       std::max((int) going.size(), wave_conversations) <= settings.max_draft_conversations;
     const auto get_want = [&](size_t i) {
         const Decoding& d = *going[i];
-        return !draft || !d.draft_enabled ? 0 :
+        return !d.draft_enabled ? 0 :
             (int) std::max<int64_t>(std::min<int64_t>(share[i], d.max_new - d.produced - 1), 0);
     };
     std::vector<DraftRequest> proposals;
@@ -230,6 +226,7 @@ void Step::prepare(const std::vector<Decoding*>& active, Work& work, int group, 
             n = 0;
             window = Window{1};
         }
+        d.guess_room += want;
         windows.push_back(window);
         stepping.push_back(&d);
         start.push_back(rows.size());

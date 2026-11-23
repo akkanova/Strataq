@@ -5,12 +5,15 @@
 //   GET_MEMORY_USE
 //     MEMORY <id> [total=<B>] [free=<B>] [unified=1] [<use>=<B> ...] [paused_count=<n>] [paused_budget=<B>]
 //            [pool_pages=<n> allocated_pages=<n> fragmented_pages=<n>] [setting=<B> smallest=<B> largest=<B>]
-//            [mapped=<B>] [name=<text>]                                                   one line per memory, then
+//            [pool_shared=<B>] [dedicated_full=1] [kept_free=<B>] [dedicated_room=<B>] [mapped=<B>]
+//            [name=<text>]                                                               one line per memory, then
 //     [MEMORY_BLOCK <memory-id> <bytes> <category> <pool> <label> [<identity-group> <ids>]] labelled allocations
 //     [PAUSE_DIRECTORY <path>]                                                  folder for automatic SSD pauses
 //     [CONVERSATION <id> <place> <state> <tokens> <capacity> <bytes> <used>]     with per_conversation: one per
 //                                                                                conversation (LIST_CONVERSATIONS')
 //     [EXPERT_FILL loaded=<0|1> pending=<n>]                                     paged engines: experts' fill
+//     [EXPERT_TRAFFIC <memory-id> hits=<n> misses=<n> loads=<n> evictions=<n> swaps=<n>
+//                     [ssd_reads=<n> ssd_bytes=<B> ssd_wait_us=<us>]]            paged engines: per expert pool
 //     SETTINGS [context=<tokens>] [concurrent=<n>] [rows=<n>] [lookahead=<n>] [tokens_min=<tokens>]
 //     [SHORTFALL <text>]                                                         CHANGE_SETTINGS' answer only
 //     END_MEMORY
@@ -28,15 +31,28 @@
 // parked conversations there; paused_budget: the most they may take.  pool_pages: the pages of a page pool there
 // (strata-q38's), of which allocated_pages hold experts or conversations and fragmented_pages are free in runs
 // shorter than the smallest expert, which no expert can use.  setting: the bytes the engine's pool there takes now
-// (its `memory_mib.<id>` setting), and smallest, largest: the range CHANGE_SETTINGS accepts for it now.  mapped: the
-// bytes of it that are page-locked for the GPUs to read (strata-q38's RAM pool); Windows counts them in a GPU's shared
-// use too, so a reader takes them off that.  name: the device's name, to the end of the line.  settings: the context
-// in tokens, the conversations decoded at once, the rows one step computes, the most guesses one conversation adds in
+// (its `memory_mib.<id>` setting), and smallest, largest: the range CHANGE_SETTINGS accepts for it now (largest: the
+// estimate of what the GPU's dedicated memory holds; a growth finds the real end).  pool_shared: the bytes of an
+// integrated GPU's pool that went to shared memory; dedicated_full=1: the pool's last growth stopped
+// where the dedicated memory ended (CHANGE_SETTINGS' shared_memory=on lets the next one go on).  kept_free: the bytes
+// the engine's pools leave unallocated on the GPU for other programs (its `vram_reserve_mib` setting).
+// dedicated_room: the bytes still available below an integrated GPU's measured dedicated-memory limit, after all
+// programs' current use (Windows' D3DKMT statistics). Absent until a pool's growth finds that limit; 0 means full.
+// Readers using another counter for free memory clamp this to their free bytes and draw the rest as unusable.
+// mapped: the bytes of it that are page-locked for the GPUs to read (strata-q38's RAM pool); Windows counts them in a
+// GPU's shared use too, so a reader takes them off that. name: the device's name, to the end of the line.
+// settings: the context in tokens, the conversations decoded at once, the rows one step computes,
+// the most guesses one conversation adds in
 // a step, the conversation tokens kept free of experts, and what else the engine can change.  EXPERT_FILL (the paged
 // engines, which fill their expert pools after READY): loaded=1 when no pool can take more experts now, which an
 // eviction or a grown pool turns back to 0; pending: the experts the pools should hold and do not, counting those that
-// wait for pages conversations hold.  A value the engine does not know is left out, not guessed.  The command changes
-// nothing.
+// wait for pages conversations hold.  EXPERT_TRAFFIC (the paged engines): counts since the engine started for
+// the expert pool in memory <memory-id> (ExpertTraffic): its hits and misses (uses of experts it held and did not;
+// a GPU's are decode routings, each expert once per step; misses include CPU computation and PCIe reads),
+// loads (experts copied in), evictions,
+// swaps (an expert taking a colder one's pages), and, for a pool that reads the SSD, its batches of reads, their bytes
+// and the microseconds spent waiting for them.  A value the engine does not know is left out, not guessed.  The
+// command changes nothing.
 //
 //   CHANGE_SETTINGS <name>=<value> [...]      -> the GET_MEMORY_USE answer once changed, or ERR <why>, changing
 //                                                nothing of the line
@@ -78,6 +94,13 @@ struct Memory {
     uint64_t setting = 0, smallest = 0, largest = 0;
     uint64_t pool_offset = 0;   ///< bytes drawn before the adjustable pool, independent of category names
     uint64_t mapped = 0;   ///< the bytes of it the GPUs map (page-locked); 0: none or not said
+    uint64_t pool_shared = 0;     ///< the bytes of the GPU's pool in shared memory instead of dedicated
+    bool dedicated_full = false;  ///< the pool's last growth stopped at the end of the GPU's dedicated memory
+    uint64_t kept_free = 0;          ///< the bytes the pools leave unallocated on the GPU for other programs
+    /// Bytes below the measured dedicated-memory limit minus all programs' use; absent until that limit is found.
+    std::optional<uint64_t> dedicated_room;
+    /// The expert pool's counters here (ExpertTraffic::get_counts), for an EXPERT_TRAFFIC line; empty: no line.
+    std::vector<std::pair<std::string, uint64_t>> traffic;
 
     /// Adds `bytes` to use `use`; a zero adds nothing.
     void add(const std::string& use, uint64_t bytes) {
@@ -88,6 +111,13 @@ struct Memory {
                 return;
             }
         uses.emplace_back(use, bytes);
+    }
+    /// Gets the bytes held here for use `use`; 0 when it holds none.
+    uint64_t get_use(const std::string& use) const {
+        for (const auto& [u, b] : uses)
+            if (u == use)
+                return b;
+        return 0;
     }
     /// Includes labelled blocks and derives the category totals from them.
     void add_blocks(const std::vector<core::MemoryBlock>& entries) {
@@ -182,6 +212,14 @@ inline std::string format_memory_report(MemoryReport report, const std::vector<c
             put("smallest", m.smallest);
             put("largest", m.largest);
         }
+        if (m.pool_shared > 0)
+            put("pool_shared", m.pool_shared);
+        if (m.dedicated_full)
+            put("dedicated_full", 1);
+        if (m.kept_free > 0)
+            put("kept_free", m.kept_free);
+        if (m.dedicated_room)
+            put("dedicated_room", *m.dedicated_room);
         if (m.mapped > 0) put("mapped", m.mapped);
         if (!m.name.empty()) s += " name=" + m.name;
         s += '\n';
@@ -210,6 +248,14 @@ inline std::string format_memory_report(MemoryReport report, const std::vector<c
     if (report.experts_loaded)
         s += std::string("EXPERT_FILL loaded=") + (*report.experts_loaded ? "1" : "0") +
              " pending=" + std::to_string(report.experts_pending) + "\n";
+    for (const Memory& m : report.memories) {
+        if (m.traffic.empty())
+            continue;
+        s += "EXPERT_TRAFFIC " + m.id;
+        for (const auto& [key, v] : m.traffic)
+            put(key, v);
+        s += '\n';
+    }
     s += "SETTINGS";
     for (const auto& [key, v] : report.settings)
         s += " " + key + "=" + std::to_string(v);

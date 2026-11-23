@@ -273,18 +273,26 @@ void confidence(const float* x, const uint16_t* E, const int* tok, const float* 
 /// The pipeline's hand-offs and tensor parallelism, through host-mapped memory (these cards copy peer to peer only
 /// through the driver's staging).  xfer_put copies up to 4 segments (16-byte multiples, 16-byte aligned) device ->
 /// host-mapped, then (flag given) sets *flag = seq after a system fence (cnt: a device counter of the stream, 0
-/// between uses); xfer_get waits on the device until *flag >= seq, then copies host-mapped -> device.
+/// between uses); xfer_get waits on the device until *flag >= seq, then copies host-mapped -> device.  Both count the
+/// bytes as the host traffic of `device`, the runtime number of the card that runs `s` (-1: not counted).
 struct Xfer {
     const void* src[4] = {nullptr, nullptr, nullptr, nullptr};
     void* dst[4] = {nullptr, nullptr, nullptr, nullptr};
     size_t bytes[4] = {0, 0, 0, 0};
     int n = 0;
+    /// Gets the bytes the n segments hold together.
+    size_t total() const {
+        size_t sum = 0;
+        for (int i = 0; i < n; ++i)
+            sum += bytes[i];
+        return sum;
+    }
 };
-void xfer_put(const Xfer& x, unsigned* flag, unsigned seq, unsigned* cnt, cudaStream_t s);
+void xfer_put(const Xfer& x, unsigned* flag, unsigned seq, unsigned* cnt, cudaStream_t s, int device);
 // Windows (WDDM, CUDA and HIP alike) holds launches back until the host waits or queries the stream: the work queued on
 // `s` submitted now (cudaStreamQuery, which does not wait).  Elsewhere nothing.  DS4_WIN_SUBMIT=0: off (A/B tests)
 void win_submit(cudaStream_t s);
-void xfer_get(const Xfer& x, const unsigned* flag, unsigned seq, cudaStream_t s);
+void xfer_get(const Xfer& x, const unsigned* flag, unsigned seq, cudaStream_t s, int device);
 /// Waits (one thread) until flags[i * stride] >= seq for i < n (a pipelined chunk's readers have taken a buffer);
 /// set_flag: *flag = v after a system fence (a reader's acknowledgement).
 void wait_flags(const unsigned* flags, int n, int stride, unsigned seq, cudaStream_t s);
@@ -305,6 +313,6 @@ struct ArGroup {
     unsigned* bflags = nullptr;
 };
 constexpr int kArBlocks = 64;
-void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s);
+void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s, int device);
 
 }  // namespace strata::ds4

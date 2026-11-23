@@ -14,7 +14,7 @@
 namespace strata::core {
 
 std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gcn_arch) {
-    return arch_default_env(gcn_arch, strata::qwen_defaults_026());
+    return arch_default_env(gcn_arch, strata::defaults_026());
 }
 
 std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gcn_arch, bool defaults026) {
@@ -113,7 +113,7 @@ bool gfx12_prefill_share_default(const char* gcn_arch, bool defaults026) {
 }
 
 bool gfx12_prefill_share_default(const char* gcn_arch) {
-    return gfx12_prefill_share_default(gcn_arch, strata::qwen_defaults_026());
+    return gfx12_prefill_share_default(gcn_arch, strata::defaults_026());
 }
 
 bool igpu_prompt_defaults_arch(const char* gcn_arch) {

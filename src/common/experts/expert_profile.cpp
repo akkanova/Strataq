@@ -1,13 +1,24 @@
 // src/common/experts/expert_profile.cpp - reads and writes the expert profile file.  Read the header first.
 #include "strata/common/experts/expert_profile.hpp"
+#include "strata/base/platform/os.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <initializer_list>
 
 namespace strata::core {
+
+namespace {
+/// Bytes of a profile's body: where they start and how many.
+using Bytes = std::pair<const void*, size_t>;
+bool write_profile_atomically(const std::string& path, const char* who, const uint32_t (&hdr)[5],
+                              std::initializer_list<Bytes> body, std::string& err);
+}  // namespace
 
 bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
                          std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err) {
@@ -126,27 +137,93 @@ bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_e
         pairs.push_back((uint16_t) l);
         pairs.push_back((uint16_t) e);
     }
-    const uint32_t hdr[5] = {1u, (uint32_t) n_layers, (uint32_t) n_expert, (uint32_t) ranked.size(),
-                             (uint32_t) ranked.size()};
-    const std::string tmp = path + ".tmp";
+    return write_profile_atomically(path, "write_expert_profile", {1u, (uint32_t) n_layers, (uint32_t) n_expert,
+                                    (uint32_t) ranked.size(), (uint32_t) ranked.size()},
+                                    {{pairs.data(), pairs.size() * 2}, {table.data(), table.size() * 4}}, err);
+}
+
+bool read_expert_counts(const std::string& path, int64_t n_expert, uint32_t max_rows,
+                        std::vector<uint32_t>& counts, std::string& err) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    const auto bytes = f.tellg();
+    if (!f || bytes < 0) {
+        err = "read_expert_counts: cannot open " + path;
+        return false;
+    }
+    f.seekg(0);
+    char magic[4] = {0, 0, 0, 0};
+    uint32_t hdr[5] = {0, 0, 0, 0, 0};
+    const bool has_header = f.read(magic, 4) && std::memcmp(magic, "STRP", 4) == 0;
+    if (n_expert <= 0 || n_expert > UINT32_MAX ||
+        (has_header && (!f.read(reinterpret_cast<char*>(hdr), sizeof hdr) || hdr[0] != 2 || hdr[2] != n_expert))) {
+        err = "read_expert_counts: " + path + " is not a version 2 profile of " + std::to_string(n_expert) +
+              " experts a row (version " + std::to_string(hdr[0]) + ", " + std::to_string(hdr[2]) + " experts)";
+        return false;
+    }
+    const uint64_t row = 4 * (uint64_t) n_expert, body = (uint64_t) bytes - (has_header ? 24 : 0);
+    const uint64_t n_rows = has_header ? hdr[1] : body / row;
+    if (n_rows > max_rows || body / row > max_rows ||
+        (body / row == max_rows && body % row != 0) ||
+        n_rows > counts.max_size() / (uint64_t) n_expert) {
+        err = "read_expert_counts: " + path + " has too many rows for this model";
+        return false;
+    }
+    if (n_rows > body / row) {
+        err = "read_expert_counts: the counts in " + path + " are truncated";
+        return false;
+    }
+    std::vector<uint32_t> loaded((size_t) n_rows * (size_t) n_expert);
+    f.clear();
+    f.seekg(has_header ? 24 : 0);
+    if (!f.read(reinterpret_cast<char*>(loaded.data()), (std::streamsize) (loaded.size() * 4))) {
+        err = "read_expert_counts: the counts in " + path + " are truncated";
+        return false;
+    }
+    counts = std::move(loaded);
+    return true;
+}
+
+bool write_expert_counts(const std::string& path, int64_t n_rows, int64_t n_expert,
+                         const std::vector<uint32_t>& counts, std::string& err) {
+    if (n_rows <= 0 || n_rows > UINT32_MAX || n_expert <= 0 || n_expert > UINT32_MAX ||
+        counts.size() > SIZE_MAX / 4 || counts.size() != (uint64_t) n_rows * (uint64_t) n_expert) {
+        err = "write_expert_counts: the counts are not n_rows x n_expert";
+        return false;
+    }
+    return write_profile_atomically(path, "write_expert_counts", {2u, (uint32_t) n_rows, (uint32_t) n_expert, 0u, 0u},
+                                    {{counts.data(), counts.size() * 4}}, err);
+}
+
+namespace {
+
+/// Publishes a complete profile by replacing the destination. `who` names the caller in errors.
+bool write_profile_atomically(const std::string& path, const char* who, const uint32_t (&hdr)[5],
+                              std::initializer_list<Bytes> body, std::string& err) {
+    // Version 1 retains its temporary path and diagnostics; counts may be saved by separate engines.
+    static std::atomic<uint64_t> next_save{0};
+    const std::string tmp = path + ".tmp" + (hdr[0] == 2 ? "." +
+        std::to_string(platform::get_process_id()) + "." + std::to_string(next_save.fetch_add(1)) : "");
     std::FILE* f = std::fopen(tmp.c_str(), "wb");
     if (f == nullptr) {
-        err = "write_expert_profile: cannot create " + tmp;
+        err = std::string(who) + ": cannot create " + tmp;
         return false;
     }
     // the format is little-endian (make_profile.py's "<"): so is every machine this engine runs on
-    bool ok = std::fwrite("STRP", 1, 4, f) == 4 && std::fwrite(hdr, 4, 5, f) == 5 &&
-              (pairs.empty() || std::fwrite(pairs.data(), 2, pairs.size(), f) == pairs.size()) &&
-              std::fwrite(table.data(), 4, table.size(), f) == table.size();
+    bool ok = std::fwrite("STRP", 1, 4, f) == 4 && std::fwrite(hdr, 4, 5, f) == 5;
+    for (const auto& [data, n] : body)
+        ok = ok && std::fwrite(data, 1, n, f) == n;
     ok = (std::fclose(f) == 0) && ok;
     std::error_code ec;
-    if (ok) std::filesystem::rename(tmp, path, ec);   // replaces an existing file (MoveFileEx / rename(2))
+    if (ok)
+        std::filesystem::rename(tmp, path, ec);   // a Windows reader may deny replacement; keep the old file
     if (!ok || ec) {
         std::filesystem::remove(tmp, ec);
-        err = "write_expert_profile: cannot write " + path;
+        err = std::string(who) + ": cannot write " + path;
         return false;
     }
     return true;
 }
+
+}  // namespace
 
 }  // namespace strata::core

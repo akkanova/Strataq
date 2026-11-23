@@ -17,6 +17,7 @@
 // bytes - (word >> 2t) & 0x03030303 holds weights t, t+4, t+8, t+12 of a 16-weight word.  So the kernels use that order
 // for the k of a half-block: mma k index 16h + 4t + j stands for weight (and activation) 16h + t + 4j.  The
 // activations are stored in it (perm32), and a lane's two B registers (h = 0 and 1) are adjacent: one 8-byte load.
+#include "strata/base/platform/env.hpp"
 #include "strata/common/kernels/prefill/moe_fused.hpp"
 #include "strata/common/kernels/prefill/pf_fused_override.hpp"
 #include "strata/base/gpu/gfx_arch.hpp"
@@ -617,10 +618,7 @@ DevInfo g_dev[32];
 // WGPs), 8192 tokens x top 10, IQ3_S / IQ4_NL, one layer: 1 block per WGP 60.7 ms, 2 44.7, 3 49.9, 4 45.2 (the same
 // work items and arithmetic: the results do not change).  STRATA_PF_OCC=N sets the blocks per WGP (an experiment knob).
 static int wgp_blocks(int occ) {
-    static const int env = [] {
-        const char* v = std::getenv("STRATA_PF_OCC");
-        return v != nullptr ? std::atoi(v) : 0;
-    }();
+    static const int env = strata::platform::env_int("STRATA_PF_OCC", 0);
     return env > 0 ? env : 2 * std::max(occ, 1);
 }
 #endif

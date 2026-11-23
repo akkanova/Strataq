@@ -6,7 +6,7 @@
 # the GPU engine of the CUDA and HIP builds (strata_core, strata_kernels, strata_prefill, strata_engine, strata, the DeepSeek and Qwen3.6 engines and their tests): shared by both backends
 macro(strata_gpu_engine)
 if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
-  add_library(strata_core STATIC src/base/gpu/device.cu src/base/gpu/pinned.cu src/base/gpu/graph.cpp
+  add_library(strata_core STATIC src/base/gpu/device.cu src/base/gpu/pinned.cu
                                src/base/platform/memory.cpp src/base/platform/io_priority.cpp src/core/weights.cpp
                                src/core/layout.cpp src/base/gpu/runtime.cu src/base/gpu/links.cu)
   target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -289,15 +289,18 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
   add_library(strata_engine STATIC src/base/gpu/vmm.cpp
     src/common/state/conversation_memory.cpp src/common/state/conversation_file.cpp
-    src/common/experts/expert_profile.cpp src/common/experts/ram_tier.cpp src/common/experts/expert_pages.cpp
-    src/common/experts/ram_experts.cpp src/common/state/pool_copy.cpp src/common/state/pause_file.cpp
+    src/common/experts/expert_profile.cpp src/common/experts/expert_pages.cpp
+    src/common/experts/ram_experts.cpp src/common/experts/expert_files.cpp src/common/state/pool_copy.cpp
+    src/common/state/pause_file.cpp
+    src/base/platform/piece_reads.cpp
+    src/common/state/conversation_block_tables.cpp
     src/core/expert_source.cpp src/core/remote_experts.cpp src/core/remote_expert_opt.cu src/core/expert_cache.cpp
     src/core/peer_experts.cpp src/core/arch_defaults.cpp src/core/nv_defaults.cpp
     src/models/qwen38/layer.cpp src/models/qwen38/session.cpp src/models/qwen38/native_head.cpp
     src/models/qwen38/native_dense.cpp src/models/qwen38/verify.cpp src/models/qwen38/mtp.cpp
     src/models/qwen38/dflash2.cpp src/models/qwen38/conversation_snapshot.cpp src/models/qwen38/conversation_state.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu strata_state
+  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu strata_state strata_split
                         ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
     add_executable(host_graph_launch_test tests/core/host_graph_launch_test.cu)
@@ -307,8 +310,19 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_tests_properties(host_graph_launch_test PROPERTIES TIMEOUT 30)
   endif()
   if(STRATA_BUILD_TESTS)
-    # the memory manager's RAM tier (docs/MEMORY_MANAGER_PLAN.md M5): on host memory, through the runtime's copies
-    foreach(_t common/state/pool_copy common/state/pause_file common/experts/ram_experts)
+    add_executable(weights_loading_test tests/core/weights_loading_test.cpp)
+    target_link_libraries(weights_loading_test PRIVATE strata_engine)
+    add_test(NAME weights_loading_test COMMAND weights_loading_test)
+    set_tests_properties(weights_loading_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    add_executable(shape_graph_cache_test tests/core/shape_graph_cache_test.cu)
+    target_include_directories(shape_graph_cache_test PRIVATE include)
+    target_link_libraries(shape_graph_cache_test PRIVATE ${_strata_gpu_runtime_target})
+    add_test(NAME shape_graph_cache_test COMMAND shape_graph_cache_test)
+    set_tests_properties(shape_graph_cache_test PROPERTIES TIMEOUT 30)
+    # the memory manager's RAM tier (docs/MEMORY_MANAGER_PLAN.md M5): on host memory, through the runtime's copies;
+    # the conversations' block tables on a GPU
+    foreach(_t common/state/pool_copy common/state/pause_file common/experts/ram_experts common/experts/expert_files
+               common/state/conversation_block_tables)
       get_filename_component(_n ${_t} NAME)
       add_executable(${_n}_test src/${_t}_test.cpp)
       target_link_libraries(${_n}_test PRIVATE strata_engine)
@@ -367,7 +381,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME expert_profile_save_test COMMAND expert_profile_save_test)
     set_tests_properties(expert_profile_save_test PROPERTIES TIMEOUT 60)
   endif()
-  # the profile header's version is enforced: a version other than 1 is refused by its number (CPU only)
+  # the profile header's version is enforced (version 1 rankings, version 2 counts, headerless old counts; CPU only)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/expert_profile_version_test.cpp")
     enable_testing()
     add_executable(expert_profile_version_test tests/core/expert_profile_version_test.cpp)
@@ -498,6 +512,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(strata_paged PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata_paged PUBLIC strata_engine strata_serve strata_spec strata_state strata_split
                         ${_strata_gpu_runtime_target})
+  if(STRATA_BUILD_TESTS)
+    add_executable(paged_start_test src/common/serve/paged_start_test.cpp)
+    target_include_directories(paged_start_test PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(paged_start_test PRIVATE strata_paged)
+    add_test(NAME paged_start_test COMMAND paged_start_test)
+  endif()
 
   # Qwen3.8's model loader (strata::qwen38::Model), which the `strata` program below calls
   add_library(strata_qwen38 STATIC src/models/qwen38/model.cpp src/models/qwen38/conversation.cpp
@@ -607,7 +627,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # on gfx11 (measured 4.97 -> 20-40 TFLOPS on this part: the chunked prompt's dense GEMM is 11.1 s of a 4K prompt at the
     # library's rate)
     target_link_libraries(strata_dsv41 PUBLIC strata_prefill strata_dsv41_kernels strata_dsv41_state strata_serve
-                          ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
+                          strata_split ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
     find_package(Threads REQUIRED)
     target_link_libraries(strata_dsv41 PUBLIC Threads::Threads)
     if(WIN32 AND STRATA_ENABLE_HIP)   # cudaMemGetInfo is the DXGI-budgeted hip_compat::mem_get_info (src/base/gpu/device.cu): on a Strix Halo the
@@ -633,14 +653,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_source_files_properties(${_ds4}/ds4_main.cpp PROPERTIES COMPILE_DEFINITIONS "DS4_BUILD_ID=\"${STRATA_BUILD_ID}\"")
     target_link_libraries(strata-dsv41 PRIVATE strata_dsv41)
     # strata-ds41 (docs/MEMORY_MANAGER_PLAN.md D4): DeepSeek on the paged engine, its conversation in page-pool pages
-    add_executable(strata-ds41 src/program/ds41_main.cpp ${_ds4}/paged_model.cpp ${_ds4}/expert_files.cpp)
+    add_executable(strata-ds41 src/program/ds41_main.cpp ${_ds4}/paged_model.cpp)
     strata_utf8_manifest(strata-ds41)
     target_link_libraries(strata-ds41 PRIVATE strata_dsv41 strata_paged)
-    if(STRATA_BUILD_TESTS)   # D5: the experts read from the files without the file cache, against the files' bytes
-      add_executable(ds4_expert_files_test ${_ds4}/expert_files_test.cpp ${_ds4}/expert_files.cpp)
-      target_link_libraries(ds4_expert_files_test PRIVATE strata_engine strata_dsv41_state)
-      add_test(NAME ds4_expert_files_test COMMAND ds4_expert_files_test)
-    endif()
     if(STRATA_NATIVE_EXPERTS)
       # the CPU lane's ggml-type rows: ggml-cpu's dots against Strata's AVX2 i-quant rows (bits and GB/s); no GPU, no model
       add_executable(ds4_gg_bench tests/dsv41/gg_dot_bench.cpp ${_ds4}/ds4_gg_cpu.cpp)
@@ -1455,6 +1470,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(platform_memory_test src/base/platform/memory_test.cpp)
   target_link_libraries(platform_memory_test PRIVATE strata_core ${_strata_gpu_runtime_target})
   add_test(NAME platform_memory_test COMMAND platform_memory_test)
+  add_executable(platform_env_test src/base/platform/env_test.cpp)
+  target_include_directories(platform_env_test PRIVATE include)
+  add_test(NAME platform_env_test COMMAND platform_env_test)
+
+  # read_pieces: merged unbuffered reads return the bytes a plain read gives (CPU only).
+  add_executable(platform_piece_reads_test src/base/platform/piece_reads_test.cpp)
+  target_link_libraries(platform_piece_reads_test PRIVATE strata_engine)
+  add_test(NAME platform_piece_reads_test COMMAND platform_piece_reads_test)
 
   # The pinned-memory headroom (pin_budget.hpp) against a simulated ceiling; skips without a GPU.
   add_executable(pin_budget_test src/base/gpu/pin_budget_test.cpp)
@@ -1528,16 +1551,6 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME cuda_device_selftest COMMAND strata-device --selftest)
   else()
     add_test(NAME hip_device_selftest COMMAND strata-device --selftest)
-  endif()
-
-  # ---- P2.S5: the GraphRegistry --------------------------------------------------
-  # A .cu because the test needs real kernels to capture; it links `strata_core` and not `strata_kernels`,
-  # because what it exercises is the capture machinery and not any kernel in it.
-  if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench/micro/graph_registry_test.cu")
-    add_executable(graph_registry_test bench/micro/graph_registry_test.cu)
-    target_include_directories(graph_registry_test PRIVATE ${_strata_gpu_include_directories})
-    target_link_libraries(graph_registry_test PRIVATE strata_core ${_strata_gpu_runtime_target})
-    add_test(NAME graph_registry_test COMMAND graph_registry_test)
   endif()
 
   # ---- P2.S5's GATE: is a device<->pinned-memory handoff graph-capturable? --------------------

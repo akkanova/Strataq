@@ -9,21 +9,21 @@
 #include <cstdint>
 #include <algorithm>
 #include <cstdlib>
-#include <cstring>
+
+#include "strata/core/defaults_026.hpp"
 
 namespace strata::ds4 {
 
-// DS4_DEFAULTS=026: the master switch.  Every default the DeepSeek engine changed since v0.2.6 goes back to what v0.2.6 did, so "off" in the app's
+// STRATA_DEFAULTS=026 (defaults_026.hpp) or DS4_DEFAULTS=026: the master switch.  Every default the DeepSeek engine changed since v0.2.6 goes back to what v0.2.6 did, so "off" in the app's
 // "DeepSeek speed-ups" really is version 0.2.6.  Each rule below takes `v026` (the engine passes defaults_026()); an explicit per-feature variable or
 // flag (DS4_ATTN_SLAB=N, DS4_COPY_PIN=1, DS4_FAST_ATTN=1, --experts N, --prefill-chunk N, ...) still wins over it.  The list, from
 // `git diff v0.2.6..f-027-int2 -- src/dsv41`: the staging ring, the prompt chunk rule, the attention slab (base and growth), the pinned copy,
 // the huge-page arena, the matrix-core attention, the drafter's cumulative cut, the 5-experts default, the store's spare slots and put, the
 // store settle after a prompt, the dense dequantizer, the F16 gate/up operand, the markov head in Q8, the head's column count, the RDNA3 WMMA GEMM.
-inline bool is_026_token(const char* v) {
-    return v != nullptr && (std::strcmp(v, "026") == 0 || std::strcmp(v, "0.2.6") == 0 || std::strcmp(v, "v0.2.6") == 0);
-}
+/// Tells whether DeepSeek's v0.2.6 defaults are asked for (read once). DS4_DEFAULTS is the name the app's switch saved and
+/// the 0.2.7 release notes gave up to 0.2.13, so settings saved then keep working.
 inline bool defaults_026() {
-    static const bool on = is_026_token(std::getenv("DS4_DEFAULTS"));
+    static const bool on = strata::defaults_026() || is_026_token(std::getenv("DS4_DEFAULTS"));
     return on;
 }
 
@@ -50,11 +50,9 @@ inline int experts_per_word(int requested, uint64_t vram_bytes, int model_k, boo
     return n < 1 ? 1 : n;
 }
 
-// The expert profile (`expert-profile.bin`, --expert-profile) is a bare array of u32 counts: one row of n_exp per layer, the drafter's blocks after the 40 layers, no header.
-// Its size is the only thing that says which model it was counted on, and the engine used to read the first rows of any file that was long enough: a profile counted on
-// 384 experts a layer (43 rows of 384 = 66,048 bytes) read as rows of 192 gives every layer the wrong experts, silently (the ISTA-DAS Coder has 192).  A file
-// holds the layers and at most kProfileExtraRows more (the drafter's 3 blocks, with room); anything longer is another model's.  Every profile written by the engine
-// or shipped with Strata (40 + 3 rows, or 40) passes, so a set with 384 experts reads exactly the files it read before.
+// DeepSeek's STRP counts have one row per layer, followed by the drafter's blocks. Headerless files identify
+// their geometry only by size: 43 rows of 384 experts must not load as 86 rows of 192 experts.
+// Allows the drafter's three blocks with room for other compatible layouts.
 constexpr int kProfileExtraRows = 8;
 inline bool profile_size_fits(uint64_t bytes, int layers, int n_exp) {
     if (layers <= 0 || n_exp <= 0) return false;

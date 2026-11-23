@@ -45,6 +45,32 @@ class Apply(unittest.TestCase):
         with self.assertRaises(ValueError):
             runconfig.check_live({"prompt_turn_ms": -1}, True)
 
+    def test_batch_groups_are_live_and_saved_with_0_for_auto(self):
+        values = runconfig.check_live({"batch_groups": 0}, True)
+        new, changed = runconfig.apply_live({"args": ["--batch-groups", "auto"]}, values)
+        self.assertEqual((new["args"], changed), (["--batch-groups", "0"], ["batch_groups"]))
+        with self.assertRaises(ValueError):
+            runconfig.check_live({"batch_groups": -1}, True)
+
+    def test_expert_and_draft_tunings_are_live_and_saved_as_their_flags(self):
+        values = runconfig.check_live({"route_tail_skip": 0, "draft_confidence_pct": 40, "draft_cumulative_pct": 15,
+                                       "expert_half_life": 50, "copy_back": "off", "route_prior_pct": 348}, True)
+        new, changed = runconfig.apply_live({"args": ["--copy-back", "auto"]}, values)
+        self.assertEqual(new["args"], ["--copy-back", "off", "--route-tail-skip", "0", "--draft-confidence-pct", "40",
+                                       "--draft-cumulative-pct", "15", "--expert-half-life", "50",
+                                       "--route-prior-pct", "348"])
+        self.assertEqual(len(changed), 6)
+        for bad in ({"route_tail_skip": 10}, {"draft_confidence_pct": 101}, {"copy_back": True},
+                    {"copy_back": "sometimes"}, {"expert_half_life": -1}, {"expert_half_life": 2147483648},
+                    {"route_prior_pct": 10001}):
+            with self.assertRaises(ValueError):
+                runconfig.check_live(bad, True)
+
+    def test_step_profile_is_a_switch_saved_as_on_or_off(self):
+        new, changed = runconfig.apply_live({"args": ["--step-profile", "1"]},
+                                            runconfig.check_live({"step_profile": False}, True))
+        self.assertEqual((new["args"], changed), (["--step-profile", "off"], ["step_profile"]))
+
     def test_saving_conversations_on_shutdown_is_a_switch_saved_as_on_or_off(self):
         values = runconfig.check_live({"save_on_shutdown": True}, True)
         new, changed = runconfig.apply_live({"args": []}, values)
@@ -52,6 +78,42 @@ class Apply(unittest.TestCase):
         self.assertEqual(changed, ["save_on_shutdown"])
         with self.assertRaises(ValueError):
             runconfig.check_live({"save_on_shutdown": 1}, True)
+
+    def test_the_reserve_is_live_and_saved_as_the_flag_both_new_engines_take(self):
+        values = runconfig.check_live({"vram_reserve_mib": 1024}, True)
+        new, changed = runconfig.apply_live({"args": ["--vram-reserve-mib", "700"]}, values)
+        self.assertEqual((new["args"], changed), (["--vram-reserve-mib", "1024"], ["vram_reserve_mib"]))
+        self.assertEqual(runconfig.read_live_defaults(None)["vram_reserve_mib"], None)
+        with self.assertRaises(ValueError):
+            runconfig.check_live({"vram_reserve_mib": -1}, True)
+        with self.assertRaises(ValueError):                              # the Settings view leaves it to the panel
+            runconfig.apply(CFG, {"vram_reserve_mib": 2048})
+
+    def test_saving_the_reserve_replaces_its_deepseek_alias(self):
+        cfg = {"args": ["--vram-reserve-mib", "700", "--reserve-mib", "600"],
+               "user_args": ["--reserve-mib", "600"]}
+        self.assertEqual(runconfig._arg(cfg, "--vram-reserve-mib"), 600)
+        new, changed = runconfig.apply_live(cfg, {"vram_reserve_mib": 1024})
+        self.assertEqual(changed, ["vram_reserve_mib"])
+        self.assertEqual(new["args"], ["--vram-reserve-mib", "1024"])
+        self.assertEqual(new["user_args"], ["--vram-reserve-mib", "1024"])
+        self.assertEqual(runconfig._arg(new, "--vram-reserve-mib"), 1024)
+
+    def test_shared_memory_holds_for_one_change_and_is_never_saved(self):
+        values = runconfig.check_live({"memory_mib.gpu0": 30720, "shared_memory": True}, True, ["memory_mib.gpu0"])
+        self.assertEqual(values, {"memory_mib.gpu0": 30720, "shared_memory": "on"})
+        new, changed = runconfig.apply_live({"args": []}, values, {"memory_mib.gpu0": 30208})
+        self.assertEqual((new["args"], changed), (["--gpu-mib", "30720"], ["memory_mib.gpu0"]))
+    def test_draft_rule_is_saved_as_its_text_and_refuses_other_words(self):
+        values = runconfig.check_live({"draft_rule": "top-90"}, True)
+        new, changed = runconfig.apply_live({"args": ["--draft-rule", "exact"]}, values)
+        self.assertEqual(new["args"], ["--draft-rule", "top-90"])
+        self.assertEqual(changed, ["draft_rule"])
+        for name in ("exact", "speculative", "typical", "lower-temperature", "top-1", "top-99"):
+            self.assertEqual(runconfig.check_live({"draft_rule": name}, False), {"draft_rule": name})
+        for bad in ("top-0", "top-100", "top-05", "Exact", "", 90, True):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                runconfig.check_live({"draft_rule": bad}, False)
 
     def test_live_residency_default_survives_a_restart_without_changing_concurrency(self):
         values = runconfig.check_live({"vram_conversations": 3}, True)
@@ -73,22 +135,21 @@ class Apply(unittest.TestCase):
 
     def test_only_the_named_keys_change(self):
         new, changed = runconfig.apply(CFG, {"sampling.top_p": 0.95, "reasoning_budget_tokens": 4096,
-                                             "vram_reserve_mib": 2048, "aliases": "qwen, local", "lazy_load": True})
-        self.assertEqual(changed, ["sampling.top_p", "reasoning_budget_tokens", "vram_reserve_mib", "aliases",
-                                   "lazy_load"])
+                                             "aliases": "qwen, local", "lazy_load": True})
+        self.assertEqual(changed, ["sampling.top_p", "reasoning_budget_tokens", "aliases", "lazy_load"])
         self.assertEqual(new["sampling"], {"temperature": 0.7, "presence_penalty": 1.5, "top_p": 0.95})
-        self.assertEqual(new["args"][-2:], ["--vram-reserve-mib", "2048"])
+        self.assertEqual(new["args"], CFG["args"])
         self.assertEqual(new["aliases"], ["qwen", "local"])
         for k in ("exe", "model_name", "port", "host", "api_key", "mcp_servers", "cors_origins"):
             self.assertEqual(new[k], CFG[k], k)
         self.assertEqual(CFG["sampling"], {"temperature": 0.7, "presence_penalty": 1.5})   # the input is left alone
 
     def test_null_is_the_default_again(self):
-        cfg, _ = runconfig.apply(CFG, {"vram_reserve_mib": 2048, "fit_max_tokens": True})
-        new, changed = runconfig.apply(cfg, {"vram_reserve_mib": None, "fit_max_tokens": None,
+        cfg, _ = runconfig.apply(CFG, {"reasoning_budget_tokens": 2048, "fit_max_tokens": True})
+        new, changed = runconfig.apply(cfg, {"reasoning_budget_tokens": None, "fit_max_tokens": None,
                                              "sampling.temperature": None, "idle_unload_s": None})
-        self.assertEqual(changed, ["vram_reserve_mib", "fit_max_tokens", "sampling.temperature"])
-        self.assertEqual(new["args"], CFG["args"])
+        self.assertEqual(changed, ["reasoning_budget_tokens", "fit_max_tokens", "sampling.temperature"])
+        self.assertNotIn("reasoning_budget_tokens", new)
         self.assertNotIn("fit_max_tokens", new)
         self.assertEqual(new["sampling"], {"presence_penalty": 1.5})
         new, _ = runconfig.apply({"sampling": {"top_k": 20}}, {"sampling.top_k": None})
@@ -99,7 +160,7 @@ class Apply(unittest.TestCase):
                         {"args": []}, {"exe": "evil.exe"}, {"trusted_origins": ["*"]}, {"allowed_hosts": ["*"]},
                         {"sampling.temperature": -1}, {"sampling.top_p": 0}, {"sampling.top_k": 65},
                         {"sampling.min_p": 2}, {"reasoning_budget_tokens": 1.5}, {"fit_max_tokens": "yes"},
-                        {"effort_position": "middle"}, {"vram_reserve_mib": -5}, {"idle_unload_s": True},
+                        {"effort_position": "middle"}, {"reasoning_budget_tokens": -5}, {"idle_unload_s": True},
                         {"aliases": [1]}, {}, None, ["x"]):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 runconfig.apply(CFG, changes)
@@ -113,7 +174,7 @@ class Apply(unittest.TestCase):
         self.assertEqual(v["file"], "strata-q2_0.json")
         got = {k["key"]: k for k in v["keys"]}
         self.assertEqual(got["sampling.temperature"]["value"], 0.7)
-        self.assertEqual(got["vram_reserve_mib"]["value"], 1500)
+        self.assertNotIn("vram_reserve_mib", got)                        # the Memory panel's (LIVE_FLAGS)
         self.assertIsNone(got["fit_max_tokens"]["value"])
         self.assertEqual(got["anthropic_thinking"]["choices"], ["model", "on_request"])
         self.assertNotIn("api_key", got)

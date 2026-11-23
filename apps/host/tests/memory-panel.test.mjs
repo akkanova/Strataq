@@ -191,18 +191,55 @@ test('Undo sends a live size change back for the session', async () => {
     [{'memory_mib.gpu0': Math.round(pool / MIB)}, 'session']]);
 });
 
-test('a size outside what the engine accepts shows red with the reason, and releasing there changes nothing', () => {
+test('a size outside what the engine accepts shows red with the reason, and releasing there still asks the engine',
+  async () => {
   const { calls, onChange } = recorder(), { element, fire } = mount(live, onChange);
   fire('pointerdown', { target: onDivider('gpu0'), clientX: 500 });
   fire('pointermove', { clientX: 250 });                 // about 16.9 GiB less: below the 4 GiB the engine needs
-  assert.match(element.innerHTML, /class="mem-divider mem-refused"/);
+  assert.match(element.innerHTML, /class="mem-divider mem-warned"/);
   assert.match(element.innerHTML,
-    /<p class="mem-preview mem-refused">19[.,]83 GiB → [^:]*: at least 7[.,]75 GiB is needed here now/);
-  assert.match(element.innerHTML, /releasing here changes nothing/);
+    /<p class="mem-preview mem-warned">19[.,]83 GiB → [^:]*: at least 7[.,]75 GiB is needed here now/);
   fire('pointerup', {});
-  assert.equal(calls.length, 0);
-  assert.match(element.querySelector('.mem-notice.mem-error').textContent, /Nothing changed: at least 7[.,]75 GiB/);
+  await settle();
+  assert.equal(calls.length, 1);
 });
+
+for (const choice of ['accept', 'decline', 'retry fails']) {
+  test(`a GPU pool asks before taking shared memory: ${choice}`, async () => {
+    const view = {available: true, can_change: true, settings: {}, memories: [{id: 'gpu0', total: 64 * GIB,
+      free: 33 * GIB, setting: 24 * GIB, pool_offset: 7 * GIB, largest: 28 * GIB, pool_shared: GIB,
+      uses: {weights: 7 * GIB, experts: 24 * GIB}}]};
+    const full = {...view, memories: [{...view.memories[0], setting: 29 * GIB, dedicated_full: true,
+      uses: {weights: 7 * GIB, experts: 29 * GIB}}]};
+    const calls = [], asked = [];
+    const {element, fire} = mount(view, async (set, save) => {
+      calls.push([set, save]);
+      return calls.length === 2 && choice === 'retry fails' ? {ok: false, error: 'allocation failed'} :
+        {ok: true, view: full};
+    });
+    assert.match(element.querySelector('[data-divider="gpu0"]').title, /pool has 1[.,]00 GiB in shared memory/);
+    fire('pointerdown', {target: onDivider('gpu0'), clientX: 1000 * 31 / 64});
+    fire('pointermove', {clientX: 1000 * 37 / 64});
+    assert.match(element.querySelector('.mem-preview').textContent, /about 35[.,]00 GiB fits in dedicated memory/);
+    globalThis.confirm = text => { asked.push(text); return choice !== 'decline'; };
+    try {
+      fire('pointerup', {});
+      await settle();
+    } finally {
+      delete globalThis.confirm;
+    }
+    assert.equal(asked.length, 1);
+    assert.equal(asked[0], '35.0 of 37.0 GiB is available as dedicated memory. If you wish, you can ' +
+      'allocate the remainder as shared memory, which may be slower');
+    const expected = [[{'memory_mib.gpu0': 30 * 1024}, 'session']];
+    if (choice !== 'decline')
+      expected.push([{'memory_mib.gpu0': 30 * 1024, shared_memory: true}, 'session']);
+    assert.deepEqual(calls, expected);
+    assert.match(element.querySelector('[data-divider="gpu0"]').getAttribute('aria-valuetext'), /36[.,]00 GiB total/);
+    if (choice === 'retry fails')
+      assert.match(element.querySelector('.mem-notice.mem-error').textContent, /allocation failed/);
+  });
+}
 
 test('Escape cancels a drag, and dropping a divider where it started changes nothing', () => {
   const { calls, onChange } = recorder(), { element, fire } = mount(live, onChange);
@@ -500,7 +537,8 @@ test('the per-conversation widget respects the capacity loaded into the engine',
   const {calls, onChange} = recorder(), {element, fire} = mount(view, onChange);
   const help = "To raise this limit, increase --max-context in the model's engine arguments, then reload the model.";
   const capacity = (204800).toLocaleString();
-  assert.equal(element.querySelector('[data-setting="context"]').title, `Loaded capacity: ${capacity} tokens. ${help}`);
+  assert.equal(element.querySelector('[data-setting="context"]').title,
+    `--conversation-tokens: Loaded capacity: ${capacity} tokens. ${help}`);
   fire('change', {target: control('[data-setting]', {dataset: {setting: 'context'}, value: '300000'})});
   apply(fire);
   assert.equal(element.querySelector('.mem-notice.mem-error').textContent,
@@ -555,6 +593,135 @@ test('idle eviction age is configurable without implying that age alone evicts a
 });
 
 
+test('the reserved free VRAM is a number box the engine changes live', async () => {
+  assert.doesNotMatch(mount(live, recorder().onChange).element.innerHTML, /data-setting="vram_reserve_mib"/);
+  const view = {...live, settings: {...live.settings, vram_reserve_mib: 512}};
+  const {calls, onChange} = recorder(), {element, fire} = mount(view, onChange);
+  assert.match(element.innerHTML,
+    /Reserve free VRAM \(MiB\)[^]*data-setting="vram_reserve_mib" value="512" min="0"/);
+  assert.match(element.querySelector('[data-setting="vram_reserve_mib"]').title,
+    /when a pool next grows, and at the next start when it is saved as the default/);
+  const target = value => control('[data-setting]', {dataset: {setting: 'vram_reserve_mib'}, value});
+  fire('change', {target: target('-1')});
+  apply(fire);
+  assert.deepEqual(calls, []);
+  fire('change', {target: target('1024')});
+  apply(fire);
+  await settle();
+  assert.deepEqual(calls, [[{vram_reserve_mib: 1024}, 'session']]);
+});
+
+test('the minimum experts, draft cuts and expert half-life are number boxes the engine changes live', async () => {
+  const view = {...live, settings: {...live.settings, route_tail_skip: 7, draft_confidence_pct: 50,
+    draft_cumulative_pct: 0, expert_half_life: 8}};
+  const {calls, onChange} = recorder(), {element, fire} = mount(view, onChange);
+  assert.match(element.innerHTML, /data-setting="route_tail_skip" value="7" min="0" max="9"/);
+  assert.match(element.innerHTML, /data-setting="draft_confidence_pct" value="50" min="0" max="100"/);
+  assert.match(element.innerHTML, /data-setting="expert_half_life" value="8" min="0"/);
+  const target = value => control('[data-setting]', {dataset: {setting: 'route_tail_skip'}, value});
+  fire('change', {target: target('10')});
+  apply(fire);
+  assert.deepEqual(calls, []);
+  fire('change', {target: target('')});
+  apply(fire);
+  await settle();
+  assert.deepEqual(calls, [[{route_tail_skip: 0}, 'session']]);
+  const off = mount({...view, settings: {...view.settings, route_tail_skip: 0}}, onChange).element;
+  assert.match(off.innerHTML, /data-setting="route_tail_skip" value="" min="0"/);
+  assert.match(off.querySelector('[data-setting="route_tail_skip"]').title, /^--route-tail-skip: /);
+});
+
+test('preferring experts on the GPU warns before it is switched on, and not when it is switched off', async () => {
+  const run = async (now, value, answer) => {
+    const asked = [], {calls, onChange} = recorder();
+    const {element, fire} = mount({...live, settings: {...live.settings, route_prior_pct: now}}, onChange);
+    assert.match(element.innerHTML, /data-setting="route_prior_pct" value="\d+" min="0" max="10000"/);
+    assert.match(element.querySelector('[data-setting="route_prior_pct"]').title, /answers can get worse/);
+    assert.ok(element.querySelector('[data-setting="route_prior_pct"]').title
+      .endsWith(`corresponds to STRATA_ROUTE_PRIOR=${now === 348 ? '1.50' : '0.00'}.`));
+    fire('change', {target: control('[data-setting]', {dataset: {setting: 'route_prior_pct'}, value})});
+    globalThis.confirm = text => { asked.push(text); return answer; };
+    try {
+      apply(fire);
+      await settle();
+    } finally {
+      delete globalThis.confirm;
+    }
+    return [asked.length, calls];
+  };
+  assert.deepEqual(await run(0, '348', false), [1, []]);
+  assert.deepEqual(await run(0, '348', true), [1, [[{route_prior_pct: 348}, 'session']]]);
+  assert.deepEqual(await run(348, '0', false), [0, [[{route_prior_pct: 0}, 'session']]]);
+});
+
+test('saving an enabled route prior as default warns even when it is already enabled for this session', async () => {
+  const asked = [], {calls, onChange} = recorder();
+  const {fire} = mount({...live, settings: {...live.settings, route_prior_pct: 348}}, onChange);
+  globalThis.confirm = text => { asked.push(text); return false; };
+  try {
+    apply(fire, 'default');
+    await settle();
+  } finally {
+    delete globalThis.confirm;
+  }
+  assert.equal(asked.length, 1);
+  assert.match(asked[0], /Save it as the default/);
+  assert.deepEqual(calls, []);
+});
+
+test('copying evicted experts back is a list the engine reports by index and takes as a word', async () => {
+  const view = {...live, settings: {...live.settings, copy_back: 2}};
+  const {calls, onChange} = recorder(), {element, fire} = mount(view, onChange);
+  assert.match(element.innerHTML, /data-setting="copy_back"[^]*<option value="2" selected>Copied back to RAM if/);
+  assert.doesNotMatch(element.querySelector('.mem-note')?.textContent ?? '', /Experts the GPU evicts/);
+  fire('change', {target: control('[data-setting]', {dataset: {setting: 'copy_back'}, value: '0'})});
+  apply(fire);
+  await settle();
+  assert.deepEqual(calls, [[{copy_back: 'off'}, 'session']]);
+  assert.match(mount({...view, can_change: false}).element.innerHTML, /Experts the GPU evicts: auto/);
+});
+
+test('expert half-life respects the engine integer limit before submitting the form', async () => {
+  const view = {...live, settings: {...live.settings, expert_half_life: 8}};
+  const {calls, onChange} = recorder(), {fire} = mount(view, onChange);
+  const target = value => control('[data-setting]', {dataset: {setting: 'expert_half_life'}, value});
+  fire('change', {target: target('2147483648')});
+  apply(fire);
+  assert.deepEqual(calls, []);
+  fire('change', {target: target('0')});
+  apply(fire);
+  await settle();
+  assert.deepEqual(calls, [[{expert_half_life: 0}, 'session']]);
+});
+
+test('free memory shows the reserve at its start and unusable dedicated memory at its end', () => {
+  const card = {id: 'gpu0', total: 16 * GIB, free: 3 * GIB, uses: {weights: 4 * GIB, experts: 9 * GIB},
+    kept_free: 512 * MIB, dedicated_room: 2 * GIB};
+  const [row] = rows(draw({available: true, memories: [card], settings: {}}));
+  const uses = [...row.matchAll(/class="mem-seg" data-use="([^"]*)"/g)].map(m => m[1]);
+  assert.deepEqual(uses.slice(-3), ['kept_free', 'free', 'beyond_dedicated']);
+  assert.deepEqual(widths(row).slice(-3), [100 / 32, 100 * 1.5 / 16, 100 / 16]);
+  assert.match(row, /title="Kept free for other programs: 512 MiB\. Memory Strata leaves free/);
+  assert.match(row, /title="Not usable as dedicated memory: 1.00 GiB\. Free in the graphics chip's own memory/);
+  // Room is capped by free memory, and the reserve by usable room.
+  const [short] = rows(draw({available: true, memories: [{...card, free: 256 * MIB}], settings: {}}));
+  assert.deepEqual([...short.matchAll(/class="mem-seg" data-use="([^"]*)"/g)].map(m => m[1]).slice(-2),
+    ['kept_free', 'free']);
+  assert.match(short, /Kept free for other programs 256 MiB[^]*Free 0 MiB/);
+  const [limited] = rows(draw({available: true, memories: [{...card, dedicated_room: 256 * MIB}], settings: {}}));
+  assert.deepEqual(widths(limited).slice(-3), [100 / 64, 0, 100 * 2.75 / 16]);
+  const [full] = rows(draw({available: true, memories: [{...card, dedicated_room: 0}], settings: {}}));
+  assert.doesNotMatch(full, /data-use="kept_free"/);
+  assert.deepEqual(widths(full).slice(-2), [0, 100 * 3 / 16]);
+  const [unknown] = rows(draw({available: true, memories: [{...card, dedicated_room: null}], settings: {}}));
+  assert.doesNotMatch(unknown, /data-use="beyond_dedicated"/);
+  assert.deepEqual(widths(unknown).slice(-2), [100 / 32, 100 * 2.5 / 16]);
+  const [scaled] = rows(draw({available: true, settings: {}, memories: [{...card,
+    uses: {weights: 8 * GIB, experts: 16 * GIB}, in_share: 12 * GIB, other_apps: GIB}]}));
+  assert.equal(widths(scaled).reduce((a, b) => a + b, 0), 100);
+  assert.deepEqual(widths(scaled).slice(-4), [100 / 32, 100 * 1.5 / 16, 100 / 16, 100 / 16]);
+});
+
 test('decoding while a prompt is read has a share and a turn length to change', async () => {
   const view = {...live, settings: {...live.settings, decode_share_percent: 50, prompt_turn_ms: 0}};
   const {calls, onChange} = recorder(), {element, fire} = mount(view, onChange);
@@ -564,6 +731,31 @@ test('decoding while a prompt is read has a share and a turn length to change', 
   apply(fire);
   await settle();
   assert.deepEqual(calls, [[{decode_share_percent: 0}, 'session']]);
+});
+
+test('batch groups are a control only on a layer split, with the groups running now', async () => {
+  assert.doesNotMatch(mount(live, recorder().onChange).element.innerHTML, /data-setting="batch_groups"/);
+  const view = {...live, settings: {...live.settings, batch_groups: 1, batch_groups_now: 1, pipeline_stages: 2}};
+  const {calls, onChange} = recorder(), {element, fire} = mount(view, onChange);
+  assert.match(element.innerHTML, /data-setting="batch_groups" value="1" min="0"/);
+  assert.match(element.innerHTML, /Groups now: 1\./);
+  assert.doesNotMatch(element.innerHTML, /batch_groups_now|pipeline_stages/);
+  fire('change', {target: control('[data-setting]', {dataset: {setting: 'batch_groups'}, value: '0'})});
+  apply(fire);
+  await settle();
+  assert.deepEqual(calls, [[{batch_groups: 0}, 'session']]);
+  const drafting = mount({...view, settings: {...view.settings, drafter: 0, pipeline_stages: 0}}, onChange).element;
+  assert.match(drafting.innerHTML, /runs one group when a drafter is loaded, even if it is switched off/);
+});
+
+test('a startup group count above the slot limit does not block other live changes', async () => {
+  const view = {...live, settings: {...live.settings, batch_groups: 2147483647, batch_groups_now: 1,
+    pipeline_stages: 2}};
+  const {calls, onChange} = recorder(), {fire} = mount(view, onChange);
+  fire('change', {target: control('[data-setting]', {dataset: {setting: 'prompt_turn_ms'}, value: '0'})});
+  apply(fire);
+  await settle();
+  assert.deepEqual(calls, [[{prompt_turn_ms: 0}, 'session']]);
 });
 
 test('saving conversations on shutdown is a checkbox sent as a switch', async () => {
@@ -576,6 +768,17 @@ test('saving conversations on shutdown is a checkbox sent as a switch', async ()
   apply(fire);
   await settle();
   assert.deepEqual(calls, [[{save_on_shutdown: true}, 'session']]);
+});
+
+test('the step timing log is a checkbox sent as a switch', async () => {
+  const view = {...live, settings: {...live.settings, step_profile: 1}};
+  const {calls, onChange} = recorder(), {element, fire} = mount(view, onChange);
+  assert.match(element.innerHTML, /type="checkbox" data-setting="step_profile" checked> Log each step's timing/);
+  fire('change', {target: control('[data-setting]', {dataset: {setting: 'step_profile'}, type: 'checkbox',
+    checked: false})});
+  apply(fire);
+  await settle();
+  assert.deepEqual(calls, [[{step_profile: false}, 'session']]);
 });
 
 test('pending edits survive polling and a live memory resize', async () => {
@@ -614,7 +817,104 @@ test('suffix mode uses engine labels and is submitted as one mutually exclusive 
   assert.deepEqual(calls, []);
   apply(fire);
   await settle();
-  assert.deepEqual(calls, [[{drafter: false, suffix_draft: 3, lookup_chain: 0}, 'session']]);
+  assert.deepEqual(calls, [[{drafter: false, suffix_draft: 3}, 'session']]);
+});
+
+test('the Drafter list combines MTP, the suffix drafter and lookup, sending only what a choice changes', async () => {
+  const choose = async (settings, value) => {
+    const {calls, onChange} = recorder(), {element, fire} = mount({...live, settings: {...live.settings,
+      has_drafter: 1, ...settings}, details: {drafter_label: 'MTP'}}, onChange);
+    const selected = /<option value="(\w+)" selected/.exec(element.innerHTML)[1];
+    fire('change', {target: control('[data-setting]', {dataset: {setting: 'drafter'}, value})});
+    apply(fire);
+    await settle();
+    return [selected, calls[0]?.[0]];
+  };
+  const {element} = mount({...live, settings: {...live.settings, suffix_draft: 0, lookup_chain: 0},
+    details: {drafter_label: 'MTP'}}, () => {});
+  assert.deepEqual([...element.innerHTML.matchAll(/<option value="\w+"[^>]*>([^<]*)/g)].map(m => m[1]),
+    ['No MTP', 'MTP', 'Use suffix drafter (0 GiB)', 'MTP, or suffix drafter', 'MTP + lookup',
+      'MTP + lookup, or suffix drafter']);
+  assert.deepEqual(await choose({drafter: 1, suffix_draft: 0, lookup_chain: 0}, 'either'),
+    ['on', {suffix_draft: 3}]);
+  assert.deepEqual(await choose({drafter: 1, suffix_draft: 0, lookup_chain: 0}, 'all'),
+    ['on', {suffix_draft: 3, lookup_chain: 1}]);
+  assert.deepEqual(await choose({drafter: 1, suffix_draft: 4, lookup_chain: 2}, 'on'),
+    ['all', {suffix_draft: 0, lookup_chain: 0}]);
+  assert.deepEqual(await choose({drafter: 1, suffix_draft: 0, lookup_chain: 2}, 'either'),
+    ['chain', {suffix_draft: 3, lookup_chain: 0}]);
+  assert.deepEqual(await choose({drafter: 0, suffix_draft: 0, lookup_chain: 2}, 'suffix'),
+    ['off', {suffix_draft: 3}]);
+  assert.deepEqual(await choose({drafter: 0, suffix_draft: 4, lookup_chain: 2}, 'all'),
+    ['suffix', {drafter: true}]);
+  assert.deepEqual(await choose({drafter: 1, suffix_draft: 4, lookup_chain: 2}, 'all'),
+    ['all', undefined]);
+});
+
+test('revising a staged Drafter choice discards its chain edit and keeps the running chain value', async () => {
+  for (const lookup_chain of [0, 2]) {
+    for (const choice of ['off', 'suffix']) {
+      const {calls, onChange} = recorder(), {fire} = mount({...live,
+        settings: {...live.settings, drafter: 1, suffix_draft: 0, lookup_chain}}, onChange);
+      for (const value of [lookup_chain ? 'on' : 'chain', choice])
+        fire('change', {target: control('[data-setting]', {dataset: {setting: 'drafter'}, value})});
+      apply(fire);
+      await settle();
+      assert.deepEqual(calls, [[{drafter: false, ...(choice === 'suffix' ? {suffix_draft: 3} : {})}, 'session']]);
+    }
+  }
+});
+
+test('the draft acceptance rule is a choice beside the drafter, sent and saved as its text', async () => {
+  const view = {...live, details: {draft_rule: 'exact'}};
+  const {calls, onChange} = recorder(), {element, fire} = mount(view, onChange);
+  /** Gets the rule the drawn choice has selected, and its label. */
+  const selected = root => {
+    const option = root.querySelector('[data-setting="draft_rule"] option[selected]');
+    return [option?.getAttribute('value'), option?.textContent];
+  };
+  assert.deepEqual(selected(element), ['exact', 'Exact']);
+  for (const label of ['Speculative sampling', 'Typical acceptance (Medusa) *', 'Lower temperature *', 'Top 75% *',
+                       'Top 90% *', 'Top 99% *'])
+    assert.ok(element.innerHTML.includes(`>${label}</option>`), label);
+  assert.match(element.innerHTML, /At temperature 0 all options give the same answers/);
+  assert.match(element.innerHTML, /\* this option can change the output distribution"/);
+  fire('change', {target: control('[data-setting]', {dataset: {setting: 'draft_rule'}, value: 'top-90'})});
+  drawMemoryPanel(element, view, onChange);
+  assert.deepEqual(selected(element), ['top-90', 'Top 90% *']);
+  apply(fire);
+  await settle();
+  assert.deepEqual(calls, [[{draft_rule: 'top-90'}, 'session']]);
+  apply(fire, 'default');
+  await settle();
+  assert.equal(calls[1][0].draft_rule, 'exact');
+  const other = mount({...live, details: {draft_rule: 'top-50'}}, onChange).element;
+  assert.deepEqual(selected(other), ['top-50', 'top-50 *']);
+  assert.doesNotMatch(mount(live, onChange).element.innerHTML, /data-setting="draft_rule"/);
+});
+
+test('a drafter the engine did not load is shown, with its words, but cannot be chosen', () => {
+  const view = {...live, settings: {...live.settings, drafter: 0, has_drafter: 0},
+    details: {drafter_label: 'No MTP drafter loaded'}};
+  const {element} = mount(view, () => {});
+  assert.match(element.innerHTML, /<option value="on" disabled>No MTP drafter loaded<\/option>/);
+});
+
+test('an unavailable drafter without discovery details says none is loaded', () => {
+  const {element} = mount({...live, settings: {...live.settings, drafter: 0, has_drafter: 0}}, () => {});
+  assert.match(element.innerHTML, /<option value="on" disabled>No model drafter loaded<\/option>/);
+  assert.match(element.innerHTML, /<option value="off" selected>/);
+});
+
+test('a selected unavailable drafter still allows switching to suffix drafting', async () => {
+  const view = {...live, settings: {...live.settings, drafter: 1, has_drafter: 0, suffix_draft: 0}};
+  const {calls, onChange} = recorder(), {element, fire} = mount(view, onChange);
+  assert.match(element.innerHTML, /<option value="on" selected disabled>/);
+  assert.doesNotMatch(element.innerHTML, /<select[^>]* disabled/);
+  fire('change', {target: control('[data-setting]', {dataset: {setting: 'drafter'}, value: 'suffix'})});
+  apply(fire);
+  await settle();
+  assert.deepEqual(calls, [[{drafter: false, suffix_draft: 3}, 'session']]);
 });
 
 test('allocation tooltips sort every category by label', () => {

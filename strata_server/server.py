@@ -2073,11 +2073,25 @@ class Service:
                                                     "prefill_tok_s_mean": self._prefill_tok_s_mean()},
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
                                        gpu_indices=getattr(self, "gpu_indices", None),
-                                       amd=getattr(self, "backend", None) == "hip")
+                                       amd=getattr(self, "backend", None) == "hip", transfers=self._engine_transfers)
             if getattr(self, "engine", None) is not None and hasattr(self.engine, "gpu_busy"):
                 # #1317: the quick frozen-engine check does not end an engine whose GPU is busy (a long prompt chunk on a
                 # slow card keeps the GPU at work while the host thread sleeps)
                 self.engine.gpu_busy = lambda: (self.telemetry.snapshot()["now"].get("gpu_util") or 0) >= 10
+
+    def _engine_transfers(self):
+        """Gets the engine's traffic totals from its last STATS line (contracts/requests.md) for the hardware sampler
+        (Telemetry's `transfers`): (seconds, {card index: (bytes to it, bytes from it)}), or None.  The engine's
+        `gpu<N>` is the Nth card of its visibility list, or card N without one."""
+        stats = getattr(getattr(self, "engine", None), "live_stats", None)
+        if not stats:
+            return None
+        order = getattr(self, "terminal_visibility_order", None) or []
+        cards = {}
+        for g in stats["gpus"]:
+            n = int(g["id"].removeprefix("gpu").partition(".")[0])
+            cards[order[n] if n < len(order) else n] = (g["to_gpu"], g["from_gpu"])
+        return stats["seconds"], cards
 
     def _tok_s(self):
         """tok/s over the last RATE_WINDOW_S seconds.  Returns 0.0 while nothing is generating.  With parallel requests:
@@ -2473,11 +2487,14 @@ class Service:
                 "prompt_read": None, "prompt_total": None, "generated": s.get("generated") if s.get("busy") else None,
                 "max_tokens": s.get("max_tokens") if s.get("busy") else None,
                 "elapsed_s": round(now - s["started"], 1) if s.get("busy") and s.get("started") else None,
-                "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
-                "tok_s_mean": round(self._tok_s_mean(), 1) if state == "generating" else None,
+                "tok_s": None, "tok_s_mean": None, "tok_s_window_s": None,
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
-                "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
-        if state == "reading" and progress:
+                # a paged engine's running totals (contracts/requests.md, STATS), from which the Monitor takes rates
+                "engine_stats": getattr(self.engine, "live_stats", None)}
+        if live["phases"]:                              # decoding, also beside a prompt that is read
+            live.update(tok_s=round(self._tok_s(), 1), tok_s_mean=round(self._tok_s_mean(), 1),
+                        tok_s_window_s=RATE_WINDOW_S)
+        if (state == "reading" or reading) and progress:
             live["prompt_read"], live["prompt_total"] = progress
         if par:                                         # #465: the requests running together, slot by slot
             with self.status_lock:
@@ -2493,7 +2510,7 @@ class Service:
                         admitting=int(getattr(self.engine, "admitting", 0) or 0))
             if running and state == "idle":
                 live["state"] = "generating"
-        if live["state"] == "reading":
+        if live["state"] == "reading" or reading:
             live.update(self._find_reading_request(s, running_st, live.get("slots")))
         live["error"] = last_error
         if hasattr(self.engine, "replica_view"):        # opt-in replicas: each one's state and requests routed to it
@@ -6687,10 +6704,11 @@ def apply_vision_defaults(cfg: dict) -> dict:
         return cfg
     cfg["vision"] = {**cfg["vision"], "elastic": True}
     args = list(cfg.get("args") or [])
-    if "--vram-reserve-mib" not in args[:-1]:
+    flag = next((f for f in ("--vram-reserve-mib", "--reserve-mib") if f in args[:-1]), None)   # (--reserve-mib: older name)
+    if flag is None:
         args += ["--vram-reserve-mib", str(VISION_RESERVE_MIB)]
-    elif args[args.index("--vram-reserve-mib") + 1] == "700":
-        args[args.index("--vram-reserve-mib") + 1] = str(VISION_RESERVE_MIB)
+    elif args[args.index(flag) + 1] == "700":
+        args[args.index(flag) + 1] = str(VISION_RESERVE_MIB)
     cfg["args"] = args
     return cfg
 

@@ -1471,10 +1471,8 @@ def model_shards(fam: dict, model: str) -> int:
 
 
 def budget_model(cfg: dict) -> str:
-    """The Unsloth model a config with a RAM budget runs, from its --native shard's name (UD-Q4_K_XL by default)."""
-    a = cfg.get("args", [])
-    native = Path(a[a.index("--native") + 1]).name.upper() if "--native" in a and a.index("--native") + 1 < len(a) \
-        else ""
+    """The Unsloth model a config with a RAM budget runs, from its model shard's name (UD-Q4_K_XL by default)."""
+    native = Path(user_args.find_model_file(cfg.get("args")) or "").name.upper()
     mine = [m for m, d in MODELS.items() if d.get("budget") and f"-{model_quant(m).upper()}-" in native]
     if len(mine) > 1:                                  # the pinned UD-IQ4_XS (three shards) and the v3.1 one (four): the shard count in the name tells them apart
         count = re.search(r"-OF-(\d{5})\.GGUF$", native)
@@ -5337,11 +5335,11 @@ def ensure_build_tools():
     return cmake, ninja
 
 
-def configured_generator(bdir: Path) -> str | None:
-    """The generator a build folder was configured with (CMakeCache.txt), None when it was never configured."""
+def get_configured_value(bdir: Path, key: str) -> str | None:
+    """Reads a build folder's CMakeCache.txt setting, or returns None when the setting or cache is absent."""
     try:
         for line in (Path(bdir) / "CMakeCache.txt").read_text(encoding="utf-8", errors="replace").splitlines():
-            if line.startswith("CMAKE_GENERATOR:"):
+            if line.startswith(key + ":"):
                 return line.split("=", 1)[1].strip()
     except OSError:
         pass
@@ -5353,7 +5351,7 @@ def fresh_if_other_generator(bdir: Path, generator: str = "Ninja") -> bool:
     previously"). The manual build in docs/INSTALL.md uses CMake's default, Unix Makefiles on Linux, in the same build/ folder (#4038).
     Such a folder is configured afresh: its cache is removed (the compiled objects of the other generator are not reused anyway), with one
     plain line. True when it did."""
-    had = configured_generator(bdir)
+    had = get_configured_value(bdir, "CMAKE_GENERATOR")
     if had is None or had == generator:
         return False
     say(f"  {Path(bdir).name}/ was configured with {had}; setup builds with {generator}, so it is configured again (the other build is not used)")
@@ -5364,12 +5362,16 @@ def fresh_if_other_generator(bdir: Path, generator: str = "Ninja") -> bool:
 
 def cmake_build(src, bdir, target, defs, vcvars, bat_name):
     """Configures and compiles `target` (one CMake target, or several separated by spaces) of the project `src` in
-    `bdir`.  On Windows the commands run from the script `bat_name` after MSVC's `vcvars`."""
+    `bdir`.  On Windows the commands run from the script `bat_name` after MSVC's `vcvars`.  `defs` None: `bdir` is
+    compiled as it was configured, with the cmake that configured it."""
     acquisition.require("a compile (cmake)")
-    cmake, ninja = ensure_build_tools()
-    fresh_if_other_generator(bdir)
-    conf = [cmake, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}", "-S", str(src), "-B", str(bdir),
-            "-DCMAKE_BUILD_TYPE=Release", *defs]
+    if defs is None:
+        cmake, conf = get_configured_value(bdir, "CMAKE_COMMAND"), []
+    else:
+        cmake, ninja = ensure_build_tools()
+        fresh_if_other_generator(bdir)
+        conf = [[cmake, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}", "-S", str(src), "-B", str(bdir),
+                 "-DCMAKE_BUILD_TYPE=Release", *defs]]
     build = [cmake, "--build", str(bdir), "--target", *target.split(), "-j", str(max(2, (os.cpu_count() or 4) // 2))]
     # A failed build is tried once more: CUDA 13.0's ptxas now and then fails to parse a PTX file it just wrote, and
     # the same command then gets past it (issue #45); a second attempt only compiles what is still missing.
@@ -5380,12 +5382,13 @@ def cmake_build(src, bdir, target, defs, vcvars, bat_name):
                  "needs no compiler: `strata update` fetches it")
         bat = ROOT / bat_name
         q = lambda c: " ".join(f'"{x}"' if " " in str(x) else str(x) for x in c)  # noqa: E731
-        bat.write_text(f'@echo off\r\ncall "{vcvars}" >nul\r\n{q(conf)} || exit /b 1\r\n{q(build)} && exit /b 0\r\n'
-                       f'echo   (the build stopped - trying it once more)\r\n{q(build)} || exit /b 1\r\n',
-                       encoding="utf-8")
+        bat.write_text(f'@echo off\r\ncall "{vcvars}" >nul\r\n' + "".join(f'{q(c)} || exit /b 1\r\n' for c in conf) +
+                       f'{q(build)} && exit /b 0\r\necho   (the build stopped - trying it once more)\r\n'
+                       f'{q(build)} || exit /b 1\r\n', encoding="utf-8")
         run(["cmd", "/c", str(bat)])
     else:
-        run(conf)
+        for c in conf:
+            run(c)
         if run(build, check=False).returncode != 0:
             say("  (the build stopped - trying it once more)")
             run(build)
@@ -6864,10 +6867,10 @@ def _start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open
     if browser:
         cmd.append("--open")
     gb = 0.0
-    if "--native" in cfg["args"]:
+    if model := user_args.find_model_file(cfg["args"]):
         try:
-            gb = Path(cfg["args"][cfg["args"].index("--native") + 1]).stat().st_size / 1e9
-        except (OSError, IndexError):
+            gb = Path(model).stat().st_size / 1e9
+        except OSError:
             pass
     say()
     say("  " + "-" * 100)
@@ -9407,11 +9410,11 @@ def main() -> int:
                        OWN_PATH_FAMILIES[a.family]["title"] if a.family in OWN_PATH_FAMILIES else "Qwen3.8-Flash-Next")
         + " on a normal PC (a GPU + system RAM + CPU)")
     have = installed_configs()
+    explicit = a.setup or a.model or a.family or a.check or a.no_start
     # A plain start of an installed model finds everything where it already is: it creates, moves and copies nothing
     # (the model paths are in the run config; the data folder is the one settings.json remembers).  Setting up, checking,
     # tuning and updating look for and gather the model files (data_folder).
-    plain_start = bool(have) and not (a.setup or a.model or a.family or a.check or a.no_start or a.update
-                                      or a.calibrate or a.rollback_engine or a.data_dir)
+    plain_start = bool(have) and not (explicit or a.update or a.calibrate or a.rollback_engine or a.data_dir)
     models_dir_given = a.models_dir is not None
     data, elsewhere = data_folder_in_place() if plain_start else data_folder_for(a)   # the model files
     roots = [data, *elsewhere]
@@ -9424,7 +9427,6 @@ def main() -> int:
     # ---- 0. already installed: just start it
     if a.update:                                       # #475: UPDATE.bat / update.sh - never starts the model
         return update_install(have, a)
-    explicit = a.setup or a.model or a.family or a.check or a.no_start
     adopted = None                                     # #629: the earlier install this copy is set up like
     if not have and not explicit:                      # a new copy of Strata (an update unzipped elsewhere): set it
         prev = previous_config(elsewhere, load_settings())   # up like the last one, from the files already here
@@ -9479,24 +9481,18 @@ def main() -> int:
             say()
             warn("this PC is NOT tuned: the tuning failed (the reason is above); the model "
                  + ("keeps" if a.no_start else "starts with") + " the default settings")
-        return 0 if a.no_start else start(pick_cfg, a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
-                     keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
-                           "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser})
-    if have and not (a.setup or a.model or a.family or a.check or a.no_start):
+        return 0 if a.no_start else start_installed(pick_cfg, a, run_gpu)
+    if have and not explicit:
         engine_update_note()
         if len(have) == 1:
-            return start(have[0], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
-                     keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
-                           "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser})
+            return start_installed(have[0], a, run_gpu)
         say()
         for i, c in enumerate(have, 1):
             say(f"  {i}) {json.loads(c.read_text(encoding='utf-8-sig')).get('model_name', c.stem)}")
         say(f"  {len(have) + 1}) install another model / change settings")
         pick = int(ask("Which one?", [str(i) for i in range(1, len(have) + 2)], "1", a.yes))
         if pick <= len(have):
-            return start(have[pick - 1], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
-                     keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
-                           "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser})
+            return start_installed(have[pick - 1], a, run_gpu)
         data, elsewhere = data_folder_for(a)      # "install another model": now the model files are gathered
         roots = [data, *elsewhere]
         if not models_dir_given:
@@ -10281,6 +10277,21 @@ def main() -> int:
             f"(later: {'BENCH.bat' if WIN else './bench.sh'})", ["y", "n"], "n", a.yes) == "y":
         subprocess.call([sys.executable, str(ROOT / "tools" / "strata_bench.py"), "--config", str(cfg_path), "--port", str(port)])
     return start(cfg_path, port)
+
+
+def start_installed(cfg_path: Path, a, gpu) -> int:
+    """Starts the installed model of the run config `cfg_path` with this run's options `a`.  --build first compiles
+    the engine program it runs again, in the CMake build folder that made it and with that folder's settings."""
+    if a.build:
+        exe = Path(json.loads(cfg_path.read_text(encoding="utf-8-sig"))["exe"])
+        if get_configured_value(exe.parent, "CMAKE_COMMAND") is None:
+            fail(f"--build compiles a model's engine in the folder it was built in, and {exe} was not built there",
+                 f"to compile setup's own engine instead: {'START-HERE.bat' if WIN else './setup.sh'} --setup --build")
+        say(f"  Compiling {exe.name} again in {exe.parent} (only what changed) ...")
+        cmake_build(ROOT, exe.parent, exe.stem, None, find_vcvars() if WIN else None, "build-strata.bat")
+    return start(cfg_path, a.port, gpu, yes=a.yes, layer_split=a.layer_split,
+                 keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
+                       "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser})
 
 
 if __name__ == "__main__":

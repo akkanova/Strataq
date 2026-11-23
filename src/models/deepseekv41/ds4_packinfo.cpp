@@ -15,10 +15,8 @@
 #include <string>
 #include <vector>
 
-#if defined(_MSC_VER)
-#include <cstring>
-#define strtok_r strtok_s
-#endif
+#include "strata/common/artifact/tensor_directory.hpp"
+
 namespace strata::ds4 {
 namespace {
 
@@ -44,12 +42,6 @@ bool dense_type(const std::string& t) {
     return t == "BF16" || t == "F32" || t == "F16" || t == "MXFP8" || t == "Q8_0" || device_type(t);
 }
 
-struct Tensor {
-    std::string dtype;
-    double bytes = 0;
-    std::vector<long long> shape;
-};
-
 double gb(double b) { return b / 1e9; }
 
 }  // namespace
@@ -74,46 +66,17 @@ int pack_info(const std::string& dir, std::FILE* out) {
     };
     const long long nl = num("num_hidden_layers", 0), ne = num("n_routed_experts", 0), topk = num("num_experts_per_tok", 0);
     const long long dim = num("hidden_size", 0), ff = num("moe_intermediate_size", 0), vocab = num("vocab_size", 0);
-    std::map<std::string, Tensor> t;
-    std::vector<std::string> files;
     std::map<int, double> need;   // bytes the pack needs from each file (its largest tensor end)
-    {
-        std::FILE* f = std::fopen((dir + "/tensors.txt").c_str(), "r");
-        if (f == nullptr) {
-            std::fprintf(out, "pack-info: %s/tensors.txt: not found\n", dir.c_str());
-            return 1;
-        }
-        std::vector<char> buf(1 << 16);
-        while (std::fgets(buf.data(), (int) buf.size(), f) != nullptr) {
-            char* s = buf.data();
-            if (s[0] == 'f') {   // file <i> <name>
-                char name[4096];
-                int i = 0;
-                if (std::sscanf(s, "file %d %4095s", &i, name) == 2) {
-                    if ((int) files.size() <= i) files.resize((size_t) i + 1);
-                    files[(size_t) i] = name;
-                }
-                continue;
-            }
-            if (s[0] != 't') continue;
-            char* save = nullptr;
-            ::strtok_r(s, " \n", &save);
-            const char* name = ::strtok_r(nullptr, " \n", &save);
-            const char* dt = ::strtok_r(nullptr, " \n", &save);
-            const char* fi = ::strtok_r(nullptr, " \n", &save);
-            const char* off = ::strtok_r(nullptr, " \n", &save);
-            const char* nb = ::strtok_r(nullptr, " \n", &save);
-            if (name == nullptr || dt == nullptr || fi == nullptr || off == nullptr || nb == nullptr) continue;
-            Tensor x;
-            x.dtype = dt;
-            x.bytes = (double) std::strtoull(nb, nullptr, 10);
-            const int idx = std::atoi(fi);
-            need[idx] = std::max(need[idx], (double) std::strtoull(off, nullptr, 10) + x.bytes);
-            while (const char* d = ::strtok_r(nullptr, " \n", &save)) x.shape.push_back(std::atoll(d));
-            t[name] = std::move(x);
-        }
-        std::fclose(f);
+    artifact::TensorDirectory toc;
+    std::string err;
+    if (!toc.load(dir + "/tensors.txt", err)) {
+        std::fprintf(out, "pack-info: %s\n", err.c_str());
+        return 1;
     }
+    const std::vector<std::string>& files = toc.files;
+    const std::map<std::string, artifact::TensorEntry> t(toc.tensors.begin(), toc.tensors.end());
+    for (const auto& [name, e] : t)
+        need[e.file] = std::max(need[e.file], (double) (e.off + e.bytes));
     if (t.empty()) {
         std::fprintf(out, "pack-info: %s/tensors.txt: no tensors\n", dir.c_str());
         return 1;

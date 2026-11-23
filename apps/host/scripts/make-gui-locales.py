@@ -1,6 +1,6 @@
 """Writes src/locales/gui-<lang>.json: the strings of the GUI feedback round 2 (branch f-0291-gui-fb2): the new name and hint of the "Leave room for my work"
 choice (it keeps 5-8 GB of memory free; it was "Leave 20% for my work"), the memory-error sentence that names it, and the words of the compact files block
-("Delivered to", "Working folder", "{0} files").
+("Delivered to", "Working folder", "{0} files"), and the Memory & Settings card's title and tooltip.
 Run from apps/host:  python scripts/make-gui-locales.py
 Every entry names all nine languages; the keys are gf01.. in the order of S. gui-en.json is the English source. Placeholders ({0}) must be kept in every language.
 A separate file keeps this work from colliding with the other catalogs (the same reason pick-, tune-, tools-, fix-, gh-, ui-, engine- and df2- exist)."""
@@ -39,6 +39,19 @@ add("Working folder",
 add("{0} files",
     "{0} 个文件", "{0} 個のファイル", "{0} Dateien", "{0} archivos", "Файлов: {0}", "{0} arquivos", "파일 {0}개", "{0} fichiers")
 here = Path(__file__).resolve().parent.parent / "src" / "locales"
+add("Memory & Settings",
+    "内存与设置", "メモリと設定", "Speicher & Einstellungen", "Memoria y ajustes",
+    "Память и настройки", "Memória e configurações", "메모리 및 설정", "Mémoire et réglages")
+add("Only settings you can edit live are shown here. Most of the important settings are shown here; see additional settings in the model's Expert settings (its run config, strata-<model>.json).",
+    "这里只显示可在运行时修改的设置。大多数重要设置都在这里；其他设置见模型的专家设置（其运行配置文件 strata-<model>.json）。",
+    "ここには実行中に変更できる設定だけを表示します。重要な設定の多くはここにあります。その他の設定はモデルのエキスパート設定（起動設定ファイル strata-<model>.json）にあります。",
+    "Hier stehen nur Einstellungen, die sich im laufenden Betrieb ändern lassen. Die meisten wichtigen Einstellungen stehen hier; weitere finden Sie in den Experteneinstellungen des Modells (seiner Startkonfiguration strata-<model>.json).",
+    "Aquí solo aparecen los ajustes que se pueden cambiar en marcha. Están la mayoría de los ajustes importantes; los demás están en los ajustes de experto del modelo (su configuración de arranque, strata-<model>.json).",
+    "Здесь показаны только настройки, которые можно менять на ходу. Большинство важных настроек здесь; остальные — в экспертных настройках модели (её файл запуска strata-<model>.json).",
+    "Aqui aparecem só as configurações que podem ser alteradas em execução. A maioria das configurações importantes está aqui; as demais ficam nas configurações avançadas do modelo (sua configuração de execução, strata-<model>.json).",
+    "여기에는 실행 중에 바꿀 수 있는 설정만 표시됩니다. 중요한 설정은 대부분 여기에 있으며, 나머지 설정은 모델의 전문가 설정(실행 구성 파일 strata-<model>.json)에 있습니다.",
+    "Seuls les réglages modifiables en cours de route apparaissent ici. La plupart des réglages importants y sont ; les autres se trouvent dans les réglages experts du modèle (sa configuration de lancement, strata-<model>.json).")
+
 NBSP = " "
 
 

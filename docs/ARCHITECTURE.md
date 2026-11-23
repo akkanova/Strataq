@@ -24,7 +24,7 @@ Folder names are chosen so that, in alphabetical order, shared code comes before
 | Layer | Folder | What belongs here | May use |
 |---|---|---|---|
 | 0 | `src/base/` | All-purpose code with no inference knowledge | `third_party/` only |
-| 0 | `src/base/gpu/` | The device runtime interface (memory, copies, streams, events, graphs), one implementation per backend; GPU hardware traits; the HIP compat headers | `src/base/platform/` |
+| 0 | `src/base/gpu/` | The device runtime interface (memory, copies, streams, events, graphs), one implementation per backend; GPU hardware traits; the HIP compat headers | `src/base/`'s own files, `src/base/platform/` |
 | 0 | `src/base/platform/` | Operating-system services: files read at an offset, mapping, NUMA, thread pinning, free RAM, worker pools | nothing |
 | 1 | `src/common/` | Inference code that does not depend on a model | layer 0 |
 | 1 | `src/common/artifact/` | GGUF reading, quantization block formats, CPU reference dequantizers | |

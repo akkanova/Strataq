@@ -31,6 +31,7 @@ class Switch:
     only: str                     # "qwen-gpu" | "qwen-cuda-12gb" | "qwen-radeon-9000" | "deepseek" | "qwen-any": where it applies
     default: str = "on"           # "on" | "off": what a launch without the entries does
     legacy: tuple[tuple[str, str], ...] = ()    # entries an earlier 0.2.7 test build wrote for the same state: they read as the switch being set, and are removed with it
+    cleanup_env: tuple[str, ...] = ()  # Retired names removed when returning to the default state.
     terminal_only: bool = False   # shown in the Terminal's Advanced table only, never in the app
 
 
@@ -48,11 +49,12 @@ SWITCHES: tuple[Switch, ...] = (
     Switch("deepseek_speedups", "DeepSeek speed-ups",
            "Reads long prompts faster and loads the parts of the model it needs faster. "
            "Turn off if DeepSeek stops working or its answers look wrong; it then runs as in version 0.2.6.",
-           # DS4_DEFAULTS=026: the engine's master switch back to the 0.2.6 defaults; the six are what older engines (and the test builds) read
-           (("DS4_DEFAULTS", "026"), ("DS4_FAST_ATTN", "0"), ("DS4_ATTN_SLAB", "0"), ("DS4_COPY_PIN", "0"), ("DS4_COPY_HUGETLB", "0"),
+           # STRATA_DEFAULTS=026: the engines' master switch back to the 0.2.6 defaults; the six are what older engines read.
+           # DS4_DEFAULTS=026 is what 0.2.7-0.2.13 wrote as the master switch.
+           (("STRATA_DEFAULTS", "026"), ("DS4_FAST_ATTN", "0"), ("DS4_ATTN_SLAB", "0"), ("DS4_COPY_PIN", "0"), ("DS4_COPY_HUGETLB", "0"),
             ("DS4_STORE_SPARE", "0"), ("DS4_STORE_PUT", "0")), "deepseek",
            legacy=(("DS4_FAST_ATTN", "0"), ("DS4_ATTN_SLAB", "0"), ("DS4_COPY_PIN", "0"), ("DS4_COPY_HUGETLB", "0"),
-                   ("DS4_STORE_SPARE", "0"), ("DS4_STORE_PUT", "0"))),
+                   ("DS4_STORE_SPARE", "0"), ("DS4_STORE_PUT", "0")), cleanup_env=("DS4_DEFAULTS",)),
     # Troubleshooting only, in the Terminal's Advanced table and nowhere else: every Qwen 0.2.7 default back to its 0.2.6 behaviour.
     Switch("qwen_defaults_026", "Qwen: 0.2.6 behaviour",
            "Starts every Qwen speed setting new in 0.2.7 the way 0.2.6 did, for troubleshooting. Use it if something that worked before no longer does.",
@@ -152,19 +154,19 @@ def set_switch(env: Mapping[str, Any] | None, switch: Switch | str, on: bool) ->
         else:
             out.pop(name, None)
     if not write:
-        for name, _ in sw.legacy:
+        for name in (*dict(sw.legacy), *sw.cleanup_env):
             out.pop(name, None)
     return out
 
 
 def env_names() -> dict[str, Switch]:
-    """Every environment name a switch writes -> its switch."""
+    """Every environment name a switch writes -> its switch (STRATA_DEFAULTS, which two switches write: the later one)."""
     return {name: sw for sw in SWITCHES for name, _ in sw.env}
 
 
-def env_words(name: str) -> str:
-    """The plain sentence of one environment row of the Terminal's Advanced table."""
-    sw = env_names()[name]
+def env_words(name: str, sw: Switch | None = None) -> str:
+    """The plain sentence of one environment row of the Terminal's Advanced table; `sw` is the switch that writes it."""
+    sw = sw or env_names()[name]
     value = dict(sw.env)[name]
     together = f"; all {len(sw.env)} speed-up rows go together" if len(sw.env) > 1 else ""
     if sw.default == "off":

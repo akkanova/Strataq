@@ -12,7 +12,9 @@
 // (restore_points_test.cpp).
 #pragma once
 
+#include "strata/base/platform/env.hpp"
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -55,6 +57,9 @@ inline int latest_point(const std::vector<int64_t>& at, int64_t limit, int64_t p
 struct MarkAt {
     int64_t pos = 0;
     bool shared = false;
+    /// false: only one of the model's own checkpoints (prompt_checkpoint.hpp), which does not restart the paged
+    /// engine's read chunks
+    bool asked = true;
 };
 
 // The restore points the read of a prompt's tokens [from, total) keeps, in order, from the positions a request asks
@@ -174,10 +179,7 @@ private:
     // STRATA_DS4_RESTORE_TAIL_AUTO (1): the tail point is left out where its cost is measured higher than reading its
     // tokens again; 0: kept on every read that reaches it
     static bool is_weighed() {
-        static const bool on = [] {
-            const char* v = std::getenv("STRATA_DS4_RESTORE_TAIL_AUTO");
-            return v == nullptr || std::atoi(v) != 0;
-        }();
+        static const bool on = strata::platform::env_tri("STRATA_DS4_RESTORE_TAIL_AUTO") != 0;
         return on;
     }
 };
@@ -201,6 +203,53 @@ inline int mark_victim(const std::vector<MarkUse>& v) {
         if (b >= 0) return b;
     }
     return -1;
+}
+
+/// Gets the point at position `at` of a conversation's restore points, marked used (gone back to, or kept again), or
+/// nullptr.  `clock`, the chain's use clock, first moves past every point's use: a chain back from a pause keeps its
+/// own.  `Point` has `pos`, `used` and `shared`.
+template <class Point>
+Point* touch_restore_point(std::vector<Point>& points, uint64_t& clock, int64_t at) {
+    Point* there = nullptr;
+    for (Point& x : points) {
+        clock = std::max(clock, x.used);
+        if (x.pos == at)
+            there = &x;
+    }
+    if (there != nullptr)
+        there->used = ++clock;
+    return there;
+}
+
+/// Gets the restore point to capture the state at position `at` into, making room under `cap` by `pick` (mark_victim's
+/// signature, the new point last): the one that gives way moves last with its payload buffers, for the caller to
+/// overwrite.  nullptr when none is kept (`cap` or `at` <= 0, or `pick` refuses the new one) or one at `at` exists
+/// (touched, and made shared if `shared`).  DeepSeek V4.1's marks and Qwen3.8's paged checkpoints use it.
+template <class Point, class Pick>
+Point* make_restore_point_room(std::vector<Point>& points, uint64_t& clock, int64_t at, bool shared, int cap,
+                               Pick&& pick) {
+    if (cap <= 0 || at <= 0)
+        return nullptr;
+    if (Point* there = touch_restore_point(points, clock, at)) {
+        there->shared = there->shared || shared;
+        return nullptr;
+    }
+    if ((int) points.size() >= cap) {
+        std::vector<MarkUse> u;
+        for (const Point& x : points)
+            u.push_back({x.pos, x.shared, x.used});
+        u.push_back({at, shared, clock + 1});
+        const size_t k = (size_t) pick(u);
+        if (k >= points.size())
+            return nullptr;
+        std::rotate(points.begin() + (std::ptrdiff_t) k, points.begin() + (std::ptrdiff_t) k + 1, points.end());
+    } else
+        points.emplace_back();
+    Point& c = points.back();
+    c.pos = at;
+    c.shared = shared;
+    c.used = ++clock;
+    return &c;
 }
 
 }  // namespace strata::core

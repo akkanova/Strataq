@@ -10,22 +10,17 @@
 
 namespace strata::core {
 
-namespace {
-bool off(const char* name) {
-    const char* v = std::getenv(name);
-    return v != nullptr && v[0] == '0';
-}
-}  // namespace
+using strata::platform::is_env_off;
 
 std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int minor) {
-    return nv_default_env(major, minor, strata::qwen_defaults_026());
+    return nv_default_env(major, minor, strata::defaults_026());
 }
 
 std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int minor, bool defaults026) {
     std::vector<std::pair<std::string, std::string>> t;
     const int mj = strata::cc_major_of(major), mn = strata::cc_minor_of(minor);
     if (mj == 8 && mn == 6) {
-        if (off("STRATA_SM86_PERF")) return t;
+        if (is_env_off("STRATA_SM86_PERF")) return t;
         t = {
             // 148-nv, RTX 3060 + RTX A4000 (IQ3_XXS, default flags, 8 pairs): the stack +9.6% / +14.6% (8/8 each), identity gate IDENTICAL.
             // Each is in because removing it from the full stack cost speed on a card (drop-one, 4 rounds) and saved none on the other.
@@ -40,7 +35,7 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             {"STRATA_B6_MMVQ_ROWS", "1"},        // A4000 0, 3060 -1.7
         };
     } else if (mj == 6 && mn == 0) {
-        if (off("STRATA_SM60_PERF")) return t;
+        if (is_env_off("STRATA_SM60_PERF")) return t;
         t = {
             // 148-nv, Tesla P100 (IQ3_XXS, default flags, 8 pairs): the stack +17.8% (8/8), identity gate IDENTICAL.
             {"STRATA_ADAPT_NOWAIT", "1"},        // -10 points when removed (with ADAPT_LAG)
@@ -54,7 +49,7 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
     } else if (mj == 12 && mn == 1) {
         // GB10 (NVIDIA DGX Spark, 48 SMs, unified memory): only what was measured on that part goes in.  New in 0.2.7.1, so
         // STRATA_DEFAULTS=026 (the master switch of everything since 0.2.6) leaves the table out, like STRATA_SM121_PERF=0.
-        if (off("STRATA_SM121_PERF") || defaults026) return t;
+        if (is_env_off("STRATA_SM121_PERF") || defaults026) return t;
         t = {
             // the fused IQ prompt kernels.  IQ3_S, 64K context, fresh 4K/16K/32K prompts at T=0, 3 paired rounds against
             // the same tree without it: prompt 1.139 / 1.149 / 1.121, decode unchanged; 5 of 5 greedy answers byte-
@@ -108,7 +103,7 @@ std::vector<std::string> apply_nv_defaults(int major, int minor) {
 }
 
 std::vector<std::pair<std::string, std::string>> nv_kq_default_env(int min_major, int min_minor) {
-    return nv_kq_default_env(min_major, min_minor, strata::qwen_defaults_026());
+    return nv_kq_default_env(min_major, min_minor, strata::defaults_026());
 }
 
 std::vector<std::pair<std::string, std::string>> nv_kq_default_env(int min_major, int min_minor, bool defaults026) {
@@ -149,7 +144,7 @@ void apply_spec_adapt_default(int major, int minor) {
     const bool sm86 = mj == 8 && mn == 6;
     if (!sm86) return;
     if (const char* v = std::getenv("STRATA_SPEC_ADAPT_SM86"); v == nullptr || v[0] != '1') return;
-    if (off("STRATA_SM86_PERF")) return;
+    if (is_env_off("STRATA_SM86_PERF")) return;
     const std::pair<const char*, const char*> kv[2] = {{"STRATA_SPEC_ADAPT_EVERY", "2"}, {"STRATA_SPEC_ADAPT_WARM", "200"}};
     for (const auto& p : kv)
         strata::platform::set_env(p.first, p.second, false);

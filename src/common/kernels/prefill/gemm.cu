@@ -1,5 +1,6 @@
 // src/common/kernels/prefill/gemm.cu - see include/strata/common/kernels/prefill/gemm.hpp.
 #include "strata/base/gpu/managed_memory.hpp"
+#include "strata/base/platform/env.hpp"
 #include "strata/common/kernels/prefill/gemm.hpp"
 #include "strata/common/kernels/dequant_bf16.hpp"
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
@@ -856,10 +857,7 @@ int current_cc() {
 }
 // 0: cuBLAS's BF16 GEMM, 1: through FP16 (tensor cores), 2: through FP32 (Pascal)
 int bf16_path() {
-    static const int forced = [] {
-        const char* v = std::getenv("STRATA_BF16_TC");
-        return v != nullptr && v[0] != '\0' ? std::atoi(v) : -1;
-    }();
+    static const int forced = strata::platform::env_int("STRATA_BF16_TC", -1);
     const int cc = current_cc();
     if (forced == 2 && cc > 0) return 1;   // a test mode: the FP16 path on any card (gemm_bf16_parity on sm_80+)
     if (cc <= 0 || cc >= 80) return 0;
@@ -905,10 +903,7 @@ void f16_to_f32(const uint16_t* in, float* out, int64_t n, cudaStream_t st) {
 }
 int g_dense_f32 = -1;   // gemm_set_dense_f32 (the parity test: 0 / 1 on any card); -1 = STRATA_DENSE_F32
 bool dense_f32_on() {
-    static const bool env = [] {
-        const char* v = std::getenv("STRATA_DENSE_F32");
-        return v != nullptr && std::atoi(v) != 0;
-    }();
+    static const bool env = strata::platform::env_tri("STRATA_DENSE_F32") == 1;
     if (g_dense_f32 >= 0) return g_dense_f32 != 0;
     if (!env) return false;
     const int cc = current_cc();

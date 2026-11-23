@@ -44,4 +44,16 @@ std::vector<std::pair<int32_t, int32_t>> rank_learned_profile(int64_t n_layers, 
 bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
                           const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err);
 
+/// Reads DeepSeek's per-expert routing counts: `STRP`, `2, n_rows, n_expert, 0, 0` (uint32), then `n_rows x
+/// n_expert` uint32 counts (one row per layer, the drafter's blocks after the layers).  A file without `STRP` (before
+/// version 2) is the counts alone and gives its whole rows; the caller decides whether that many rows fit its model.
+/// The STRP prefix is reserved, including in legacy files.
+/// Rejects more than `max_rows` before allocating. Returns false with `err` if the file cannot be used.
+bool read_expert_counts(const std::string& path, int64_t n_expert, uint32_t max_rows,
+                        std::vector<uint32_t>& counts, std::string& err);
+
+/// Writes `counts` (n_rows x n_expert) in read_expert_counts' version 2 format, atomically like write_expert_profile.
+bool write_expert_counts(const std::string& path, int64_t n_rows, int64_t n_expert,
+                         const std::vector<uint32_t>& counts, std::string& err);
+
 }  // namespace strata::core

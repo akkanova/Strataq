@@ -67,6 +67,26 @@ bool is_expert(const uint8_t* bytes, int64_t layer, int64_t expert) {
 }  // namespace
 
 int main() {
+    TrafficCount count;
+    std::thread first([&] {
+        for (int i = 0; i < 10000; ++i)
+            ++count;
+    });
+    std::thread second([&] {
+        for (int i = 0; i < 10000; ++i)
+            ++count;
+    });
+    first.join();
+    second.join();
+    const TrafficCount snapshot = count;
+    TrafficCount assigned;
+    assigned = count;
+    ++count;
+    check(snapshot == 20000 && assigned == 20000 && count == 20001,
+          "concurrent increments are retained and copies are independent snapshots");
+    count += UINT64_MAX;
+    check(count == 20000, "overflow wraps as an unsigned total");
+
     Ssd ssd;
     StateLayout layout;   // a conversation of a 3-page state and 1 page per 4 tokens
     layout.add(RegionKind::fixed, 3 * kPage);
@@ -86,6 +106,9 @@ int main() {
     uint64_t startup_wait = 0;
     check(ram.refill(16, startup_wait, err) == 9, "refill brings in the experts that fit");
     check(ssd.batches == 1, "a refill submits its experts in one SSD read");
+    const ExpertTraffic& traffic = ram.pages().traffic();
+    check(traffic.loads == 9 && traffic.ssd_reads == 1 && traffic.ssd_bytes == 12 * kPage,
+          "the refill's experts and its SSD read are counted");
     check(ram.holds(1, 2) && !ram.holds(0, 3) && ram.pages().pool().report().experts.pages == 12,
           "the pool holds the ranking's first experts");
     {
@@ -149,9 +172,14 @@ int main() {
                   later.holds(1, 5) && is_expert(later.blob(1, 5), 1, 5),
               "while the pool has free pages, an expert brought in pushes none out");
         check(is_expert(later.blob(2, 7), 2, 7), "a conversation can read before refill completes");
+        const uint64_t loads_before_failure = later.pages().traffic().loads;
         later_ssd.fail = true;
-        check(later.refill(2, ms, err) == -1 && !later.holds(2, 0) && !later.holds(0, 1),
+        check(later.refill(2, ms, err) == -1 && !later.holds(2, 0) && !later.holds(0, 1) &&
+                  later.pages().traffic().loads == loads_before_failure,
               "a failed SSD batch publishes none of its experts");
+        later_ssd.fail = false;
+        check(later.pages().is_refill_wanted() && later.refill(2, ms, err) == 2 && later.holds(2, 0) &&
+                  later.holds(0, 1), "a failed refill keeps its experts eligible for retry");
     }
     check(is_expert(ram.blob(1, 2), 1, 2) && !ram.transient(1, 2), "an expert in the pool is its bytes there");
     const int filled = ssd.reads;
@@ -166,10 +194,39 @@ int main() {
     check(ram.copy_blob(1, 0, out.data()) && is_expert(out.data(), 1, 0) && ram.copy_blob(1, 6, out.data()) &&
               is_expert(out.data(), 1, 6),
           "copy_blob gives the pool's and the SSD's experts");
+    check(traffic.hits == 2 && traffic.misses == 4, "each read counts a hit or, outside the pool, a miss");
+    {
+        const ExpertKey keys[] = {{1, 0}, {1, 6}, {2, 6}};   // one the pool holds, two it does not
+        const uint64_t bytes[] = {kBlobs[1], kBlobs[1], kBlobs[2]};
+        const int reads = ssd.reads, batches = ssd.batches;
+        check(ram.use_blobs(keys, bytes, 3, [&](const uint8_t* const* from) {
+                  return is_expert(from[0], 1, 0) && is_expert(from[1], 1, 6) && is_expert(from[2], 2, 6);
+              }) && ssd.reads == reads + 2 && ssd.batches == batches + 1 &&
+                  !ram.holds(1, 6) && !ram.holds(2, 6),
+              "use_blobs gives held experts and reads the others in one batch");
+        ssd.fail = true;
+        check(!ram.use_blobs(keys, bytes, 3, [](const uint8_t* const*) {
+                  check(false, "a failed read must not call the consumer");
+                  return true;
+              }), "use_blobs fails when the SSD read fails");
+        ssd.fail = false;
+    }
+
+    {
+        RamExperts trunk;
+        check(trunk.open(ssd, 4 * kPage, 1, layout, config, {kBlobs[0]}, kExperts, {{0, 0}}, err), err.c_str());
+        const ExpertKey key{2, 6};
+        const uint64_t bytes = kBlobs[2];
+        check(trunk.use_blobs(&key, &bytes, 1, [](const uint8_t* const* from) {
+                  return is_expert(from[0], 2, 6);
+              }), "use_blobs reads a drafter layer past the RAM pool's layers");
+        check(!trunk.use_blobs(&key, &bytes, 1, [](const uint8_t* const*) { return false; }),
+              "use_blobs reports a consumer failure");
+    }
 
     PagePool& pool = ram.pages().pool();
     check(pool.grow_conversation(9, 8).empty(), "a paused conversation takes pages");
-    check(pool.report().experts.pages <= 12 - 5, "it took experts' pages");
+    check(pool.report().experts.pages <= 12 - 5 && traffic.evictions > 0, "it took experts' pages");
     check(is_expert(ram.blob(2, 2), 2, 2) && is_expert(ram.blob(1, 7), 1, 7), "an evicted expert is read from the SSD");
     std::vector<uint8_t> gpu(kPage);
     for (uint64_t i = 0; i < kPage; ++i)
@@ -192,8 +249,10 @@ int main() {
     while (ram.holds(2, in))
         ++in;
     const int before = ssd.reads;
+    const ExpertTraffic was = traffic;
     check(ram.pages().replace({2, gone}, {2, in}, err) == 1 && ram.holds(2, in) && !ram.holds(2, gone) &&
-              ssd.reads == before + 1 && is_expert(ram.blob(2, in), 2, in),
+              ssd.reads == before + 1 && is_expert(ram.blob(2, in), 2, in) && traffic.swaps == was.swaps + 1 &&
+              traffic.loads == was.loads + 1,
           "an expert replaced in place leaves, and the other takes its pages with its own bytes");
     const auto check_bytes = [&] {
         for (int64_t l = 0; l < 3; ++l)
@@ -240,6 +299,9 @@ int main() {
     check(ram.holds(1, 0) && ram.holds(1, 3) && !ram.holds(1, 4) && pool.report().experts.pages == 8,
           "the new ranking's first come in");
     check_bytes();
+    const auto before_speed_test = traffic.get_counts();
+    check(ram.time_ssd_reads(0) > 0 && traffic.get_counts() == before_speed_test,
+          "the SSD speed probe leaves traffic counters unchanged");
     std::printf("ram_experts_test: %d checks passed\n", checks);
     return 0;
 }

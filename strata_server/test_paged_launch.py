@@ -12,7 +12,8 @@ class PagedLaunchTests(unittest.TestCase):
     def test_saved_token_limits_reach_both_engines(self):
         args = ['--max-context', '204800', '--conversation-tokens', '180000', '--tokens-max', '401000',
                 '--vram-conversations', '3', '--conversation-idle-seconds', '66', '--decode-share-percent', '0',
-                '--prompt-turn-ms', '20000', '--save-on-shutdown', 'on']
+                '--prompt-turn-ms', '20000', '--save-on-shutdown', 'on', '--step-profile', 'on',
+                '--draft-rule', 'top-90']
         for exe in ('strata-q38', 'strata-ds41'):
             with self.subTest(exe=exe):
                 self.assertEqual(engine_client.engine_args({'exe': exe, 'args': args}), args)
@@ -37,6 +38,13 @@ class PagedLaunchTests(unittest.TestCase):
                 args = ['--batch-groups', groups, '--batch', '2']
                 self.assertEqual(engine_client.engine_args({'exe': exe, 'args': args}), args)
 
+    def test_saved_expert_and_draft_tunings_reach_both_engines(self):
+        args = ['--route-tail-skip', '0', '--draft-confidence-pct', '40', '--draft-cumulative-pct', '15',
+                '--expert-half-life', '50', '--copy-back', 'off', '--route-prior-pct', '348']
+        for exe in ('strata-q38', 'strata-ds41'):
+            with self.subTest(exe=exe):
+                self.assertEqual(engine_client.engine_args({'exe': exe, 'args': args}), args)
+
     def test_deepseek_groups_survive_disabled_drafting(self):
         for groups in ('1', '2', 'auto'):
             cfg = {'exe': 'strata-ds41.exe', 'drafting': 'off', 'parallel': 4,
@@ -45,6 +53,14 @@ class PagedLaunchTests(unittest.TestCase):
             self.assertEqual(args[:2], ['--batch-groups', groups])
             self.assertEqual(args[args.index('--batch') + 1], '4')
             self.assertEqual(args[args.index('--dspark') + 1], 'none')
+
+    def test_both_names_use_spellings_supported_by_older_engines(self):
+        args = ['--vram-reserve-mib', '700', '--reserve-mib', '600', '--eos-ids', '1', '--eos', '2', '--slots', '3']
+        for exe in ('strata-q38', 'strata-ds41'):
+            reserve, eos = (('--reserve-mib', '--eos') if exe == 'strata-ds41' else
+                            ('--vram-reserve-mib', '--eos-ids'))
+            self.assertEqual(engine_client.engine_args({'exe': exe, 'args': args}),
+                             [reserve, '700', reserve, '600', eos, '1', eos, '2', '--batch', '3'])
 
     def test_lookup_options_reach_both_engines(self):
         args = ['--suffix-draft', '3', '--lookup-chain', '2', '--lookup-chain-min', '6', '--mtp-max-t', '4']
@@ -82,9 +98,7 @@ class PagedLaunchTests(unittest.TestCase):
         self.assertEqual(engine_client.engine_args(cfg)[-2:], ['--dspark', 'none'])
 
     def test_gpu_names_and_explicit_pool_budget(self):
-        self.assertEqual(engine_client.engine_args({'exe': 'strata-ds41', 'args': ['--gpu', '1,0',
-                                                                             '--vram-reserve-mib', '700']}),
-                         ['--gpus', '1,0', '--reserve-mib', '700'])
+        self.assertEqual(engine_client.engine_args({'exe': 'strata-ds41', 'args': ['--gpu', '1,0']}), ['--gpus', '1,0'])
         cfg = {'exe': 'strata-q38', 'args': ['--gpus', '1', '--resident-budget-gib', '2.5']}
         self.assertEqual(engine_client.engine_args(cfg), ['--gpu', '1', '--ram-mib', '2560'])
         cfg['args'] += ['--ram-mib', '1024']

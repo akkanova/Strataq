@@ -325,6 +325,9 @@ public:
     /// when the layer-major walk does not apply (then nothing was read; the caller reads the prompts one by one).
     bool run_multi(const std::vector<Seg>& segs, std::string& err);
 
+    /// Tells whether a run of two chunks or more goes layer by layer (STRATA_PREFILL_LAYER_MAJOR, or the default
+    /// here), unless the walk declines it (lm_prepare: an image prompt, no VRAM for it, ...).
+    bool is_layer_major_on() const;
     bool layer_major_mid() const {
         const Prefill* p = this;
         while (p->next_ != nullptr) p = p->next_;

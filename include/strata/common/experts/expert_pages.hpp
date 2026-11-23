@@ -12,6 +12,7 @@
 // expert's pages go to another use, the `leaving` hook may copy it elsewhere (a GPU's expert back to RAM).
 #pragma once
 
+#include "strata/common/experts/expert_traffic.hpp"
 #include "strata/common/state/page_pool.hpp"
 #include "strata/core/expert_cache.hpp"
 
@@ -36,6 +37,10 @@ struct ChunkMemory {
     std::function<bool(uint8_t* to, const uint8_t* from, uint64_t bytes)> copy;
     /// Each chunk `alloc` gives starts where the last one ended (one virtual range), so runs may cross chunks.
     bool contiguous = false;
+    /// Tells whether a chunk `alloc` gave lies outside the memory's own (PagePoolHooks::is_outside); null: none does.
+    std::function<bool(const uint8_t*)> is_outside;
+    /// Gets the bytes of the memory's own part that no one holds (PagePoolHooks::get_own_room); null: not known.
+    std::function<std::optional<uint64_t>()> get_own_room;
 };
 
 /// Experts in the pages of a page pool made over one arena: a GPU's expert cache (whose slots are the pages) or host
@@ -47,9 +52,9 @@ class ExpertPages {
 public:
     /// The engine's side of the pool: copying an expert in, publishing where experts are, and an expert's last look.
     struct Hooks {
-        /// Copies an expert's bytes into its pages (from `first`) and waits for the copy; false (and `err`) when it
-        /// could not.
-        std::function<bool(ExpertKey key, int32_t first, std::string& err)> load;
+        /// Copies the bytes of `n` experts into their pages (keys[i] from slot firsts[i]) and waits for the copies, so
+        /// that a refill reads its whole batch at once; false (and `err`) when it could not.
+        std::function<bool(const ExpertKey* keys, const int32_t* firsts, size_t n, std::string& err)> load;
         /// Tells the engine where an expert is now: its first page, or kNotResident when it left the pool.  A GPU's
         /// engine updates the residency tables its kernels read before its next step.
         std::function<void(ExpertKey key, int32_t first)> moved;
@@ -65,17 +70,19 @@ public:
     /// the ones of the first `max_experts` that fit (PagePoolConfig::expert_ranking).  From then on the cache's
     /// `admit` takes pages from the pool.  The pool opens without experts: `refill` brings in those of the first
     /// `max_experts` that fit (is_refill_wanted).
+    /// The pool grows to `bytes` as `growth` says (PagePool::resize).
     bool open(ExpertCache& cache, ChunkMemory memory, uint64_t bytes, const StateLayout& layout,
               PagePoolConfig config, const std::vector<uint64_t>& blob_bytes, int64_t n_expert, int64_t max_experts,
-              const std::vector<ExpertKey>& ranking, std::string& err);
+              const std::vector<ExpertKey>& ranking, const PoolGrowth& growth, std::string& err);
     /// The same in chunks of `config.chunk_bytes` of `memory` only, without a cache: `admit` gives experts their
     /// pages, and a slot is a page's number.
     bool open(ChunkMemory memory, uint64_t bytes, const StateLayout& layout, PagePoolConfig config,
               const std::vector<uint64_t>& blob_bytes, int64_t n_expert, int64_t max_experts,
-              const std::vector<ExpertKey>& ranking, std::string& err);
-    /// Takes or gives back chunks so that the pool holds `bytes` (PagePool::resize, whose refusal it gets).  After a
-    /// growth, `refill` brings in the experts of the first `max_experts` that the pool lacks.
-    PoolResize resize(uint64_t bytes);
+              const std::vector<ExpertKey>& ranking, const PoolGrowth& growth, std::string& err);
+    /// Takes or gives back chunks so that the pool holds `bytes`, growing as `growth` says (PagePool::resize, whose
+    /// refusal it gets).  After a growth, `refill` brings in the experts of the first `max_experts` that the pool
+    /// lacks.
+    PoolResize resize(uint64_t bytes, const PoolGrowth& growth = {});
     /// Makes `ranking` (hottest first) the experts the pool holds, at most `max_experts` of them, as `open` does: the
     /// experts it holds that are not among the first `max_experts` leave (the `leaving` and `moved` hooks), and
     /// `refill` brings in the others.  strata-q38 gives a layer split's card its new layers' experts when the cut
@@ -96,6 +103,10 @@ public:
     bool is_contiguous() const { return memory_.contiguous; }
     /// Gets the slot of a pool's page: what the cache's residency and the kernels use.
     int32_t get_slot(PageId page) const;
+    /// Gets where a slot (get_slot's) starts in the pool's memory.
+    uint8_t* get_slot_address(int32_t slot) const;
+    /// Gets the weight bytes of one expert of `layer` (less than the pages it takes).
+    uint64_t get_expert_bytes(int64_t layer) const { return blob_bytes_.at((size_t) layer); }
     void set_hooks(Hooks hooks) { hooks_ = std::move(hooks); }
     /// Gets the page pool that the experts share with the memory's conversations.
     PagePool& pool() { return *pool_; }
@@ -117,6 +128,10 @@ public:
     /// Counts a use of an expert the pool holds, so that a conversation evicts it after the experts used less
     /// recently (nothing when the pool does not hold it).
     void note_use(ExpertKey key) { (void) pool_->use_expert(key); }
+    /// Gets what the pool has done since it opened (EXPERT_TRAFFIC): it counts its loads, evictions and swaps, its
+    /// users the hits and misses (RamExperts and the paged engine) and SSD reads (RamExperts).
+    ExpertTraffic& traffic() { return traffic_; }
+    const ExpertTraffic& traffic() const { return traffic_; }
     /// Gets the pool's clock now (the times admit takes).
     uint64_t get_time() const { return now_(); }
     /// Tells whether experts that conversations evicted wait for pages that may be free for them now or soon.
@@ -128,20 +143,21 @@ public:
     /// when a caller admits them.  The RAM's pool uses it so that its start-up fill skips the GPUs' experts.
     void stop_wanting_if(const std::function<bool(ExpertKey)>& is_held_elsewhere);
     /// Puts back up to `max` evicted experts, hottest first, into free pages experts may take; it evicts no expert,
-    /// since one there now may be one that decoding uses more (the adaptive tier's).  Gets how many (-1 when a copy
-    /// failed, with `err`); `wait_ms` gets 0, or the milliseconds until more pages open to experts when the next
-    /// expert found no room before then.
+    /// since one there now may be one that decoding uses more (the adaptive tier's), and copies them in with one call
+    /// of the `load` hook.  Gets how many (-1 when the copy failed, with `err`: then none of them stays); `wait_ms`
+    /// gets 0, or the milliseconds until more pages open to experts when the next expert found no room before then.
     int refill(int max, uint64_t& wait_ms, std::string& err);
 
 private:
     bool open_pool(ChunkMemory memory, uint64_t bytes, const StateLayout& layout, PagePoolConfig config,
                    const std::vector<uint64_t>& blob_bytes, int64_t n_expert, int64_t max_experts,
-                   const std::vector<ExpertKey>& ranking, std::string& err);
+                   const std::vector<ExpertKey>& ranking, const PoolGrowth& growth, std::string& err);
     uint8_t* alloc_chunk(uint64_t bytes);
     void free_chunk(uint8_t* chunk);
     void on_evicted(ExpertKey key, PageId first);
     void on_relocated(ExpertKey key, PageId to);
     void want_missing();
+    bool load(const ExpertKey* keys, const int32_t* firsts, size_t n, std::string& err);
     int32_t admit_free(ExpertKey key);
     size_t index_of(ExpertKey key) const { return (size_t) key.layer * (size_t) n_expert_ + (size_t) key.expert; }
     /// Gets the clock time that stands for the last use of the expert of rank `rank`.
@@ -155,6 +171,7 @@ private:
     Hooks hooks_;
     std::function<uint64_t()> now_;      ///< the pool's clock
     std::vector<uint32_t> pages_;        ///< per layer, the pages one of its experts takes
+    std::vector<uint64_t> blob_bytes_;   ///< per layer, one expert's weight bytes
     int64_t n_expert_ = 0, max_experts_ = 0;
     uint64_t t0_ = 0;                    ///< the clock time given to the hottest expert's last use
     std::vector<int32_t> rank_;          ///< per expert, its rank; -1 while it has none
@@ -163,6 +180,7 @@ private:
     /// The pool's free pages when `refill` last found no room and no page about to open; refills wait until that
     /// changes.  UINT64_MAX: not waiting.
     uint64_t blocked_at_free_ = UINT64_MAX;
+    ExpertTraffic traffic_;
     /// While admit_free runs: `admit` takes free pages only (a GPU's pool reaches it through the cache's admitter)
     bool free_only_ = false;
 };

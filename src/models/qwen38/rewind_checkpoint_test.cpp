@@ -36,10 +36,10 @@ int main() {
     std::vector<RewindCheckpoint> chain;
     for (int i = 1; i <= 6; ++i) {
         RewindCheckpoint checkpoint;
-        checkpoint.tokens = i * 100;
+        checkpoint.pos = i * 100;
         checkpoint.used = i + 10;
         checkpoint.turn = i == 6;
-        checkpoint.pinned = i == 1;
+        checkpoint.shared = i == 1;
         checkpoint.state.assign(32, (uint8_t) i);
         checkpoint.recurrent.assign(1024, (uint8_t) (i + 1));
         chain.push_back(std::move(checkpoint));
@@ -51,8 +51,8 @@ int main() {
     check(read_rewind_checkpoints(reader, 6, 600, 1024, restored) && reader.at == bytes.size(),
           "every retained checkpoint survives host serialization");
     for (size_t i = 0; i < chain.size(); ++i)
-        check(restored[i].tokens == chain[i].tokens && restored[i].used == chain[i].used &&
-                  restored[i].turn == chain[i].turn && restored[i].pinned == chain[i].pinned &&
+        check(restored[i].pos == chain[i].pos && restored[i].used == chain[i].used &&
+                  restored[i].turn == chain[i].turn && restored[i].shared == chain[i].shared &&
                   restored[i].state == chain[i].state && restored[i].recurrent == chain[i].recurrent,
               "rewind restores recurrent bytes and retention metadata independently for each position");
     for (size_t end : {size_t{0}, size_t{7}, bytes.size() - 1}) {

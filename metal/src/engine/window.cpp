@@ -3485,7 +3485,7 @@ bool window_init(void* w, const strata::core::ModelGeometry& g, strata::core::Se
                  int64_t* n_vocab, std::string& err) {
     Window* x = (Window*) w;
     if (!x->ready()) {
-        if (g_shard1.empty()) { err = "metal window: the model shard is not set (--native SHARD1)"; return false; }
+        if (g_shard1.empty()) { err = "metal window: the model shard is not set (--model SHARD1)"; return false; }
         if (!x->init(g, ss, g_shard1, MAXT, max_cells, err)) return false;
         window_register(w);
         if (!mtp_load_pending(x, err)) return false;

@@ -1,4 +1,5 @@
 // src/models/qwen38/kernels/cuda/qsa_decode_attn.cu - see include/strata/models/qwen38/kernels/qsa_decode_attn.hpp.
+#include "strata/base/platform/env.hpp"
 #include "strata/models/qwen38/kernels/qsa_decode_attn.hpp"
 #include "strata/base/gpu/sm75_series.hpp"
 #include "strata/base/gpu/sm120_series.hpp"
@@ -922,10 +923,7 @@ int attn_kv_mode(const QsaAttnPools& p) {
 // STRATA_ATTN_MERGE_V2: 1 merges with attn_merge_v2_kernel, 0 with attn_merge_kernel.  Unset it follows
 // STRATA_ATTN_DAILY (the Daily had it on by default on NVIDIA), so upstream's merger stays the default.
 int attn_merge_v2() {
-    static const int env = [] {
-        const char* v = std::getenv("STRATA_ATTN_MERGE_V2");
-        return v != nullptr && *v != '\0' ? (std::atoi(v) != 0 ? 1 : 0) : -1;
-    }();
+    static const int env = strata::platform::env_tri("STRATA_ATTN_MERGE_V2");
     return env >= 0 ? env : (daily_attn() ? 1 : 0);
 }
 

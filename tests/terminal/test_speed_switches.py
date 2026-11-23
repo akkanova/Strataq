@@ -23,7 +23,7 @@ ENV = {      # what each switch writes outside its default
     "faster_long_prompts": {"STRATA_KVA": "1"},
     "faster_12gb_nvidia": {"STRATA_ROUTE_PRIOR": "1.5"},
     "faster_radeon_9000": {"STRATA_PCIE_FRAC_DEFAULT": "old"},
-    "deepseek_speedups": {"DS4_DEFAULTS": "026", "DS4_FAST_ATTN": "0", "DS4_ATTN_SLAB": "0", "DS4_COPY_PIN": "0", "DS4_COPY_HUGETLB": "0",
+    "deepseek_speedups": {"STRATA_DEFAULTS": "026", "DS4_FAST_ATTN": "0", "DS4_ATTN_SLAB": "0", "DS4_COPY_PIN": "0", "DS4_COPY_HUGETLB": "0",
                           "DS4_STORE_SPARE": "0", "DS4_STORE_PUT": "0"},
     "qwen_defaults_026": {"STRATA_DEFAULTS": "026"},         # the Terminal's troubleshooting switch: not in the app
 }
@@ -116,15 +116,19 @@ class Contract(unittest.TestCase):
     def test_deepseek_off_writes_the_master_switch_and_the_six_and_on_removes_all_seven(self):
         env = {"DS4_ASYNC_T": "4"}
         off = W.set_switch(env, "deepseek_speedups", False)
-        self.assertEqual(list(off)[:2], ["DS4_ASYNC_T", "DS4_DEFAULTS"], "the master switch first")
-        self.assertEqual(off, {"DS4_ASYNC_T": "4", "DS4_DEFAULTS": "026", **{k: "0" for k in SIX}})
+        self.assertEqual(list(off)[:2], ["DS4_ASYNC_T", "STRATA_DEFAULTS"], "the master switch first")
+        self.assertEqual(off, {"DS4_ASYNC_T": "4", "STRATA_DEFAULTS": "026", **{k: "0" for k in SIX}})
         self.assertFalse(W.is_on(off, "deepseek_speedups"))
         self.assertEqual(W.set_switch(off, "deepseek_speedups", True), env)
-        # an earlier test build wrote only the six: it still reads as off, and turning it on removes them
-        six = {"DS4_ASYNC_T": "4", **{k: "0" for k in SIX}}
+        # 0.2.7-0.2.13 wrote DS4_DEFAULTS=026 and the six: it still reads as off, and turning it on removes all of them
+        six = {**env, **{k: "0" for k in SIX}}
         self.assertFalse(W.is_on(six, "deepseek_speedups"))
         self.assertEqual(W.set_switch(six, "deepseek_speedups", True), env)
-        self.assertTrue(W.is_on({"DS4_DEFAULTS": "026"}, "deepseek_speedups"), "the master switch alone is not the whole switch: a hand-edited file is left alone")
+        self.assertTrue(W.is_on({"DS4_DEFAULTS": "026"}, "deepseek_speedups"))
+        old = {"DS4_ASYNC_T": "4", "DS4_DEFAULTS": "026", **{k: "0" for k in SIX}}
+        self.assertFalse(W.is_on(old, "deepseek_speedups"))
+        self.assertEqual(W.set_switch(old, "deepseek_speedups", True), env)
+        self.assertTrue(W.is_on({"STRATA_DEFAULTS": "026"}, "deepseek_speedups"), "the master switch alone is not the whole switch: a hand-edited file is left alone")
 
     def test_the_terminal_only_switch_is_for_qwen_and_never_in_the_app(self):
         sw = W.BY_ID["qwen_defaults_026"]
@@ -133,7 +137,7 @@ class Contract(unittest.TestCase):
         self.assertNotIn("qwen_defaults_026", [s.id for s in W.app_switches()])
         for cfg, gpus in ((QWEN, [RTX]), (QWEN36, [RTX]), ({**QWEN, "backend": "sycl"}, []), ({**QWEN, "backend": "cpu"}, [])):
             self.assertIn("qwen_defaults_026", [s.id for s in W.applicable(cfg, gpus)])
-        self.assertNotIn("qwen_defaults_026", [s.id for s in W.applicable(DEEPSEEK, [RTX])], "DeepSeek has its own master switch (DS4_DEFAULTS)")
+        self.assertNotIn("qwen_defaults_026", [s.id for s in W.applicable(DEEPSEEK, [RTX])], "DeepSeek's master switch is in its speed-ups switch")
         self.assertEqual(W.set_switch({"PATH": "/bin"}, sw, True), {"PATH": "/bin", "STRATA_DEFAULTS": "026"})
         self.assertFalse(W.is_on({}, sw))
         self.assertEqual(W.set_switch({"STRATA_DEFAULTS": "026"}, sw, False), {})
@@ -201,7 +205,7 @@ class Terminal(unittest.TestCase):
         def names(cfg, gpus, extra=None):
             rows = P.build_rows(None, cfg["args"], None, cfg["env"], None, extra or {}, P.switch_params(W.applicable(cfg, gpus)))
             return [r.name for r in rows if r.name in W.env_names()]
-        # (STRATA_DEFAULTS, the Qwen "0.2.6 behaviour" row, closes every Qwen table; the DeepSeek table has DS4_DEFAULTS instead)
+        # (STRATA_DEFAULTS, the Qwen "0.2.6 behaviour" row, closes every Qwen table; the DeepSeek table has it inside "DeepSeek speed-ups")
         self.assertEqual(names(QWEN, [RTX]), ["STRATA_KVA", "STRATA_DEFAULTS"])
         self.assertEqual(names(QWEN, [RTX3060]), ["STRATA_KVA", "STRATA_ROUTE_PRIOR", "STRATA_DEFAULTS"])
         self.assertEqual(names({**QWEN, "backend": "hip"}, [R9700]), ["STRATA_KVA", "STRATA_PCIE_FRAC_DEFAULT", "STRATA_DEFAULTS"])
@@ -236,7 +240,7 @@ class Terminal(unittest.TestCase):
     def test_the_six_deepseek_rows_say_they_go_together(self):
         text = W.env_words("DS4_COPY_PIN")
         self.assertIn("all 7 speed-up rows go together", text)
-        self.assertEqual({W.env_names()[n].id for n in ENV["deepseek_speedups"]}, {"deepseek_speedups"})
+        self.assertIn("all 7 speed-up rows go together", W.env_words("STRATA_DEFAULTS", W.BY_ID["deepseek_speedups"]))
 
 
 class SameAsTheApp(unittest.TestCase):

@@ -13,6 +13,8 @@
 // compressed KV and index keys included, which a checkpoint leaves in place - through a file or a host buffer.
 #pragma once
 
+#include "strata/common/experts/expert_files.hpp"
+#include "strata/common/kernels/draft_rule.hpp"
 #include "strata/common/serve/memory_report.hpp"
 #include "strata/common/serve/request.hpp"
 #include "strata/models/deepseekv41/conversation_layout.hpp"
@@ -100,23 +102,7 @@ struct Options {
     int seqs = 1;
 };
 
-/// Where one trunk layer's routed experts lie in the model's files (Model::get_file_paths) and where each matrix goes
-/// in an expert's blob, the layout the GPU's kernels and the CPU lane read: matrix r (gate, up, down) of expert e is
-/// bytes[r] bytes at off[r] + e * stride[r] in file file[r], at tr[r] in a blob of `blob` bytes.
-struct ExpertFileLayout {
-    int n_exp = 0;
-    int file[3] = {-1, -1, -1};
-    uint64_t off[3] = {0, 0, 0}, stride[3] = {0, 0, 0};
-    uint64_t bytes[3] = {0, 0, 0};
-    uint64_t tr[3] = {0, 0, 0};
-    uint64_t blob = 0;
-    /// EXL3 stores nine separately placed pieces per expert, in the pack's file order.
-    struct Piece {
-        int file = -1;
-        uint64_t off = 0, bytes = 0, dst = 0;
-    };
-    std::vector<std::vector<Piece>> pieces;
-};
+using strata::core::ExpertFileLayout;
 
 /// Reads comma- or space-separated integers from `s`, stopping at the first that is not one.
 std::vector<int> parse_ids(const std::string& s);
@@ -215,6 +201,8 @@ public:
     /// (Options::expert_pages) Gets each trunk expert's routings in windows since the caller last changed them (layer
     /// * n_exp + expert), counted once the caller sized it to that.
     std::vector<float>& get_usage();
+    /// Gets the experts the CPU lane has computed so far (cpu_experts' calls), each counted once a call.
+    int64_t get_cpu_experts() const;
     /// Gets the GPU memory of the weights on GPU `dev` (an index into get_devices).
     uint64_t get_weight_bytes(int dev) const;
     /// Gets DSpark's reloadable dense allocation size on a stage, including while unloaded.
@@ -272,6 +260,8 @@ public:
     int poll_group(int stage, std::string& err);
     /// Restores the group's logits and retains its DSpark inputs after every stage drains.
     bool finish_group(int group, const std::function<void(int)>& select, std::string& err);
+    /// Sets which drafts a sampled request's verify rows keep (verify_rows, pick_joint_rows); speculative by default.
+    void set_draft_rule(strata::kernels::DraftRule rule);
     /// Samples one row of the last shared pass with the request's sampling settings.
     int sample_row(int row, float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter);
     /// Feeds `token` at pos(); with logits, leaves the next token's scores on the head's device.

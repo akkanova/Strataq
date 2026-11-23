@@ -30,7 +30,7 @@ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std:
 
 bool mapped(size_t bytes, void** h, void** d) {
     if (strata::core::allocate_host(h, bytes, cudaHostAllocMapped,
-        {"other", "Device allocations", "Drafter"}) != cudaSuccess) return false;
+        {"drafter", "Device allocations", "Drafter"}) != cudaSuccess) return false;
     std::memset(*h, 0, bytes);
     return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
 }
@@ -45,8 +45,7 @@ Dflash2Drafter::~Dflash2Drafter() {
     prof_free();
     const OnDevice on_device(device_);
     if (cs_) cudaStreamSynchronize(cs_);
-    for (cudaGraphExec_t& e : exec_)
-        if (e) cudaGraphExecDestroy(e);
+    graphs_.clear();
     auto fr = [](void* p) { if (p) strata::core::release_device(p); };
     auto fh = [](void* p) { if (p) strata::core::release_host(p); };
     fh(h_logq_); fh(h_logd_);
@@ -175,15 +174,20 @@ bool Dflash2Drafter::load(const std::string& path, int device, std::string& err)
         return false;
     }
     if (strata::core::allocate_device((void**) &blob_, total,
-        {"other", "Device allocations", "Drafter"}) != cudaSuccess) { err = "dflash2: the pack does not fit in VRAM ("
-            + std::to_string(total >> 20) + " MiB)"; return false; }
+        {"drafter", "Device allocations", "Drafter"}) != cudaSuccess) {
+        err = "dflash2: the pack does not fit in VRAM (" + std::to_string(total >> 20) + " MiB)";
+        return false;
+    }
     vram_ += total;
     uint64_t max_bytes = 0;
     for (const Tensor& t : tensors_) max_bytes = std::max(max_bytes, t.bytes);
     std::vector<uint8_t> stage(max_bytes);
     uint8_t* tmp = nullptr;
     if (strata::core::allocate_device((void**) &tmp, max_bytes,
-        {"other", "Device allocations", "Drafter"}) != cudaSuccess) { err = "dflash2: upload scratch"; return false; }
+        {"drafter", "Device allocations", "Drafter"}) != cudaSuccess) {
+        err = "dflash2: upload scratch";
+        return false;
+    }
     struct TmpFree { uint8_t* p; ~TmpFree() { strata::core::release_device(p); } } tmp_free{tmp};
     for (const Tensor& t : tensors_) {
 #if defined(_WIN32)
@@ -250,7 +254,7 @@ bool Dflash2Drafter::alloc(std::string& err) {
     auto dev = [&](auto** p, size_t n) {
         using T = std::remove_pointer_t<std::remove_reference_t<decltype(*p)>>;
         if (strata::core::allocate_device((void**) p, n * sizeof(T),
-            {"other", "Device allocations", "Drafter"}) != cudaSuccess) return false;
+            {"drafter", "Device allocations", "Drafter"}) != cudaSuccess) return false;
         vram_ += n * sizeof(T);
         return true;
     };
@@ -276,7 +280,8 @@ bool Dflash2Drafter::alloc(std::string& err) {
     rt_blk_ = rt_ctx_ + B * 128;
     cudaMemset(rt_ctx_, 0, 2 * B * 128 * 4);
     kernels::df2_rope_inv(theta_, rope_inv_, nullptr);
-    if (strata::core::allocate_device((void**) &tag_, (size_t) kRing * 8, {"other", "Device allocations", "Drafter"}) != cudaSuccess) {
+    if (strata::core::allocate_device((void**) &tag_, (size_t) kRing * 8,
+        {"drafter", "Device allocations", "Drafter"}) != cudaSuccess) {
         err = "dflash2: ring tags";
         return false;
     }
@@ -304,14 +309,17 @@ bool Dflash2Drafter::bind_raw(EmbedFn embed, const void* head_w, int head_type, 
             dvocab_ = const_cast<int32_t*>(shared_.vocab_dev);
         } else {
             if (strata::core::allocate_device((void**) &dvocab_, vocab.size() * 4,
-                {"other", "Device allocations", "Drafter"}) != cudaSuccess) { err = "dflash2: draft vocabulary"; return false; }
+                {"drafter", "Device allocations", "Drafter"}) != cudaSuccess) {
+                err = "dflash2: draft vocabulary";
+                return false;
+            }
             vram_ += vocab.size() * 4;
             cudaMemcpy(dvocab_, vocab.data(), vocab.size() * 4, cudaMemcpyHostToDevice);
         }
     }
     if ((n_dvocab_ + kernels::kDf2TopBlocks - 1) / kernels::kDf2TopBlocks > 4096) { err = "dflash2: the head has too many rows for the top-k"; return false; }
     if (!logits_ && strata::core::allocate_device((void**) &logits_, (size_t) kDrafts * (size_t) n_dvocab_ * 4,
-        {"other", "Device allocations", "Drafter"}) != cudaSuccess) { err = "dflash2: the draft logits do not fit";
+        {"drafter", "Device allocations", "Drafter"}) != cudaSuccess) { err = "dflash2: the draft logits do not fit";
             return false; }
     vram_ += (uint64_t) kDrafts * (uint64_t) n_dvocab_ * 4;
     bound_ = true;
@@ -321,7 +329,7 @@ bool Dflash2Drafter::bind_raw(EmbedFn embed, const void* head_w, int head_type, 
 #ifndef STRATA_DF2_NO_BIND   // the split engine (src/split) binds through bind_raw only: bind() copies head rows between cards with the peer API
 bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const std::string& vocab_file, std::string& err, int head_device) {
     const OnDevice on_device(device_);
-    if (head == nullptr || !head->loaded()) { err = "dflash2: the drafter needs the native head (--native)"; return false; }
+    if (head == nullptr || !head->loaded()) { err = "dflash2: the drafter needs the native head (--model)"; return false; }
     const WeightRef* we = wt.find("token_embd.weight");
     if (we == nullptr && native_embed() == nullptr) { err = "dflash2: token_embd.weight is missing"; return false; }   // (a later stage of a layer split may not carry it: the native table serves)
     EmbedFn embed = [we](const int32_t* tok, int n, float* out, cudaStream_t cs) {
@@ -368,8 +376,10 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
         int32_t* dv = nullptr;
         {
             const OnDevice on_head(head_device);
-            if (strata::core::allocate_device((void**) &dv, vocab.size() * 4, {"other", "Device allocations", "Drafter"}) != cudaSuccess ||
-                strata::core::allocate_device((void**) &tmp, bytes, {"other", "Device allocations", "Drafter"}) != cudaSuccess) {
+            if (strata::core::allocate_device((void**) &dv, vocab.size() * 4,
+                {"drafter", "Device allocations", "Drafter"}) != cudaSuccess ||
+                strata::core::allocate_device((void**) &tmp, bytes,
+                    {"drafter", "Device allocations", "Drafter"}) != cudaSuccess) {
                 if (dv)
                     strata::core::release_device(dv);
                 err = "dflash2: the draft vocabulary's head rows do not fit on the head's card";
@@ -380,7 +390,8 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
             cudaDeviceSynchronize();
             strata::core::release_device(dv);
         }
-        if (strata::core::allocate_device((void**) &dhead_, bytes, {"other", "Device allocations", "Drafter"}) != cudaSuccess) {
+        if (strata::core::allocate_device((void**) &dhead_, bytes,
+            {"drafter", "Device allocations", "Drafter"}) != cudaSuccess) {
             { const OnDevice on_head(head_device); strata::core::release_device(tmp); }
             err = "dflash2: the draft vocabulary's head rows do not fit";
             return false;
@@ -394,9 +405,9 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
     } else if (!vocab.empty()) {
         int32_t* dv = nullptr;
         if (strata::core::allocate_device((void**) &dv, vocab.size() * 4,
-            {"other", "Device allocations", "Drafter"}) != cudaSuccess || strata::core::allocate_device((void**)
-                &dhead_, (size_t) ((int64_t) vocab.size() * row_bytes), {"other", "Device allocations", "Drafter"}) !=
-                    cudaSuccess) {
+            {"drafter", "Device allocations", "Drafter"}) != cudaSuccess ||
+            strata::core::allocate_device((void**) &dhead_, (size_t) ((int64_t) vocab.size() * row_bytes),
+                {"drafter", "Device allocations", "Drafter"}) != cudaSuccess) {
             if (dv)
                 strata::core::release_device(dv);
             err = "dflash2: the draft vocabulary's head rows do not fit";
@@ -562,10 +573,7 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
 }
 
 bool Dflash2Drafter::capture(int n, const float* taps, std::string& err) {
-    if (exec_[n]) return true;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "dflash2: begin capture"; return false; }
-    kernels::copy_i32_from_mapped(d_meta_, m_meta_, 32, cs_);
-    kernels::df2_rope_table_inv(d_meta_, 16, rope_inv_, rt_ctx_, cs_);   // the context rows' and the block rows' tables in one launch, before the branches split
+    if (graphs_.find(n)) return true;
     // the context update (fc, the keys and values) and the block's front run side by side: they meet before each layer's attention
     // measured: -0.3 ms a round on an RTX 3060, +0.0..0.7 on a Strix Halo (gfx1151), so the HIP builds keep one stream (STRATA_DF2_FORK=1 / 0 overrides)
 #if defined(STRATA_USE_HIP)
@@ -574,26 +582,24 @@ bool Dflash2Drafter::capture(int n, const float* taps, std::string& err) {
     static const bool fork_default = true;
 #endif
     static const bool fork_on = [] { const char* e = std::getenv("STRATA_DF2_FORK"); return e && e[0] ? e[0] == '1' : fork_default; }();
-    fork_ = fork_on && prof_ == nullptr && cs2_ != nullptr;
-    if (fork_) {
-        cudaEventRecord(ev_fork_, cs_);
-        cudaStreamWaitEvent(cs2_, ev_fork_, 0);
-    }
-    bool ok = record_context(taps, n, fork_ ? cs2_ : cs_, err, false);
-    if (fork_) cudaEventRecord(ev_join_, cs2_);
-    if (ok) ok = record_block(cs_, err, false);
-    if (fork_) cudaStreamWaitEvent(cs_, ev_join_, 0);
-    fork_ = false;
-    cudaGraph_t graph = nullptr;
-    const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
-    if (!ok) { if (graph) cudaGraphDestroy(graph); return false; }
-    if (ce != cudaSuccess || cudaGraphInstantiate(&exec_[n], graph, 0) != cudaSuccess) {
-        if (graph) cudaGraphDestroy(graph);
-        err = std::string("dflash2: capture: ") + cudaGetErrorString(ce);
-        return false;
-    }
-    cudaGraphDestroy(graph);
-    cudaGraphUpload(exec_[n], cs_);
+    const cudaGraphExec_t ex = graphs_.capture(n, cs_, [&] {
+        kernels::copy_i32_from_mapped(d_meta_, m_meta_, 32, cs_);
+        // the context rows' and the block rows' tables in one launch, before the branches split
+        kernels::df2_rope_table_inv(d_meta_, 16, rope_inv_, rt_ctx_, cs_);
+        fork_ = fork_on && prof_ == nullptr && cs2_ != nullptr;
+        if (fork_) {
+            cudaEventRecord(ev_fork_, cs_);
+            cudaStreamWaitEvent(cs2_, ev_fork_, 0);
+        }
+        bool ok = record_context(taps, n, fork_ ? cs2_ : cs_, err, false);
+        if (fork_) cudaEventRecord(ev_join_, cs2_);
+        if (ok) ok = record_block(cs_, err, false);
+        if (fork_) cudaStreamWaitEvent(cs_, ev_join_, 0);
+        fork_ = false;
+        return ok;
+    }, "dflash2: capture: ", err);
+    if (!ex) return false;
+    cudaGraphUpload(ex, cs_);
     cudaStreamSynchronize(cs_);
     return true;
 }
@@ -615,7 +621,8 @@ bool Dflash2Drafter::clone_bind(const Dflash2Drafter& parent, std::string& err) 
     embed_ = parent.embed_; head_w_ = parent.head_w_; head_type_ = parent.head_type_; n_dvocab_ = parent.n_dvocab_;
     dvocab_ = parent.dvocab_; dhead_ = parent.dhead_; dhead_shared_ = true;
     ndraft_ = parent.ndraft_;
-    if (strata::core::allocate_device((void**) &logits_, (size_t) kDrafts * (size_t) n_dvocab_ * 4, {"other", "Device allocations", "Drafter"}) != cudaSuccess) {
+    if (strata::core::allocate_device((void**) &logits_, (size_t) kDrafts * (size_t) n_dvocab_ * 4,
+        {"drafter", "Device allocations", "Drafter"}) != cudaSuccess) {
         err = "dflash2: the slot drafter's draft logits do not fit";
         return false;
     }
@@ -643,7 +650,7 @@ float* Dflash2Drafter::defer_rows(int64_t pos0, int n, std::string& err) {
     if (dpend_ == nullptr) {
         const OnDevice on_device(device_);
         if (strata::core::allocate_host((void**) &dpend_, (size_t) kRing2048 * taps_.size() * (size_t) N_ * 4, cudaHostAllocPortable,
-                                        {"other", "Device allocations", "Drafter"}) != cudaSuccess) {
+                                        {"drafter", "Device allocations", "Drafter"}) != cudaSuccess) {
             (void) cudaGetLastError();
             dpend_ = nullptr;
             err = "dflash2: the deferred-rows buffer does not fit in pinned memory";
@@ -690,8 +697,7 @@ void Dflash2Drafter::set_max_drafts(int n) {
     if (n == ndraft_) return;
     const OnDevice on_device(device_);
     cudaDeviceSynchronize();
-    for (auto& e : exec_)
-        if (e) { cudaGraphExecDestroy(e); e = nullptr; }
+    graphs_.clear();
     graph_taps_ = nullptr;
     ndraft_ = n;
 }
@@ -772,9 +778,11 @@ void Dflash2Drafter::init_ring_log() {
     const char* off = std::getenv("STRATA_DF2_RING_LOG");
     if (off && off[0] == '0') { log_on_ = false; return; }
     if (const char* e = std::getenv("STRATA_DF2_LOG_MIB"); e && e[0]) stash_budget_ = (uint64_t) std::max(0, std::atoi(e)) << 20;
-    if (h_logq_ == nullptr && strata::core::allocate_host((void**) &h_logq_, (size_t) kRows * N_, cudaHostAllocDefault, {"other", "Device allocations", "Drafter"}) != cudaSuccess)
+    if (h_logq_ == nullptr && strata::core::allocate_host((void**) &h_logq_, (size_t) kRows * N_, cudaHostAllocDefault,
+        {"drafter", "Device allocations", "Drafter"}) != cudaSuccess)
         h_logq_ = nullptr;
-    if (h_logd_ == nullptr && strata::core::allocate_host((void**) &h_logd_, (size_t) kRows * (N_ / 32) * 4, cudaHostAllocDefault, {"other", "Device allocations", "Drafter"}) != cudaSuccess)
+    if (h_logd_ == nullptr && strata::core::allocate_host((void**) &h_logd_, (size_t) kRows * (N_ / 32) * 4,
+        cudaHostAllocDefault, {"drafter", "Device allocations", "Drafter"}) != cudaSuccess)
         h_logd_ = nullptr;
     log_on_ = h_logq_ != nullptr && h_logd_ != nullptr;
     if (!log_on_) {
@@ -853,9 +861,12 @@ bool Dflash2Drafter::rebuild(int64_t lo, int64_t hi, int64_t* rebuilt, int64_t* 
     const size_t rows = pos.size();
     const size_t cap = (size_t) kRing;   // a window is at most 2048 rows
     if (rb_q_ == nullptr) {
-        if (strata::core::allocate_device((void**) &rb_q_, (cap + kRows) * 2560, {"other", "Device allocations", "Drafter"}) != cudaSuccess ||
-            strata::core::allocate_device((void**) &rb_d_, (cap + kRows) * 80 * sizeof(float), {"other", "Device allocations", "Drafter"}) != cudaSuccess ||
-            strata::core::allocate_device((void**) &rb_pos_, (cap + kRows) * sizeof(int32_t), {"other", "Device allocations", "Drafter"}) != cudaSuccess) {
+        if (strata::core::allocate_device((void**) &rb_q_, (cap + kRows) * 2560,
+            {"drafter", "Device allocations", "Drafter"}) != cudaSuccess ||
+            strata::core::allocate_device((void**) &rb_d_, (cap + kRows) * 80 * sizeof(float),
+                {"drafter", "Device allocations", "Drafter"}) != cudaSuccess ||
+            strata::core::allocate_device((void**) &rb_pos_, (cap + kRows) * sizeof(int32_t),
+                {"drafter", "Device allocations", "Drafter"}) != cudaSuccess) {
             if (rb_q_)
                 strata::core::release_device(rb_q_);
             if (rb_d_)
@@ -1049,7 +1060,7 @@ bool Dflash2Drafter::draft_launch(const float* taps, int n_new, int64_t pos0, in
     const OnDevice on_device(device_);
     const Clock::time_point t0 = Clock::now();
     if (graph_taps_ != nullptr && graph_taps_ != taps) { err = "dflash2: the taps buffer moved after capture"; return false; }
-    if (!prof_ && !exec_[n_new]) {
+    if (!prof_ && !graphs_.find(n_new)) {
         // the staging must hold valid positions while the capture runs the (empty) kernels' parameter checks
         for (int i = 0; i < 8; ++i) h_meta_[i] = (int32_t) (pos0 + i);
         if (!capture(n_new, taps, err)) return false;
@@ -1076,7 +1087,7 @@ bool Dflash2Drafter::draft_launch(const float* taps, int n_new, int64_t pos0, in
         if (!record_context(taps, n_new, cs_, err) || !record_block(cs_, err)) return false;
         prof_collect();
     } else
-    if (cudaGraphLaunch(exec_[n_new], cs_) != cudaSuccess) { err = std::string("dflash2 draft: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+    if (cudaGraphLaunch(graphs_.find(n_new), cs_) != cudaSuccess) { err = std::string("dflash2 draft: ") + cudaGetErrorString(cudaGetLastError()); return false; }
     if (timing_) cudaEventRecord(ev_b_, cs_);
     (void) cudaStreamQuery(cs_);
     launch_t0_ = t0;

@@ -5,6 +5,10 @@ import {parseEngineVersion} from './engine-version.mjs';
 const ENGINE_DEFAULT_RESERVE_MIB=700;
 /** A card that drives no display needs little beside the engine; the engine keeps the last few hundred MiB for allocations it makes after the cache. */
 const COMPUTE_ONLY_RESERVE_MIB=512;
+/** Leaves room for the desktop and other programs beside the page-pool engines' own buffers. */
+const PAGED_DISPLAY_RESERVE_MIB=512;
+/** Matches kDefaultVramReserveMib, used when a page-pool engine's card drives no display. */
+const PAGED_ENGINE_RESERVE_MIB=256;
 
 const wholeMib=v=>v!==null&&v!==undefined&&v!==''&&Number.isFinite(Number(v))&&Number(v)>=0?Math.trunc(Number(v)):null;
 
@@ -21,18 +25,19 @@ function candidateReserve(config,values={},legacyDefaults=new Set()){
  return keyOk?key:argOk?arg:null;
 }
 
-/** What the app keeps free when the person asked for nothing: [work, performance]. A card that drives a display (or is not known to be headless) gets no
- *  less than 1536 MiB on a card of 16 GB or less, 1024 above, 2048 with pictures (the engine warns below ~1-1.5 GiB of free VRAM: the driver then pages GPU memory to
- *  system RAM and decoding falls to a few tokens a second, #2065); "work" also keeps a fifth of the card. A card the probe says drives no display keeps 512 MiB
- *  (700 with pictures) on either profile. */
+/** Gets automatic reserves in MiB for Work and Performance. Page-pool engines lend prompt buffers from their pools,
+ *  so their display floor covers other programs. Older engines also need room for buffers allocated after the cache
+ *  (#1376, #2065). Work keeps a fifth of dedicated display-card memory, capped at 1536 MiB on cards up to 16 GB. */
 export function defaultReserves(config,hardware,baselineReserve=0){
  const placement=Array.isArray(config.gpu)?config.gpu:[config.gpu??0];
  const placed=(hardware?.gpus??[]).filter(g=>placement.includes(g.index)),gpuMemory=placed.map(g=>g.vram_gb).filter(n=>Number.isFinite(n)&&n>0);
  const headless=placed.length>0&&placed.every(computeOnly);   // no display on the card (the desktop is on an integrated GPU): no desktop to keep room for
  /* Only a picture reader that runs on the GPU needs VRAM of its own: the CPU reader (vision.gpu false) took the same 2048 floor and cost a 12 GB card a quarter of its expert cache (0.2.3 tuning, notes-023-tune.md). */
  const pictures=config.vision?(typeof config.vision==='object'?Boolean(config.vision.gpu):true):false;
- const floor=headless?(pictures?ENGINE_DEFAULT_RESERVE_MIB:COMPUTE_ONLY_RESERVE_MIB):gpuMemory.length&&Math.min(...gpuMemory)>16?1024:1536;
- const safety=headless?floor:Math.max(pictures?2048:floor,baselineReserve);
+ const paged=isPagedEngine(config);
+ const floor=headless?(paged?PAGED_ENGINE_RESERVE_MIB:pictures?ENGINE_DEFAULT_RESERVE_MIB:COMPUTE_ONLY_RESERVE_MIB):
+  paged?PAGED_DISPLAY_RESERVE_MIB:gpuMemory.length&&Math.min(...gpuMemory)>16?1024:1536;
+ const safety=headless?(paged&&pictures?2048:floor):Math.max(pictures?2048:floor,baselineReserve);
  /* A card that shares the PC's memory (Strix Halo, other APUs) has no memory of its own to keep a fifth of: that fifth is RAM, and "Leave 20% for my work" already keeps it
   *  through the RAM budget. A fifth of the shared pool here held back 16 GB of expert cache for nothing (#3510); the display floor stays. */
  const shared=placed.length>0&&placed.some(g=>g.uma===true||g.unified===true);
@@ -49,6 +54,9 @@ export function reserveChoice(config,hardware,values={},baselineReserve=0){
  return {asked,defaults};
 }
 export const explicitReserve=(config,values={},hardware=null)=>reserveChoice(config,hardware,values).asked;
+
+/** Recognizes the page-pool programs named by a saved run config, for the app's reserve policy. */
+const isPagedEngine=config=>/(?:^|[\\/])strata-(?:q38|ds41)(?:\.exe)?$/i.test(String(config?.exe??''));
 
 /** True when the probe says this card drives no display: only compute runs on it. Unknown counts as a display card. */
 const computeOnly=g=>g?.drives_display===false;
