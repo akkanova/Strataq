@@ -323,6 +323,12 @@ public:
                         std::string& err) override {
         return m_.lay_out_prompt((int) card.index, get_lent_rows(chunk), device, host, err);
     }
+    bool raise_prompt_ceiling(int64_t chunk, std::string& err) override {
+        if (!m_.raise_prompt_chunk((int) chunk, err))   // (CHANGE_SETTINGS takes at most INT32_MAX)
+            return false;
+        prompt_ceiling_ = chunk;
+        return true;
+    }
     bool read_prompt(const PagedParts& parts, const std::vector<int64_t>& ids, int64_t from, int64_t n, bool drafting,
                      const PromptControl& control, int64_t& took, std::string& err) override;
     bool wait_state(std::string& err) override { return m_.wait_state(err); }
@@ -638,6 +644,7 @@ PagedDeepSeek::PagedDeepSeek(Model& m, const Options& o, const ProgramOptions& x
     facts.drafter_label = "DSpark";
     facts.kv_quantization = "FP8 sliding window, FP4 compressed KV, FP4 index";
     facts.drafter_start = "--dspark on and a --lookahead above 0";
+    facts.prompt_chunk_setting = "prefill_chunk";
     // the engine's tables are the trunk's; the drafter's experts are this model's alone (residency_ has room for them,
     // after the trunk's layers)
     blobs_ = m.get_expert_bytes();

@@ -658,6 +658,7 @@ PagedEngine::PagedEngine(PagedModel& model, PagedCards& cards, strata::core::Ram
     }
     if (!settings_.draft_rule)
         settings_.draft_rule = facts_.draft_rule;
+    settings_.prompt_chunk = model_.get_prompt_ceiling();
     apply_settings();
     if (settings_.conversation_context < 0)
         settings_.conversation_context = std::min(facts_.context, settings_.tokens_max);
@@ -1789,7 +1790,7 @@ bool PagedEngine::make_room(Held& h, int64_t tokens, std::string& err, std::opti
 }
 
 bool PagedEngine::lend_prompt_buffers(int64_t tokens, std::string& err) {
-    const int64_t ceiling = model_.get_prompt_ceiling();
+    const int64_t ceiling = settings_.prompt_chunk;
     if (ceiling <= 0)
         return true;
     if (!model_.wait_state(err))   // (a lend copies pages that the model's writes in flight may still change)
@@ -2492,6 +2493,10 @@ strata::serve::MemoryReport PagedEngine::describe_memory() const {
     report.settings.emplace_back("step_profile", settings_.step_profile ? 1 : 0);
     report.settings.emplace_back("suffix_draft", settings_.suffix_draft);
     report.settings.emplace_back("lookup_chain", settings_.lookup_chain);
+    if (const int64_t ceiling = model_.get_prompt_ceiling(); ceiling > 0)
+        report.settings.insert(report.settings.end(),
+                               {{facts_.prompt_chunk_setting, settings_.prompt_chunk},
+                                {facts_.prompt_chunk_setting + "_capacity", ceiling}});
     if (const int rank = model_.get_route_tail_skip(); rank >= 0)
         report.settings.emplace_back("route_tail_skip", rank);
     if (const float prior = model_.get_route_prior(); prior >= 0)
@@ -2590,6 +2595,8 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
             s.decode_share_percent = v;
         else if (name == "prompt_turn_ms")
             s.prompt_turn_ms = v;
+        else if (name == facts_.prompt_chunk_setting && settings_.prompt_chunk > 0)
+            s.prompt_chunk = v;
         else if (name == "rows")
             s.step.rows = (int) v;
         else if (name == "lookahead")
@@ -2631,6 +2638,10 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
         return "route_prior_pct takes 0 (off) to 10000";
     if (std::max(s.draft_confidence_pct, s.draft_cumulative_pct) > 100)
         return "the drafts' confidence cuts take 0 to 100 percent";
+    const int64_t prompt_ceiling = model_.get_prompt_ceiling();
+    const int64_t prompt_minimum = std::min(kPromptChunkStep, prompt_ceiling);
+    if (s.prompt_chunk < prompt_minimum)
+        return facts_.prompt_chunk_setting + " takes " + std::to_string(prompt_minimum) + " tokens or more";
     if (const std::string why = strata::serve::get_token_limits_error(s.conversation_context, facts_.context,
             s.tokens_min, s.tokens_max); !why.empty())
         return why;
@@ -2674,6 +2685,10 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
     settings_.conversation_idle_seconds = s.conversation_idle_seconds;
     settings_.decode_share_percent = s.decode_share_percent;
     settings_.prompt_turn_ms = s.prompt_turn_ms;
+    if (std::string why; s.prompt_chunk > prompt_ceiling &&
+                         (!model_.wait_state(why) || !model_.raise_prompt_ceiling(s.prompt_chunk, why)))
+        note("the prompt chunk: ", "it stays at most " + std::to_string(prompt_ceiling) + " tokens (" + why + ")");
+    settings_.prompt_chunk = std::min(s.prompt_chunk, model_.get_prompt_ceiling());
     settings_.save_on_shutdown = s.save_on_shutdown;
     settings_.step_profile = s.step_profile;
     settings_.vram_reserve_mib = s.vram_reserve_mib;

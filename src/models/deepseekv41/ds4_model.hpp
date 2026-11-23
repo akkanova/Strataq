@@ -353,9 +353,13 @@ public:
     /// Gets the bytes GPU `dev`'s chunked prompt path borrows on the GPU for chunks of `chunk` tokens; `host` gets
     /// those it borrows in page-locked host memory.
     uint64_t get_prompt_bytes(int dev, int chunk, uint64_t& host) const;
-    /// Lays GPU `dev`'s chunked prompt path out for chunks of `chunk` tokens (at most prompt_chunk()'s at load) in
-    /// the lent `device` and `host` memory (get_prompt_bytes'); `chunk` 0: waits until it no longer reads them.
+    /// Lays GPU `dev`'s chunked prompt path out for chunks of `chunk` tokens (at most prompt_chunk()'s at load, or
+    /// raise_prompt_chunk's) in the lent `device` and `host` memory (get_prompt_bytes'); `chunk` 0: waits until it no
+    /// longer reads them.
     bool lay_out_prompt(int dev, int chunk, uint8_t* device, uint8_t* host, std::string& err);
+    /// Lets lay_out_prompt take chunks of up to `chunk` tokens, growing the page-locked buffers the load sized for
+    /// its chunk; between prompts.  False (and `err`, the old limit kept) when they cannot grow.
+    bool raise_prompt_chunk(int chunk, std::string& err);
     /// A request starts (before its prompt): DISK_SKIP_AUTO may switch back on here, never mid-answer.
     void begin_request();
     int64_t pos() const;

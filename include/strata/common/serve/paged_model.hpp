@@ -105,6 +105,9 @@ struct PagedModelFacts {
     bool has_drafter = false;
     /// what the start needs for a drafter, for the refusal of `drafter on` without one ("--mtp and ...")
     std::string drafter_start;
+    /// Names PagedSettings::prompt_chunk in memory reports and live changes. Uses the model's start option with
+    /// underscores for dashes ("prefill" for --prefill) so saving the default writes that option.
+    std::string prompt_chunk_setting;
     /// Names the loaded prediction model for the Memory settings UI.
     std::string drafter_label = "model";
     /// Describes the formats used for token state in the shared memory report.
@@ -296,6 +299,12 @@ public:
     /// Gets the largest chunk a prompt is read in (--prefill: a ceiling), or 0 when the prompt path keeps buffers of
     /// its own.  The engine reads each prompt in the largest chunk up to it whose buffers its pools can lend then.
     virtual int64_t get_prompt_ceiling() const { return 0; }
+    /// Raises get_prompt_ceiling to `chunk`, growing the buffers of the prompt path's own that the start sized for
+    /// the old ceiling; between prompts (none lent).  False (and `err`, the ceiling kept) when they cannot grow.
+    virtual bool raise_prompt_ceiling(int64_t chunk, std::string& err) {
+        err = "this model's prompt path cannot read chunks above " + std::to_string(get_prompt_ceiling()) + " tokens";
+        return false;
+    }
     /// Gets what `card`'s prompt path borrows to read `tokens` tokens in chunks of `chunk`; nothing when such a read
     /// needs no buffers (Qwen3.8 reads a short prompt through its verify windows).
     virtual PromptBuffers get_prompt_buffers(const PagedCard&, int64_t /*chunk*/, int64_t /*tokens*/) const {

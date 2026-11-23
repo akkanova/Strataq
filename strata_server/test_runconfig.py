@@ -45,6 +45,14 @@ class Apply(unittest.TestCase):
         with self.assertRaises(ValueError):
             runconfig.check_live({"prompt_turn_ms": -1}, True)
 
+    def test_prompt_chunk_is_saved_as_its_models_flag(self):
+        new, changed = runconfig.apply_live({"args": ["--prefill", "auto"]},
+                                            runconfig.check_live({"prefill": 4096}, True))
+        self.assertEqual((new["args"], changed), (["--prefill", "4096"], ["prefill"]))
+        new, _ = runconfig.apply_live({"args": []}, runconfig.check_live({"prefill_chunk": 2048}, True),
+                                    {"prefill_chunk": 1024})
+        self.assertEqual(new["args"], ["--prefill-chunk", "2048"])
+
     def test_batch_groups_are_live_and_saved_with_0_for_auto(self):
         values = runconfig.check_live({"batch_groups": 0}, True)
         new, changed = runconfig.apply_live({"args": ["--batch-groups", "auto"]}, values)

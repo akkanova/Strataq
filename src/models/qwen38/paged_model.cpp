@@ -234,6 +234,7 @@ public:
         return alone && tokens >= 2 * chunk && conv_.sp.is_layer_major_on() ? tokens : chunk;
     }
     int64_t get_prompt_ceiling() const override { return m_.o.prefill_chunk; }
+    bool raise_prompt_ceiling(int64_t chunk, std::string& err) override;
     strata::serve::PromptBuffers get_prompt_buffers(const PagedCard& card, int64_t chunk,
                                                     int64_t tokens) const override;
     bool lay_out_prompt(const PagedCard& card, int64_t chunk, uint8_t* device, uint8_t* host,
@@ -522,6 +523,7 @@ PagedQwen::PagedQwen(Model& m, Conversation& conv, const PagedCards& cards, Mode
     facts.kv_quantization = core::qsa_kv_q4() ? "Q4_0" : core::qsa_kv_int8() ? "INT8" : "FP16";
     facts.draft_limits.confidence = (float) o.spec_min_p;
     facts.drafter_start = "--mtp and a --lookahead above 0";
+    facts.prompt_chunk_setting = "prefill";
     facts.expert_bytes = get_blob_bytes(m);
     for (size_t i = 0; i < m.profile_all.size() && (int64_t) i < o.expert_cache; ++i)
         facts.split_ranking.push_back({m.profile_all[i].first, m.profile_all[i].second});
@@ -1380,6 +1382,16 @@ strata::serve::PromptBuffers PagedQwen::get_prompt_buffers(const PagedCard& card
     if (tokens <= m_.o.short_read && image_row_ptrs_.empty())   // (read through the verify windows)
         return {};
     return get_prompt_bytes(m_, cards_[card.index], chunk, card.index + 1 < cards_.size());
+}
+
+bool PagedQwen::raise_prompt_ceiling(int64_t chunk, std::string& err) {
+    for (size_t k = 0; k < cards_.size(); ++k) {
+        const strata::core::OnDevice on(pcards_[k].dev);
+        if (!cards_[k].sp->raise_chunk_limit(chunk, err))
+            return false;
+    }
+    m_.o.prefill_chunk = chunk;
+    return true;
 }
 
 bool PagedQwen::lay_out_prompt(const PagedCard& card, int64_t chunk, uint8_t* device, uint8_t* host,

@@ -126,6 +126,14 @@ steps for `decode_share_percent` of the turn's time. 0 percent makes them wait f
 engine's `STRATA_BATCH_DECODE_SHARE` in percent. A STOP, a pending CHANGE_SETTINGS and the progress line are still
 handled after every chunk.
 
+A paged engine whose prompt path borrows its buffers from the pools reports the largest prompt chunk under its start
+option's name, `prefill` (strata-q38, `--prefill`) or `prefill_chunk` (strata-ds41, `--prefill-chunk`), and the
+largest chunk the prompt path's own buffers hold now as `prefill_capacity` or `prefill_chunk_capacity`. Each prompt is
+read in the largest chunk up to the setting whose buffers the pools can lend then. CHANGE_SETTINGS takes 256 or more
+(or the capacity when it is smaller) and applies from the next prompt. A value above the capacity grows those buffers
+(page-locked RAM and GPU memory outside the pools; DeepSeek takes at most 32,768 tokens); when they cannot grow, the
+setting becomes the capacity and the answer says why as a shortfall. A lower value frees nothing.
+
 `save_on_shutdown` (`--save-on-shutdown on|off`, default off; `INFO save_on_shutdown=0|1` at start) makes the
 engine, when its command loop ends (QUIT or the end of stdin), pause its conversations in VRAM and move those
 paused in RAM to the SSD, highest ranked first, within `ssd_pause_mib`. It keeps the files instead of deleting

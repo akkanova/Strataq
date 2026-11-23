@@ -1010,7 +1010,7 @@ struct Model::Impl {
     unsigned win_seq = 0;             // the windows the threads ran (the hand-offs' seq)
     // the chunked prompt path (threads mode): chunk tokens a pass, runs shorter than chunk_min in windows
     int chunk = 0, chunk_min = 512;
-    int prompt_ceiling = 0;           // (lends_prompt) the load's chunk, which a prompt's lend may lower for its read
+    int prompt_ceiling = 0;           // (lends_prompt) the capacity, which a prompt's lend may lower for its read
     double load_t0 = 0;   // when load() began (its messages' times)
     static constexpr bool kChunkedPromptDefault = true;   // the layer-major prompt is the default (gate: KL 0.1685 vs 0.1686, 8K prompt 6x, decode within 2% - ds4 notes-dsv41-r97)
     static constexpr int kFlowChunkMin = 2;   // chunk_min with every device's layers on the flow (see load)
@@ -3382,11 +3382,10 @@ struct Model::Impl {
 
         }
         // the host side of the CPU lane and the Engram rows
-        const int cols = (pk.eg_ngram - 1) * pk.eg_heads;
         if (!halloc(h_x, (size_t) kWin * g.dim, err) || !halloc(h_w, (size_t) kWin * kPicks, err) ||
             !halloc(h_part, (size_t) kWin * g.dim, err) || !halloc(h_idx, (size_t) kWin * kPicks, err) || !halloc(h_idx_a, (size_t) 2 * kPicks, err) ||
             !halloc(h_emb, (size_t) std::max(kWin, chunk) * g.dim, err) ||
-            !halloc(h_eg, (size_t) std::max(1, pk.eg_layers) * eg_cap * cols * (pk.eg_hd + pk.eg_hd / 32) + 64, err))
+            !halloc(h_eg, get_engram_bytes(eg_cap), err))
             return false;
         if (pk.eg_layers > 0) {
             // the Engram rows' reader: threads enough to keep an SSD's queue busy (reads from the page cache need few);
@@ -3918,6 +3917,11 @@ struct Model::Impl {
     }
     // ---- the chunked prompt path
     size_t x_cap() const { return (size_t) std::max<int>(kWin, chunk + 2); }   // a window's / chunk's new source rows
+    // the bytes h_eg takes for `tokens` tokens' Engram rows (eg_cap of them)
+    size_t get_engram_bytes(size_t tokens) const {
+        return (size_t) std::max(1, pk.eg_layers) * tokens * (size_t) ((pk.eg_ngram - 1) * pk.eg_heads) *
+               (size_t) (pk.eg_hd + pk.eg_hd / 32) + 64;
+    }
     size_t chunk_hand_bytes() const {
         return (size_t) chunk * ((size_t) g.hc * g.dim * 4 + 8 * 4 + topk_stride() * 4 + cand_stride() * 4);
     }
@@ -4085,6 +4089,60 @@ struct Model::Impl {
         if (e == cudaSuccess) return true;
         err = "the prompt path on CUDA" + std::to_string(d.id) + ": " + cudaGetErrorString(e);
         return false;
+    }
+    // (lends_prompt) raises prompt_ceiling to C rows, growing the page-locked buffers the load sized for its chunk:
+    // the embedding and Engram rows, the remote sources' staging, the groups' all-reduce sums and hand-offs.  Between
+    // prompts (no chunk laid out).  False (and `err`) when they cannot grow; the old ceiling then stays, as the
+    // buffers that did grow still hold it
+    bool raise_prompt_ceiling(int C, std::string& err) {
+        if (C > kMaxChunk) {
+            err = "the prompt path's kernels take chunks of at most " + std::to_string(kMaxChunk) + " tokens";
+            return false;
+        }
+        std::lock_guard<std::mutex> lk(warm_mu);   // (the warm-up uses the chunk's buffers)
+        try {
+            host_allocs.reserve(host_allocs.size() + 1);
+        } catch (const std::exception& e) {
+            err = std::string("the prompt path's host allocation records could not grow: ") + e.what();
+            return false;
+        }
+        chunk = C;   // (x_cap and chunk_hand_bytes size by it)
+        bool ok = regrow_host(h_emb, (size_t) std::max(kWin, C) * g.dim, false, err) &&
+                  regrow_host(h_eg, get_engram_bytes((size_t) C), false, err);
+        for (Src& sr : srcs) {
+            ok = ok && (!sr.remote || regrow_host(sr.x_stage, x_cap() * (ckv_rb() + ik_rb()), true, err));
+            ok = ok && (!sr.x_stage1 || regrow_host(sr.x_stage1, x_cap() * (ckv_rb() + ik_rb()), true, err));
+        }
+        for (Group& G : groups) {
+            const size_t stride = (size_t) C * g.dim;
+            ok = ok && (!G.arb.data || regrow_host(G.arb.data, (size_t) G.arb.nm * G.arb.slots * stride, true, err));
+            ok = ok && (!G.arb.sums || regrow_host(G.arb.sums, (size_t) G.arb.slots * stride, true, err));
+            if (ok)
+                G.arb.stride = stride;
+        }
+        for (const std::unique_ptr<Chunk>& c : chunks)
+            for (int sl = 0; sl < 2; ++sl)
+                ok = ok && (!c->hand[sl] || regrow_host(c->hand[sl], chunk_hand_bytes(), true, err));
+        if (ok) {
+            eg_cap = (size_t) C;
+            prompt_ceiling = C;
+        }
+        chunk = prompt_ceiling;
+        return ok;
+    }
+    // replaces page-locked buffer `p` (halloc's, or with `mapped` hmap's) by one of `n` elements; false (and `err`)
+    // keeping `p` when there is none to be had
+    template <class T>
+    bool regrow_host(T*& p, size_t n, bool mapped, std::string& err) {
+        T* q = nullptr;
+        if (!(mapped ? hmap(q, n, err, kPromptLabel) : halloc(q, n, err, kPromptLabel)))
+            return false;
+        if (p != nullptr) {
+            host_allocs.erase(std::find(host_allocs.begin(), host_allocs.end(), (void*) p));
+            strata::core::release_host(p);
+        }
+        p = q;
+        return true;
     }
 
     // the default chunk where every GPU will lend the prompt path its room (a GGUF's in-place experts on the flow, each
@@ -16319,6 +16377,7 @@ uint64_t Model::get_prompt_bytes(int dev, int chunk, uint64_t& host) const {
 bool Model::lay_out_prompt(int dev, int chunk, uint8_t* device, uint8_t* host, std::string& err) {
     return p_->lay_out_prompt(dev, chunk, device, host, err);
 }
+bool Model::raise_prompt_chunk(int chunk, std::string& err) { return p_->raise_prompt_ceiling(chunk, err); }
 bool Model::cancelled() const { return p_->halted; }
 void Model::begin_request() { p_->begin_request(); }
 int Model::sample(float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter) {

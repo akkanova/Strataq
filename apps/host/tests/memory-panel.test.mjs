@@ -733,6 +733,33 @@ test('decoding while a prompt is read has a share and a turn length to change', 
   assert.deepEqual(calls, [[{decode_share_percent: 0}, 'session']]);
 });
 
+for (const key of ['prefill', 'prefill_chunk']) {
+  test(`${key} controls the prompt chunk and describes its start-up capacity`, async () => {
+    const view = {...live, settings: {...live.settings, [key]: 8192, [`${key}_capacity`]: 8192}};
+    const {calls, onChange} = recorder(), {element, fire} = mount(view, onChange);
+    assert.match(element.innerHTML, new RegExp(`data-setting="${key}" value="8192" min="256"`));
+    assert.match(element.innerHTML, new RegExp(`title="--${key.replaceAll('_', '-')}: [^"]*up to 8,192 tokens`));
+    assert.ok(!element.innerHTML.includes(`${key}_capacity`));
+    fire('change', {target: control('[data-setting]', {dataset: {setting: key}, value: '4096'})});
+    apply(fire);
+    await settle();
+    assert.deepEqual(calls, [[{[key]: 4096}, 'session']]);
+  });
+
+  test(`${key} with a small start-up capacity allows unrelated changes and a larger saved default`, async () => {
+    const view = {available: true, can_change: true, config: true, memories: [],
+      settings: {[key]: 128, [`${key}_capacity`]: 128, prompt_turn_ms: 0}};
+    const {calls, onChange} = recorder(), {fire} = mount(view, onChange);
+    fire('change', {target: control('[data-setting]', {dataset: {setting: 'prompt_turn_ms'}, value: '10'})});
+    apply(fire);
+    await settle();
+    fire('change', {target: control('[data-setting]', {dataset: {setting: key}, value: '16384'})});
+    apply(fire, 'default');
+    await settle();
+    assert.deepEqual(calls, [[{prompt_turn_ms: 10}, 'session'], [{[key]: 16384, prompt_turn_ms: 0}, 'default']]);
+  });
+}
+
 test('batch groups are a control only on a layer split, with the groups running now', async () => {
   assert.doesNotMatch(mount(live, recorder().onChange).element.innerHTML, /data-setting="batch_groups"/);
   const view = {...live, settings: {...live.settings, batch_groups: 1, batch_groups_now: 1, pipeline_stages: 2}};
