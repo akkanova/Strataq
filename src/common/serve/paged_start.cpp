@@ -511,6 +511,13 @@ bool open_ram_pool(const std::string& program, const PagedSettings& s, strata::c
                      ? "copied back to RAM when a prompt's buffers evict it, else dropped"
                      : "dropped",
                  back, ssd, s.copy_back.c_str());
+    if (!ram.get_shortfall().empty())   // (engine_client.narrate_start shows this line in the server's window)
+        std::fprintf(stderr, "%s: WARNING: the RAM's page pool got %.2f GiB of the %.2f GiB asked for (%s). The "
+                             "experts it cannot hold are read from the SSD, which is slower. Close other programs, "
+                             "or ask for less RAM (--ram-mib)\n",
+                     program.c_str(), (double) ram.pages().pool().report().total.bytes / 1073741824.0,
+                     (double) (bytes - std::min(bytes, ram.ring_bytes())) / 1073741824.0,
+                     ram.get_shortfall().c_str());
     return true;
 }
 

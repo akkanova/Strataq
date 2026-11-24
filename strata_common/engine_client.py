@@ -596,7 +596,8 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
 
     say("weights", "[strata] starting the engine: reading the model's weights ...")
     pos = offset
-    while not done.wait(0.5):
+    while True:
+        finished = done.wait(0.5)
         try:
             with open(log_path, "rb") as f:
                 f.seek(pos)
@@ -623,9 +624,32 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
                     say("cache", f"[strata] filling the GPU's expert cache ({n}) ...")
                 elif "session is up" in line:
                     say("up", "[strata] almost ready ...")
+                elif ": WARNING: the RAM's page pool got " in line:
+                    say("ram short", paint_warning("[strata] WARNING: " + line.split(": WARNING: ", 1)[1]))
+        if finished:
+            return
         if time.time() - last > heartbeat:
             last = time.time()
             print(f"[strata] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
+
+
+def paint_warning(text: str) -> str:
+    """Formats startup warnings in bright yellow for consoles, leaving piped output plain."""
+    if not sys.stdout.isatty() or "NO_COLOR" in os.environ:
+        return text
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.windll.kernel32
+        k32.GetStdHandle.argtypes = [wintypes.DWORD]
+        k32.GetStdHandle.restype = wintypes.HANDLE
+        k32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        k32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        handle, mode = k32.GetStdHandle(-11), wintypes.DWORD()             # STD_OUTPUT_HANDLE
+        if not (k32.GetConsoleMode(handle, ctypes.byref(mode)) and
+                k32.SetConsoleMode(handle, mode.value | 4)):                  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            return text
+    return f"\033[93m{text}\033[0m"
 
 
 _BTRACE = bool(os.environ.get("STRATA_BATCH_TRACE"))

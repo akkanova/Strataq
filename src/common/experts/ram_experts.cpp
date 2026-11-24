@@ -56,14 +56,15 @@ bool RamExperts::open(ExpertSource& files, uint64_t bytes, int ring, const State
         std::memcpy(to, from, (size_t) n);
         return true;
     };
-    // every expert may come in (the pool's room decides how many)
+    // Open the mandatory chunk first so that a later allocation failure leaves a usable pool.
     if (ring_ == nullptr || pool == 0 ||
-        !pages_.open(std::move(memory), pool, layout, config, blob_bytes, n_expert, (int64_t) first_page_.size(),
-                     ranking, {}, err)) {
-        err = "the RAM's page pool: no room for " + std::to_string(bytes >> 20) + " MiB" +
-              (err.empty() ? "" : " (" + err + ")");
+        !pages_.open(std::move(memory), config.chunk_bytes, layout, config, blob_bytes, n_expert,
+                     (int64_t) first_page_.size(), ranking, {}, err)) {
+        err = "the RAM's page pool: no room for even " + std::to_string((ring_bytes() + config.chunk_bytes) >> 20) +
+              " MiB" + (err.empty() ? "" : " (" + err + ")");
         return false;
     }
+    shortfall_ = pages_.resize(pool).refusal;
     ExpertPages::Hooks hooks;
     hooks.load = [this](const ExpertKey* keys, const int32_t* firsts, size_t n, std::string& e) {
         if (copy_from_ != nullptr) {   // (keep_copy's one expert)
