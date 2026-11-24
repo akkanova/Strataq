@@ -499,11 +499,12 @@ bool open_ram_pool(const std::string& program, const PagedSettings& s, strata::c
     }
     copy_back_gain = strata::core::get_copy_back_gain(back, ssd);
     const double gain = get_copy_back_gain_for(s.copy_back, copy_back_gain);
-    std::fprintf(stderr, "%s: the RAM's page pool: %.2f GiB%s, opened in %.1f s; it takes experts while the engine "
-                         "serves, and an expert it does not hold is read from the SSD %s.  An expert the GPU evicts "
-                         "is %s (copying it back: %.1f GB/s, reading the SSD: %.1f GB/s; --copy-back %s)\n",
+    std::fprintf(stderr, "%s: the RAM's page pool: %.2f GiB%s, opened in %.1f s, grows towards %.2f GiB when the "
+                         "engine starts serving; it takes experts while the engine serves, and an expert it does not "
+                         "hold is read from the SSD %s.  An expert the GPU evicts is %s (copying it back: %.1f GB/s, "
+                         "reading the SSD: %.1f GB/s; --copy-back %s)\n",
                  program.c_str(), (double) (ram.pages().pool().report().total.bytes) / 1073741824.0,
-                 ram.is_page_locked() ? ", page-locked" : "", open_s,
+                 ram.is_page_locked() ? ", page-locked" : "", open_s, (double) bytes / 1073741824.0,
                  files.is_direct() ? "without the file cache"
                                    : "THROUGH the file cache (the files cannot be read unbuffered here)",
                  strata::core::is_copy_back_worth(gain, false) ? "copied back to RAM"
@@ -511,13 +512,6 @@ bool open_ram_pool(const std::string& program, const PagedSettings& s, strata::c
                      ? "copied back to RAM when a prompt's buffers evict it, else dropped"
                      : "dropped",
                  back, ssd, s.copy_back.c_str());
-    if (!ram.get_shortfall().empty())   // (engine_client.narrate_start shows this line in the server's window)
-        std::fprintf(stderr, "%s: WARNING: the RAM's page pool got %.2f GiB of the %.2f GiB asked for (%s). The "
-                             "experts it cannot hold are read from the SSD, which is slower. Close other programs, "
-                             "or ask for less RAM (--ram-mib)\n",
-                     program.c_str(), (double) ram.pages().pool().report().total.bytes / 1073741824.0,
-                     (double) (bytes - std::min(bytes, ram.ring_bytes())) / 1073741824.0,
-                     ram.get_shortfall().c_str());
     return true;
 }
 

@@ -257,7 +257,8 @@ std::vector<strata::core::ExpertKey> get_ram_ranking(const std::vector<strata::c
 /// here, whatever --copy-back says).  The pool takes --ram-mib, by default
 /// get_ram_room(`headroom`) but no more than every expert and its staging ring of `ring` buffers take; its
 /// conversations are `layout`'s, its pages `card`'s (get_ram_pool_config), its chunks at least the `prompt_bytes`
-/// the model's prompt paths borrow from it at most (PagedModel::get_prompt_buffers).  It opens
+/// the model's prompt paths borrow from it at most (PagedModel::get_prompt_buffers).  It opens with one chunk, and
+/// serve_paged_model grows it to the rest after the model's own memory is taken.  It opens
 /// empty: the engine's start-up fill brings in the experts in get_ram_ranking's order as far as they fit.  Says on
 /// stderr after `program` what it took.
 bool open_ram_pool(const std::string& program, const PagedSettings& s, strata::core::ExpertFiles& files,

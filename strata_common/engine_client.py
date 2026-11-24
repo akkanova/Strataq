@@ -624,8 +624,8 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
                     say("cache", f"[strata] filling the GPU's expert cache ({n}) ...")
                 elif "session is up" in line:
                     say("up", "[strata] almost ready ...")
-                elif ": WARNING: the RAM's page pool got " in line:
-                    say("ram short", paint_warning("[strata] WARNING: " + line.split(": WARNING: ", 1)[1]))
+                elif ": WARNING: " in line:                     # e.g. a smaller RAM pool, or the drafter left off
+                    say(line, paint_warning("[strata] WARNING: " + line.split(": WARNING: ", 1)[1]))
         if finished:
             return
         if time.time() - last > heartbeat:

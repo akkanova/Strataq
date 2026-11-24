@@ -36,9 +36,9 @@ public:
     /// Makes the pool in `bytes` of page-locked RAM, less a staging ring of `ring` buffers of the largest expert (as
     /// many as the experts a step's layer may read from the SSD), with the conversations' `layout` and `config`'s
     /// limits; `config.page_bytes` is the GPU pool's, so that a conversation's blocks are alike in both, and the pool
-    /// takes its memory in chunks of `config.chunk_bytes` (at most the pool).  When the memory has room for fewer
-    /// chunks, the pool keeps those it got (get_shortfall says why); it fails only without room for the ring and one
-    /// chunk.  The pool opens empty; `refill` brings in the experts of `ranking` in order, as far as they fit.  The
+    /// takes its memory in chunks of `config.chunk_bytes` (at most the pool).  It takes only the ring and one chunk
+    /// now, the least the engine runs with; `resize` grows it to get_asked_bytes once the engine's other memory is
+    /// taken.  The pool opens empty; `refill` brings in the experts of `ranking` in order, as far as they fit.  The
     /// experts of layer l are `blob_bytes[l]` bytes, `n_expert` per layer.  `files` reads the experts from the SSD and
     /// must outlive this object.
     bool open(ExpertSource& files, uint64_t bytes, int ring, const StateLayout& layout, PagePoolConfig config,
@@ -80,8 +80,8 @@ public:
     const ExpertPages& pages() const { return pages_; }
     /// Tells whether the pool's memory is page-locked, which the GPU reads in place (device_alias).
     bool is_page_locked() const { return page_locked_; }
-    /// Gets why `open` took fewer chunks than it was asked for (empty: it took them all).
-    const std::string& get_shortfall() const { return shortfall_; }
+    /// Gets the bytes of the pool and the staging ring that `open` was asked for, which it took only one chunk of.
+    uint64_t get_asked_bytes() const { return asked_bytes_; }
     /// Gets the bytes of the staging ring (outside the pool).
     uint64_t ring_bytes() const { return ring_slots_ * slot_bytes_; }
     /// Times reading a staging ring's worth of experts (one of every layer in turn) from the SSD, in GB/s; each
@@ -131,8 +131,7 @@ private:
     ExpertSource* files_ = nullptr;
     /// The memory is page-locked (the GPU reads it in place), else pageable: decided by the first allocation.
     bool page_locked_ = true;
-    /// Explains an incomplete initial allocation; empty when all requested chunks fit.
-    std::string shortfall_;
+    uint64_t asked_bytes_ = 0;   ///< get_asked_bytes
     std::map<const uint8_t*, uint8_t*> views_;   ///< each page-locked allocation's start -> its address on the GPU
     ExpertPages pages_;   ///< (after views_: destroying the pool gives its chunks back through them)
     std::vector<uint64_t> blob_bytes_;

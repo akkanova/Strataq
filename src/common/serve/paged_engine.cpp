@@ -57,6 +57,10 @@ using Clock = std::chrono::steady_clock;
 /// The free bytes beyond the pages kept for --tokens-min above which a card's pool makes the adaptive tier run a round
 /// every decode step instead of every --adapt-every steps: experts the conversations use then come in sooner.
 constexpr uint64_t kEveryStepFreeBytes = 1ull << 30;
+/// The RAM (and Windows commit room) that the RAM's pool leaves free when it grows, for the engine's later
+/// allocations and for other programs.  A guess, not a measurement: a start that left 0.8 GiB of the commit limit
+/// served, and one that left 0.1 GiB failed on its next allocation.
+constexpr uint64_t kRamReserveBytes = 1ull << 30;
 
 template <class F>
 auto time_step_if(bool enabled, double& elapsed, F&& operation) -> decltype(operation());
@@ -196,6 +200,10 @@ private:
     /// Takes or gives back chunks of the RAM's pool so that it (and the staging ring) hold `bytes`: the conversations
     /// paused in the chunks it gives back move to the SSD.  Gets why not, or an empty string.
     std::string resize_ram(uint64_t bytes);
+    /// Grows the RAM's pool from the one chunk it opened with (RamExperts::open) towards RamExperts::get_asked_bytes,
+    /// as far as get_largest_ram allows, and warns when it gets less.  It comes last in the start because the model's
+    /// own memory, even a GPU's on an integrated GPU under Windows, counts against the same commit limit.
+    void grow_ram();
     void report_resize(const char* name, const strata::core::PagePoolReport& before,
                        const strata::core::PagePoolReport& after, Clock::time_point t0) const;
     /// Runs the layer split's planner on the cards' pool sizes (their memory settings), for the conversations that
@@ -237,7 +245,8 @@ private:
     /// Gets what `card`'s pool leaves free on its GPU: `reserve_mib` (PagedSettings::vram_reserve_mib) and what the
     /// model keeps there (PagedModel::get_gpu_keep).
     uint64_t get_gpu_keep(const PagedCard& card, int64_t reserve_mib) const;
-    /// Gets the least and the most the RAM's pool and its staging ring may hold now.
+    /// Gets the least and the most the RAM's pool and its staging ring may hold now; the most leaves
+    /// kRamReserveBytes free.
     uint64_t get_smallest_ram() const;
     uint64_t get_largest_ram() const;
     /// Validates RUN, then queues it or admits a queued request at a model boundary.
@@ -715,6 +724,7 @@ bool PagedEngine::init() {
         say("%s\n", why.c_str());
         return false;
     }
+    grow_ram();
     if (cards_.size() < 2 || settings_.remote_experts == "off")
         return true;
     std::vector<int> devices;
@@ -2811,6 +2821,20 @@ std::string PagedEngine::resize_ram(uint64_t bytes) {
     return {};
 }
 
+void PagedEngine::grow_ram() {
+    const uint64_t asked = ram_.get_asked_bytes(), largest = get_largest_ram();
+    std::string why = resize_ram(std::min(asked, largest));
+    const uint64_t got = ram_.pages().pool().report().total.bytes + ram_.ring_bytes();
+    if (got + ram_.pages().pool().chunk_bytes() > asked)   // (a size in MiB is seldom whole chunks)
+        return;
+    if (why.empty())
+        why = "it leaves " + std::to_string(kRamReserveBytes >> 20) + " MiB of the RAM and of Windows' commit limit "
+              "free";
+    say("WARNING: the RAM's page pool got %.2f GiB of the %.2f GiB asked for (%s). The experts it cannot hold are "
+        "read from the SSD, which is slower. Close other programs, or ask for less RAM (--ram-mib)\n",
+        (double) got / 1073741824.0, (double) asked / 1073741824.0, why.c_str());
+}
+
 /// Says on stderr how the pool of memory `name` changed, from `before` to `after`, in the time since `t0`.
 void PagedEngine::report_resize(const char* name, const strata::core::PagePoolReport& before,
                                 const strata::core::PagePoolReport& after, Clock::time_point t0) const {
@@ -3157,7 +3181,8 @@ uint64_t PagedEngine::get_smallest_ram() const {
 uint64_t PagedEngine::get_largest_ram() const {
     const strata::core::PagePool& pool = ram_.pages().pool();
     const uint64_t chunk = pool.chunk_bytes();
-    return (pool.report().total.bytes + get_ram_room(0)) / chunk * chunk + ram_.ring_bytes();
+    const uint64_t room = get_ram_room(0);   // (its headroom would leave the commit room whole)
+    return (pool.report().total.bytes + room - std::min(room, kRamReserveBytes)) / chunk * chunk + ram_.ring_bytes();
 }
 
 strata::spec::StepModel PagedEngine::get_step_model() {

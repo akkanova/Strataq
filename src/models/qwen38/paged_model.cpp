@@ -479,16 +479,19 @@ int run_paged_engine(int argc, char** argv) {
     SplitDrive split;
     // Live grouping needs up to kVerifyMaxT groups, each starting at group * kVerifyMaxT in the hand-offs.
     const int handoff_rows = strata::kernels::kVerifyMaxT * strata::kernels::kVerifyMaxT;
-    if (!init_card_paths(m, conv, cards, model_cards, split, handoff_rows, err) ||
-        (drafting && !drafter.init(m, slots, err))) {
+    if (!init_card_paths(m, conv, cards, model_cards, split, handoff_rows, err)) {
         std::fprintf(stderr, "strata-q38: %s\n", err.c_str());
         return 1;
+    }
+    if (drafting && !drafter.init(m, slots, err)) {   // (optional: the engine serves without it, as when it is off)
+        std::fprintf(stderr, "strata-q38: WARNING: the drafter is off: %s\n", err.c_str());
+        settings.drafter = false;
     }
     // Proposals and changing group membership create many layouts; keep only recent captured graphs.
     if (drafting || model_cards.size() > 1)
         for (const ModelCard& mc : model_cards)
             mc.ver->set_batch_graph_limit(kWindowGraphs);
-    if (drafting && !settings.drafter)   // loaded for the pool's layout of the drafter's K/V, switched on later
+    if (drafting && !settings.drafter)   // loaded for the pool's layout of the drafter's K/V; may be switched on later
         m.unload_drafter();
     PagedQwen model(m, conv, cards, model_cards, split, ram, files, drafting ? &drafter : nullptr, slots,
                     window_rows.total);

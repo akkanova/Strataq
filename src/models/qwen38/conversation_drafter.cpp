@@ -22,6 +22,7 @@ bool ConversationDrafter::init(Model& m, int sessions, std::string& err) {
     mtp_ = &m.mtp;
     row_floats_ = (uint64_t) m.g.hc * (uint64_t) m.g.n_embd;
     const int max_t = max_rows_ = mtp_->max_t();
+    last_.assign((size_t) sessions, Last{});
     const GpuStage* st = m.get_drafter_stage();
     const strata::core::OnDevice on(device_ = mtp_->device());
     if (rows_ == nullptr && strata::core::allocate_device((void**) &rows_, (size_t) max_t * row_floats_ * sizeof(float),
@@ -32,7 +33,6 @@ bool ConversationDrafter::init(Model& m, int sessions, std::string& err) {
     }
     drafts_.resize((size_t) max_t);
     probs_.resize((size_t) max_t);
-    last_.assign((size_t) sessions, Last{});
     return mtp_->bind(st != nullptr ? st->wt : m.wt, st != nullptr ? &st->head : &m.native_head, rows_, err);
 }
 
@@ -47,6 +47,8 @@ bool ConversationDrafter::read_prompt(strata::prefill::Prefill* sp, const Conver
 }
 
 bool ConversationDrafter::reserve_snapshots(const float* residuals, std::string& err) {
+    if (mtp_->stream() == nullptr)
+        return true;
     const strata::core::OnDevice on(device_);
     if (saved_rows_ == nullptr && strata::core::allocate_device((void**) &saved_rows_,
         last_.size() * (size_t) max_rows_ * row_floats_ * sizeof(float), {"drafter", "Device allocations",
