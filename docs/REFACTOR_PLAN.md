@@ -75,14 +75,14 @@ written to the checkout. From Git Bash:
 
 ```sh
 # CUDA: every target, both NVIDIA code families (sm_75, sm_120) and the test machine's sm_86, the DeepSeek engine
-MSYS_NO_PATHCONV=1 docker run --rm -v "C:/AI-models/Strata:/work/Strata" -v strata-cuda-build:/build strata-cuda-dev bash -c '
+MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/work/Strata" -v strata-cuda-build:/build strata-cuda-dev bash -c '
   cd /work/Strata && ( [ -f /build/build.ninja ] || cmake -G Ninja -S . -B /build -DCMAKE_BUILD_TYPE=Release \
     -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_DSV41=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON \
     -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_MMQ_KQUANTS=ON "-DCMAKE_CUDA_ARCHITECTURES=75-real;86-real;120-real;120-virtual" \
     -DSTRATA_GGML_DIR=/work/Strata/third_party/llama.cpp ) && cmake --build /build -j 32 && cmake --build /build --target strata_kq'
 
 # SYCL: the engine, JIT (no Intel card needed to compile)
-MSYS_NO_PATHCONV=1 docker run --rm -v "C:/AI-models/Strata:/work/Strata" -v strata-sycl-build:/build \
+MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/work/Strata" -v strata-sycl-build:/build \
   -e REPO=/work/Strata -e BUILD_DIR=/build strata-sycl-dev "cd /work/Strata && bash sycl/tools/build.sh strata"
 ```
 
@@ -255,7 +255,7 @@ Windows loads the driver's `System32mdhip64_7.dll` before anything on `PATH`, s
 into a folder together with `engine\*.dll` (as `engine\strata.exe` is installed) and run it there. End-to-end checks
 use a copy of the run config with `"exe"` pointing at the engine under test and the server on another port (8091), with
 alternating runs of the two builds. Models on this PC: Qwen3.8 IQ3_S (`strata-iq3_s.json`) and Qwen3.6 UD-Q4_K_XL
-(`C:\AI-models\Strata-data\models\qwen36-UD-Q4_K_XL`); DeepSeek V4.1 IST-DAS 2.00 bpw (`C:\AI-models\DeepSeek-V4.1-Flash`, run config `strata-deepseek-v4.1-flash-ist-das-2.00bpw.json`; build `strata-dsv41` with `STRATA_BUILD_DSV41=ON`).
+(`../Strata-data/models/qwen36-UD-Q4_K_XL`); DeepSeek V4.1 IST-DAS 2.00 bpw (`../DeepSeek-V4.1-Flash`, run config `strata-deepseek-v4.1-flash-ist-das-2.00bpw.json`; build `strata-dsv41` with `STRATA_BUILD_DSV41=ON`).
 
 ## Results
 

@@ -4,12 +4,13 @@ Everything is fp32 on the CPU. The target's embedding table and LM head are the 
 Q6_K head), the context features are the hidden states dumped by the engine's STRATA_TAP_FILE hook.
 """
 import json, struct, sys
+from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
-sys.path.insert(0, r"C:\Users\AI-Server\Desktop\Strata\Public\Engine\third_party\llama.cpp\gguf-py")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "third_party" / "llama.cpp" / "gguf-py"))
 import gguf
 from gguf.quants import dequantize
 
