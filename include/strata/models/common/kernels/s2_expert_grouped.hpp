@@ -119,11 +119,25 @@ inline void moe_grouped_s2_window(const unsigned long long* grp_ptr, const int32
     moe_grouped_s2(grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_0, x_scales, scratch, out, stream);
 #endif
 }
+/// The MTP draft layer's experts in strata-q38's page pool, for `moe_group_resident`: where each is, and what a draft
+/// step does with a routed expert that is not in VRAM.  One token per call (n = k_per_tok).
+struct PoolGroupArgs {
+    const int32_t* res = nullptr;   ///< device: per expert, its first page (base + page * blob), or < 0 when absent
+    /// mapped host: [0] the routing rank from which an absent expert is left out (0: none is), [1] the steps grouped
+    /// since the host zeroed it, [2] the first of them that lacked an expert it could not leave out (the host sets it
+    /// past every step), [3] how many steps `routed` holds
+    int32_t* chain = nullptr;
+    int32_t* routed = nullptr;      ///< mapped host: each step's routed ids, for the pool's record of their use
+    float* weights = nullptr;       ///< the routing weights: a left-out expert's becomes 0
+    float* parts = nullptr;         ///< the experts' output rows (n_embd floats each): a left-out expert's becomes 0
+    int64_t n_embd = 0;
+};
 /// Plan v0.3 P6: the groups for `moe_grouped_s2` when every expert id is resident at base + id * blob (the MTP
 /// layer's 512 experts): counts[0] groups, counts[1] entries; entry dst = routing index, tok = index / k_per_tok.
+/// With `pool`, an expert is at base + res[id] * blob instead, and an absent one has no group.
 void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t* base, int64_t blob,
                         unsigned long long* grp_ptr, int32_t* grp_start, int32_t* counts, int32_t* ent_dst,
-                        int32_t* ent_tok, void* stream);
+                        int32_t* ent_tok, void* stream, const PoolGroupArgs* pool = nullptr);
 void moe_hit_select_multi(const int32_t* ids, const int32_t* res_row, int n, int n_expert, int32_t* slot, int32_t* dst,
                           int32_t* count, void* stream);
 void moe_hit_grouped_s2_multi(const uint8_t* blob_base, const int32_t* slot_index, const int32_t* dst_index,

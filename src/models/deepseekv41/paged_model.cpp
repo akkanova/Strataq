@@ -1162,22 +1162,8 @@ bool PagedDeepSeek::switch_drafter(bool on, std::string& err) {
     drafting_ = on;
     for (PagedCard* card : cards_) {
         const auto ranking = get_pool_ranking(card->lb, card->le);
-        int64_t most = (int64_t) ranking.size();
-        if (on) {
-            const auto report = card->experts.pool().report();
-            uint64_t room = report.experts.bytes + report.free.bytes;
-            int64_t fit = 0;
-            for (const strata::core::ExpertKey& key : ranking) {
-                const uint64_t page = card->experts.pool().page_bytes();
-                const uint64_t bytes = (blobs_[(size_t) key.layer] + page - 1) / page * page;
-                if (bytes > room)
-                    break;
-                room -= bytes;
-                ++fit;
-            }
-            most = std::min(most, fit);
-        }
-        card->experts.set_ranking(ranking, most);
+        const int64_t most = (int64_t) ranking.size();
+        card->experts.set_ranking(ranking, on ? std::min(most, card->experts.count_fitting(ranking)) : most);
         if (!publish_residency(*card, err))
             return false;
     }
@@ -1314,10 +1300,7 @@ bool open_card_pool(const Model& m, const PagedSettings& s, const strata::core::
         card, s, layout, m.max_context(),
         strata::core::choose_expert_page_bytes({blobs.begin(), blobs.begin() + m.geometry().nl}), blobs, ranking,
         max_experts, keep);
-    plan.config.label_expert = [layers = m.geometry().nl](strata::core::ExpertKey key, uint64_t bytes) {
-        return strata::core::MemoryLabel{"experts", "", (key.layer >= layers ? "Drafter / " : "") +
-            strata::core::get_expert_memory_label(key.layer, bytes)};
-    };
+    plan.config.label_expert = strata::serve::get_expert_labels(m.geometry().nl);
     const strata::core::OnDevice on(card.dev);
     if (!card.experts.open(strata::serve::get_gpu_chunk_memory(card.dev, plan.config.chunk_bytes), plan.bytes,
                            layout, plan.config, blobs, m.geometry().n_exp, max_experts, ranking, {false, keep}, err))

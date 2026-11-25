@@ -248,6 +248,13 @@ PagedCard& add_paged_card(PagedCards& cards, int dev, int64_t lb, int64_t le, co
     return card;
 }
 
+std::function<strata::core::MemoryLabel(strata::core::ExpertKey, uint64_t)> get_expert_labels(int64_t n_layers) {
+    return [n_layers](strata::core::ExpertKey key, uint64_t bytes) {
+        return strata::core::MemoryLabel{"experts", "", (key.layer >= n_layers ? "Drafter / " : "") +
+            strata::core::get_expert_memory_label(key.layer, bytes)};
+    };
+}
+
 CardPoolPlan plan_card_pool(const PagedCard& card, const PagedSettings& s, const strata::core::StateLayout& layout,
                             int64_t max_context, uint64_t page_bytes, const std::vector<uint64_t>& blob_bytes,
                             const std::vector<strata::core::ExpertKey>& ranking, int64_t max_experts, uint64_t keep) {

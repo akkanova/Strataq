@@ -2317,6 +2317,18 @@ Recent trunk taps stay in each conversation's fixed pool region, beside the DSpa
 pauses and checkpoints, so the engine can rebuild the rings after loading the tensors again. This adds
 7,864,320 bytes per conversation for the tested pack, plus the checkpoint copies in RAM.
 
+In `strata-q38`, the MTP draft layer's 512 experts (1.32 MiB each, 675 MiB in all) live in the last card's page
+pool, ranked before the card's own experts, and the Memory panel lists them as "Drafter / Layer 48". Only the draft
+layer's dense weights (about 130 MiB) are an allocation of their own, traded against pool chunks like DeepSeek's.
+Switching the drafter on pushes the card's least ranked experts out to make room, and its experts load between
+steps; switching it off gives their pages back. A guess whose step routes to a draft expert that is not in VRAM
+leaves it out when `--route-tail-skip` would leave out such an expert of the model itself; otherwise the guesses end
+before that step. `--route-prior-pct` also makes the draft layer prefer its experts in VRAM. Neither changes the
+answers: every guess is still checked. A draft layer that does not load at start is switched off with a warning.
+Measured on Strix Halo (Radeon 8060S, Windows, HIP), the IQ3_S pack, one greedy request of 160 tokens, twice each:
+123 of 169 to 170 guesses accepted with the experts in the pool, 3.9 to 4.3 s of decode against 6.3 to 6.8 s with
+the drafter off; switching it on again loaded its experts in 2.1 s.
+
 Measured on Windows HIP, Strix Halo (Radeon 8060S), the IQ2_XXS pack copy, context 8192,
 `--gpu-mib 10240 --ram-mib 512 --expert-cache 480 --no-expert-cache --adapt-swaps 0`,
 `--dspark-conf 0.65`, and `DS4_COMMIT_CAP_GB=18`: switching off released 752,205,056 dense bytes;

@@ -88,6 +88,10 @@ public:
     /// `refill` brings in the others.  strata-q38 gives a layer split's card its new layers' experts when the cut
     /// moves.
     void set_ranking(const std::vector<ExpertKey>& ranking, int64_t max_experts);
+    /// Counts the leading experts of `ranking` that the pages of the pool's experts and its free pages hold, the most
+    /// a set_ranking may keep without waiting for a conversation to give pages back.  The paged models cap a drafter's
+    /// switch-on with it, so that the drafter's experts push out the card's least ranked ones.
+    int64_t count_fitting(const std::vector<ExpertKey>& ranking) const;
     /// Gets the experts in rank order, hottest first: set_ranking's, then those admit took from outside it.
     const std::vector<ExpertKey>& get_ranking() const { return ranked_; }
     /// Lends a run at the top of the pool for a prompt's buffers (PagePool::lend): `bytes` in whole pages, leaving no

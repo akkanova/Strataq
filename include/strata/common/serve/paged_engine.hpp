@@ -54,6 +54,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -192,6 +193,9 @@ struct CardPoolPlan {
 CardPoolPlan plan_card_pool(const PagedCard& card, const PagedSettings& s, const strata::core::StateLayout& layout,
                             int64_t max_context, uint64_t page_bytes, const std::vector<uint64_t>& blob_bytes,
                             const std::vector<strata::core::ExpertKey>& ranking, int64_t max_experts, uint64_t keep);
+/// Gets the memory report's names of a pool's experts (PagePoolConfig::label_expert) for a model of `n_layers` layers,
+/// whose drafter's experts, kept as the layers from `n_layers` on, are named as the drafter's.
+std::function<strata::core::MemoryLabel(strata::core::ExpertKey, uint64_t)> get_expert_labels(int64_t n_layers);
 /// Plans and reports DeepSeek's initial cuts using PagedEngine's planner, one tokens_min conversation, and experts
 /// in hottest-first ranked_layers order. Repeated GPUs share free memory unless --gpu-mib sets each stage's pool.
 /// Returns no cuts if planning fails.

@@ -689,10 +689,11 @@ PagedEngine::PagedEngine(PagedModel& model, PagedCards& cards, strata::core::Ram
         hooks.load = [this, &c = card](const strata::core::ExpertKey* keys, const int32_t* slots, size_t n,
                                        std::string& err) { return load_experts(c, keys, slots, n, err); };
         // an expert of another card's layers goes to the card's `lent`, not to the residency table its layer's card
-        // reads; an evicted one leaves whichever holds it
+        // reads; an evicted one leaves whichever holds it.  A drafter's expert (a layer from n_layers on) is its card's.
         hooks.moved = [this, &c = card](strata::core::ExpertKey key, int32_t slot) {
             const size_t i = (size_t) key.layer * (size_t) facts_.n_expert + (size_t) key.expert;
-            const bool own = c.lent.empty() || (slot >= 0 ? key.layer >= c.lb && key.layer < c.le : c.lent[i] < 0);
+            const bool own = c.lent.empty() || key.layer >= facts_.n_layers ||
+                             (slot >= 0 ? key.layer >= c.lb && key.layer < c.le : c.lent[i] < 0);
             (own ? model_.get_residency()[i] : c.lent[i]) = slot;
             residency_changed_ = residency_changed_ || own;
         };
@@ -3059,15 +3060,17 @@ void PagedEngine::place_card_experts(bool lend) {
     for (PagedCard& card : cards_) {
         int64_t max_experts = facts_.gpu_experts;
         std::vector<ExpertKey> ranking = model_.get_card_ranking(card.lb, card.le, max_experts);
-        if (!placed.card.empty()) {   // those placed on it, hottest first, then the rest of its layers'
+        if (!placed.card.empty()) {   // a drafter's experts, those placed on it, hottest first, then the rest of its layers'
             const auto is_on_card = [&](const ExpertKey& k) {
-                return placed.card[(size_t) (k.layer * n_expert + k.expert)] == (int32_t) card.index;
+                return k.layer >= n_layers || placed.card[(size_t) (k.layer * n_expert + k.expert)] == (int32_t) card.index;
             };
             std::vector<ExpertKey> held;
+            std::copy_if(ranking.begin(), ranking.end(), std::back_inserter(held),
+                         [&](const ExpertKey& k) { return k.layer >= n_layers; });
             std::copy_if(first.begin(), first.end(), std::back_inserter(held), is_on_card);
             max_experts = (int64_t) held.size();
             const int64_t others = std::count_if(held.begin(), held.end(), [&](const ExpertKey& k) {
-                return k.layer < card.lb || k.layer >= card.le;
+                return k.layer < card.lb || (k.layer >= card.le && k.layer < n_layers);
             });
             std::remove_copy_if(ranking.begin(), ranking.end(), std::back_inserter(held), is_on_card);
             ranking = std::move(held);
@@ -3168,6 +3171,8 @@ bool PagedEngine::switch_drafter(bool on, std::string& err) {
     }
     for (const std::unique_ptr<Held>& h : held_)
         model_.forget_drafts(h->session);
+    if (!filling_since_ && is_fill_wanted())   // the drafter's experts, which the model ranked again, come in between steps
+        filling_since_ = Clock::now();
     settings_.drafter = true;
     say("the drafter is on\n");
     return true;

@@ -2871,8 +2871,15 @@ int Model::load() {
         // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned,
         // so it always sees the canonical geometry; `static` because MtpDrafter keeps a reference
         if (!o.mtp.empty() && !load_drafter(err)) {
-            std::fprintf(stderr, "strata generate: %s%s%s\n", err.c_str(), vram_free_note().c_str(), vram_batch_hint(err, o.batch).c_str());
-            return 1;
+            if (!is_paged()) {
+                std::fprintf(stderr, "strata generate: %s%s%s\n", err.c_str(), vram_free_note().c_str(), vram_batch_hint(err, o.batch).c_str());
+                return 1;
+            }
+            // (strata-q38: the drafter is optional; without --mtp from here on, nothing makes room for it)
+            std::fprintf(stderr, "strata-q38: WARNING: the drafter is off and cannot be switched on: %s%s\n",
+                         err.c_str(), vram_free_note().c_str());
+            unload_drafter();
+            o.mtp.clear();
         }
         // the batch slots' drafters below go on the drafter's GPU too
         const strata::core::OnDevice on_mtp(get_drafter_stage() != nullptr ? get_drafter_stage()->dev : -1);
@@ -4842,7 +4849,9 @@ int Model::build_hit_tables(bool dumping_layers) {
     // device and the token graph keeps it.  (A cache filled on demand still needs the per-layer host path.)
     graph_hits = hit_fn != nullptr && !profile.empty() && !o.no_pool;
     if (graph_hits && !o.no_capture && !o.no_token_graph && !dumping_layers && half_dump == nullptr) {
-        host_res.assign((size_t) (g.n_layers * g.n_expert), strata::core::kNotResident);
+        // (strata-q38 keeps its MTP drafter's experts in its pages as one more layer, layer n_layers: their rows follow)
+        const size_t trunk = (size_t) (g.n_layers * g.n_expert);
+        host_res.assign(trunk + (is_paged() && !o.mtp.empty() ? (size_t) g.n_expert : 0), strata::core::kNotResident);
         int64_t resident = 0;
         for (int64_t l = 0; l < g.n_layers; ++l)
             for (int64_t e = 0; e < g.n_expert; ++e) {
@@ -4870,14 +4879,14 @@ int Model::build_hit_tables(bool dumping_layers) {
             rss_probe("before the release");
             uint64_t released = 0;
             if (!keep)
-                for (size_t i = 0; i < host_res.size(); ++i)
+                for (size_t i = 0; i < trunk; ++i)
                     if (host_res[i] != strata::core::kNotResident)
                         released += srcp->release((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);
             if (released > 0)
                 std::fprintf(stderr, "strata generate: expert arena: %.2f GiB of VRAM-held experts handed back to the OS\n",
                              (double) released / (1024.0 * 1024.0 * 1024.0));
             rss_probe("after the release");
-            for (size_t i = 0; i < host_res.size(); ++i)
+            for (size_t i = 0; i < trunk; ++i)
                 if (host_res[i] == strata::core::kNotResident)
                     srcp->prefetch((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);
             rss_probe("after the prefetch hints");

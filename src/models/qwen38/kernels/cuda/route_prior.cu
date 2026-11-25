@@ -28,8 +28,10 @@ __device__ __forceinline__ float wsum(float v) {
 }
 
 // one warp per token; 512 experts = 16 values per lane (as the native router)
+// (`lambda_at`: the bonus is read there instead of `lambda`)
 __global__ void route_prior_k(const float* __restrict__ logits, const int32_t* __restrict__ res, float lambda,
-                                  int32_t* __restrict__ ids, float* __restrict__ weights) {
+                              const float* lambda_at, int32_t* __restrict__ ids, float* __restrict__ weights) {
+    if (lambda_at != nullptr) lambda = *lambda_at;
     const float* lg = logits + (size_t) blockIdx.x * 512;
     int32_t* id = ids + (size_t) blockIdx.x * 10;
     float* w = weights + (size_t) blockIdx.x * 10;
@@ -74,7 +76,13 @@ __global__ void route_prior_k(const float* __restrict__ logits, const int32_t* _
 void route_prior_top10(const float* logits, const int32_t* res_layer, float lambda, int32_t* ids, float* weights,
                              int n_tok, void* stream) {
     if (n_tok <= 0) return;
-    route_prior_k<<<n_tok, 32, 0, (cudaStream_t) stream>>>(logits, res_layer, lambda, ids, weights);
+    route_prior_k<<<n_tok, 32, 0, (cudaStream_t) stream>>>(logits, res_layer, lambda, nullptr, ids, weights);
+}
+
+void route_prior_top10(const float* logits, const int32_t* res_layer, const float* lambda, int32_t* ids,
+                       float* weights, int n_tok, void* stream) {
+    if (n_tok <= 0) return;
+    route_prior_k<<<n_tok, 32, 0, (cudaStream_t) stream>>>(logits, res_layer, 0.0f, lambda, ids, weights);
 }
 
 }  // namespace strata::kernels
