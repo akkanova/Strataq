@@ -133,6 +133,18 @@ public:
     /// `resident == false`, and the other tensors are packed into the compacted arena `pool_bytes` sized.
     bool load(const std::string& pack_dir, void* arena_base, uint64_t arena_bytes, std::string& err,
               const std::set<std::string>* skip = nullptr);
+    /// Gets the arena size `add` needs for `names` (the ones this table holds device bytes for left out), reading
+    /// the index only.
+    bool get_add_bytes(const std::string& pack_dir, const std::set<std::string>& names, uint64_t& out,
+                       std::string& err) const;
+    /// Loads the tensors of `names` that this table holds no device bytes for into `arena_base`, keeping every
+    /// tensor it holds; an empty table also gets the metadata of the pack's other rows, as `load` with a skip set.
+    /// A layer split loads each layer into an allocation of its own this way (qwen38's Model), so that a card
+    /// can give a layer back (`release`) when the layer cut moves.
+    bool add(const std::string& pack_dir, void* arena_base, uint64_t arena_bytes, const std::set<std::string>& names,
+             std::string& err);
+    /// Forgets the device bytes of `names`, whose arena the caller frees; their rows keep their metadata.
+    void release(const std::set<std::string>& names);
 
     /// A SKIPPED bf16 tensor's values read back from the pack file (the promoted-f32 and the raw 16-bit forms), for
     /// the host-side Q8_0 quantizer of STRATA_HC_Q8 (the tensor then has no copy in the arena).

@@ -175,11 +175,11 @@ int take_paged_options(int& argc, char** argv, const std::string& program, Paged
 /// Windows, no resource cache, so that the pools can shrink; when `hops_possible` (stages on separate GPUs) and
 /// `s.remote_experts` is not off, more hardware queues; the models' prompt-order switches for `s.prompt_order`.
 void set_paged_runtime_env(const PagedSettings& s, bool hops_possible);
-/// Adds a stage running [lb, le), named gpu<dev> with .<index> for repeated GPUs. With `trim_weights`, only its
-/// layers' weights stay loaded. Measures the link before pool allocation, reports it after `program`, and sets speed
-/// and refill_batch for `expert_bytes`-sized experts. Successful link measurements are reused per GPU.
-PagedCard& add_paged_card(PagedCards& cards, int dev, int64_t lb, int64_t le, int64_t n_layers, bool trim_weights,
-                          const std::string& program, uint64_t expert_bytes);
+/// Adds a stage running [lb, le), named gpu<dev> with .<index> for repeated GPUs. Measures the link before pool
+/// allocation, reports it after `program`, and sets speed and refill_batch for `expert_bytes`-sized experts.
+/// Successful link measurements are reused per GPU.
+PagedCard& add_paged_card(PagedCards& cards, int dev, int64_t lb, int64_t le, const std::string& program,
+                          uint64_t expert_bytes);
 /// Holds allocation limits and diagnostics for a GPU page pool.
 struct CardPoolPlan {
     strata::core::PagePoolConfig config;   ///< page and chunk sizes, tokens_min; other fields keep their defaults

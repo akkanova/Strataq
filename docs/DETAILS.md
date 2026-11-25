@@ -2443,14 +2443,16 @@ EXL3 inference and its chunked prompt path remain unverified; that path retains 
 ### DeepSeek paged stages: dense weights and expert hops
 
 `strata-ds41` uses the shared paged engine's cut planner, conversation transfer and expert placement.
-Without `--trim-stage-weights`, a cut may cross the initial dense-weight ranges. On separate GPUs,
-DeepSeek reloads each moved layer's dense tensors and verify scratch on its new owner before freeing
-the previous copy. The output head and DSpark stay on the last stage. Reloads print
+A cut may cross the initial dense-weight ranges. On separate GPUs, DeepSeek reloads each moved
+layer's dense tensors and verify scratch on its new owner before freeing the previous copy. The
+output head and DSpark stay on the last stage. Reloads print
 `dense layer L migrated: gpuA -> gpuB (N bytes)`; weights and scratch remain outside the page pools.
 A failed layer reload retains that layer's old copy. Extra temporary room for one layer is needed.
 Two stages on one GPU reuse the same allocations and transfer their accounting.
-Qwen currently moves cuts only within dense weights already loaded on each card; this is not a Qwen
-cross-card reload mechanism.
+`strata-q38` does the same for Qwen: a card loads the dense weights of the layers it gains before it
+frees those of the layers it gives away, and prints
+`gpuN holds the dense weights of layers A-B (N loaded, N freed)`. A failed load leaves the card as it
+was. A move therefore needs free room on the receiving card for the moved layers' dense weights.
 
 The shared expert placement selects at most one holder for each layer's lent experts. DeepSeek's CPU
 lane sends that holder the selected activation rows in one batch, runs its existing expert matrix

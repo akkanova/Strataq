@@ -231,15 +231,13 @@ void set_paged_runtime_env(const PagedSettings& s, bool hops_possible) {
             strata::platform::set_env(name, s.prompt_order == "layer" ? "1" : "0", false);
 }
 
-PagedCard& add_paged_card(PagedCards& cards, int dev, int64_t lb, int64_t le, int64_t n_layers, bool trim_weights,
-                          const std::string& program, uint64_t expert_bytes) {
+PagedCard& add_paged_card(PagedCards& cards, int dev, int64_t lb, int64_t le, const std::string& program,
+                          uint64_t expert_bytes) {
     PagedCard& card = cards.emplace_back();
     card.index = cards.size() - 1;
     card.dev = dev;
     card.lb = lb;
     card.le = le;
-    card.weights_lb = trim_weights ? lb : 0;
-    card.weights_le = trim_weights ? le : n_layers;
     const bool shared = std::any_of(cards.begin(), cards.end() - 1, [&](const PagedCard& c) { return c.dev == dev; });
     card.id = "gpu" + std::to_string(dev) + (shared ? "." + std::to_string(card.index) : "");
     const strata::core::LinkSpeed link = card.link = get_host_link(dev);

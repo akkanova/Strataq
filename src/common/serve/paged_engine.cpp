@@ -207,8 +207,8 @@ private:
     void report_resize(const char* name, const strata::core::PagePoolReport& before,
                        const strata::core::PagePoolReport& after, Clock::time_point t0) const;
     /// Runs the layer split's planner on the cards' pool sizes (their memory settings), for the conversations that
-    /// decode and the token minimum; gets the cut it chose (get_cut's form), or today's when no other can run (a card
-    /// would lack a layer's dense weights, or the model cannot run its layers: PagedModel::can_run_layers).
+    /// decode and the token minimum; gets the cut it chose (get_cut's form), or today's when no other can run (the
+    /// model cannot run a card's layers: PagedModel::can_run_layers).
     std::vector<int64_t> plan_cut() const;
     /// Moves the layer cut to `cut` between two steps: every conversation is paused into the RAM's pool, each card
     /// takes its new layers (the pool's layout for them, the conversations' state and the model's side of the card)
@@ -216,8 +216,11 @@ private:
     /// then brings the experts the conversations use into the freed pages.  False (and `err`) when a conversation
     /// did not fit in the RAM's pool, or a pool cannot have the new layout: the cut stays.
     bool move_cut(const std::vector<int64_t>& cut, std::string& err);
-    /// Updates model ownership while conversations have no GPU pages.
-    bool set_layers(const std::vector<int64_t>& cut, std::string& err);
+    /// Gives each card the layers of `cut` while conversations have no GPU pages.  A card's memory setting pays for
+    /// the dense weights of its layers too: a card that gains layers first gives their weights' bytes from its pool
+    /// (whole chunks, at least as many), one that loses layers then takes as many back into it (at most as many).
+    /// `pools`, when given, are the sizes each pool ends at instead (move_cut's rollback).
+    bool set_layers(const std::vector<int64_t>& cut, std::string& err, const std::vector<uint64_t>& pools = {});
     /// Gives each card's pool the experts it is to hold (ExpertPages::set_ranking): its layers' share of the profile's
     /// first --expert-cache (PagedModel::get_card_ranking), or with `lend`, while the cards lend pages (holder_),
     /// those that place_experts puts on it, which may be of another card's layers that their card has no room for,
@@ -2856,10 +2859,11 @@ std::vector<int64_t> PagedEngine::plan_cut() const {
             ++decoding;
             tokens = std::max(tokens, h->dec.pos + h->dec.max_new - h->dec.produced + settings_.step.lookahead + 1);
         }
-    std::vector<uint64_t> pools;
+    std::vector<uint64_t> pools;   // each card's memory setting: its pool and its layers' dense weights
     std::vector<double> layer_ms, links;
     for (const PagedCard& card : cards_) {
-        pools.push_back(card.experts.pool().report().total.bytes);
+        pools.push_back(std::accumulate(sizes.dense.begin() + card.lb, sizes.dense.begin() + card.le,
+                                        card.experts.pool().report().total.bytes));
         layer_ms.push_back(card.layer_ms);
         links.push_back(card.link.to_gbps);
     }
@@ -2870,7 +2874,7 @@ std::vector<int64_t> PagedEngine::plan_cut() const {
     problem.can_start = [&](const std::vector<SplitFill>& fills) {
         for (size_t k = 0; k < fills.size(); ++k) {
             const int64_t lb = fills[k].lb, le = fills[k].le;
-            if (lb < cards_[k].weights_lb || le > cards_[k].weights_le || !model_.can_run_layers(lb, le))
+            if (!model_.can_run_layers(lb, le))
                 return false;
         }
         return true;
@@ -2936,12 +2940,15 @@ bool PagedEngine::move_cut(const std::vector<int64_t>& cut, std::string& err) {
     // holder's own windows do not look
     if (!holder_.empty())
         place_card_experts(false);
+    std::vector<uint64_t> old_pools;
+    for (const PagedCard& card : cards_)
+        old_pools.push_back(card.experts.pool().report().total.bytes);
     if (!set_layers(cut, err)) {
         const std::string failure = err;
         for (size_t k = 0; k < cards_.size(); ++k)
             (void) cards_[k].experts.pool().set_layout(old_layouts[k]);
         std::string rollback_error;
-        if (!set_layers(before, rollback_error)) {
+        if (!set_layers(before, rollback_error, old_pools)) {
             err = failure + "; restoring the old layer owners failed: " + rollback_error;
             fatal_error_ = err;
             for (auto& [h, p] : out)
@@ -2976,14 +2983,52 @@ bool PagedEngine::move_cut(const std::vector<int64_t>& cut, std::string& err) {
     return true;
 }
 
-bool PagedEngine::set_layers(const std::vector<int64_t>& cut, std::string& err) {
+bool PagedEngine::set_layers(const std::vector<int64_t>& cut, std::string& err, const std::vector<uint64_t>& pools) {
+    const std::vector<uint64_t> dense = model_.get_layer_sizes(cards_[0].experts.pool().page_bytes()).dense;
     for (size_t k = 0; k < cards_.size(); ++k) {
         PagedCard& card = cards_[k];
-        std::tie(card.lb, card.le) = get_card_layers(cut, k, facts_.n_layers);
-        if (!model_.set_card_layers(card, err))
+        const auto [lb, le] = get_card_layers(cut, k, facts_.n_layers);
+        uint64_t gained = 0, lost = 0;
+        for (int64_t l = std::min(lb, card.lb); l < std::max(le, card.le); ++l) {
+            const bool runs = l >= card.lb && l < card.le, will_run = l >= lb && l < le;
+            if (will_run && !runs)
+                gained += dense[(size_t) l];
+            else if (runs && !will_run)
+                lost += dense[(size_t) l];
+        }
+        const uint64_t chunk = card.experts.pool().chunk_bytes(), now = card.experts.pool().report().total.bytes;
+        const uint64_t given = (gained + chunk - 1) / chunk * chunk;
+        if (given > now) {
+            err = card.id + "'s pool has " + std::to_string(now >> 20) + " MiB, not the " +
+                  std::to_string(given >> 20) + " MiB its new layers' dense weights need";
             return false;
+        }
+        if (given != 0 && !(err = resize_gpu(card, now - given)).empty()) {
+            err = card.id + "'s pool cannot make room for its new layers' dense weights: " + err;
+            return false;
+        }
+        const int64_t old_lb = card.lb, old_le = card.le;
+        card.lb = lb;
+        card.le = le;
+        if (!model_.set_card_layers(card, err)) {
+            card.lb = old_lb;
+            card.le = old_le;
+            if (given != 0)
+                (void) resize_gpu(card, now);
+            return false;
+        }
         for (const std::unique_ptr<Held>& h : held_)
             h->parts[k]->set_layers(card.lb, card.le);
+        // Pool chunks are indivisible; rounding the final budget once limits each move's slack to one chunk.
+        const uint64_t after = pools.empty() ? (now - gained + lost) / chunk * chunk : pools[k];
+        if (after != card.experts.pool().report().total.bytes)
+            if (const std::string why = resize_gpu(card, after); !why.empty()) {
+                if (!pools.empty()) {
+                    err = card.id + "'s pool could not be restored: " + why;
+                    return false;
+                }
+                say("the pool of %s after the layer cut moved: %s\n", card.id.c_str(), why.c_str());
+            }
     }
     return true;
 }

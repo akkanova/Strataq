@@ -331,6 +331,10 @@ private:
     std::vector<int32_t> picks_;       ///< the last step's token after each row, for the drafter
     std::vector<const std::vector<int32_t>*> histories_; ///< consumed tokens for the current step
     std::vector<int> history_lengths_; ///< each session's penalty window
+    /// Each layer's dense weights on a card of the split (Model::get_layer_bytes), read once a cut is planned
+    mutable std::vector<uint64_t> layer_dense_;
+    /// Prevents a cut move when pack metadata could not establish its memory cost.
+    mutable bool layer_dense_ok_ = true;
 };
 
 std::string get_split_hop_refusal(const Options& o);
@@ -713,6 +717,29 @@ bool PagedQwen::publish_residency(const PagedCard& card, std::string& err) {
 
 bool PagedQwen::set_card_layers(const PagedCard& card, std::string& err) {
     ModelCard& mc = cards_[card.index];
+    if (!mc.ver->drop_batch_graphs(err))
+        return false;
+    {   // the dense weights follow the layers: those of the layers gained load before the others are freed, so that a
+        // load that fails leaves the card as it was
+        const strata::core::OnDevice on(card.dev);
+        strata::core::WeightTable& wt = mc.stage != nullptr ? mc.stage->wt : m_.wt;
+        strata::core::NativeDense& dense = mc.stage != nullptr ? mc.stage->dense : m_.native_dense;
+        std::map<int64_t, void*>& arenas = mc.stage != nullptr ? mc.stage->layer_arenas : m_.layer_arenas;
+        const size_t held = arenas.size();
+        if (!m_.load_card_layers(wt, dense, arenas, card.lb, card.le, err)) {
+            m_.release_card_layers(wt, dense, arenas, mc.stage != nullptr ? mc.stage->lb : 0,
+                                   mc.stage != nullptr ? mc.stage->le
+                                                       : m_.split_at.empty() ? m_.g.n_layers : m_.split_at[0]);
+            return false;
+        }
+        const size_t gained = arenas.size() - held;
+        m_.release_card_layers(wt, dense, arenas, card.lb, card.le);
+        const size_t freed = held + gained - arenas.size();
+        if (gained != 0 || freed != 0)
+            std::fprintf(stderr, "%s: %s holds the dense weights of layers %lld-%lld (%zu loaded, %zu freed)\n",
+                         kProgram.c_str(), card.id.c_str(), (long long) card.lb, (long long) card.le - 1, gained,
+                         freed);
+    }
     if (mc.stage != nullptr) {
         mc.stage->lb = card.lb;
         mc.stage->le = card.le;
@@ -723,17 +750,25 @@ bool PagedQwen::set_card_layers(const PagedCard& card, std::string& err) {
     m_.split_at.clear();   // (complete once the last card has its layers)
     for (size_t k = 1; k < pcards_.size(); ++k)
         m_.split_at.push_back(pcards_[k].lb);
-    return mc.ver->drop_batch_graphs(err);
+    return true;
 }
 
 strata::core::LayerSizes PagedQwen::get_layer_sizes(uint64_t page) const {
     const strata::core::ModelGeometry& g = m_.g;
     const std::vector<strata::core::StateRegion>& whole = ram_.pages().pool().layout().regions;   // (every layer's)
     strata::core::LayerSizes sizes;
+    std::string err;
+    if (layer_dense_.empty() && !m_.get_layer_bytes(strata::core::WeightTable(), layer_dense_, err)) {
+        std::fprintf(stderr, "%s: the layers' dense weights could not be priced, so the layer cut stays: %s\n",
+                     kProgram.c_str(), err.c_str());
+        layer_dense_ok_ = false;
+        layer_dense_.assign((size_t) g.n_layers, 0);
+    }
+    // The common price includes routers retained by CUDA0 for mmap lookahead, so that card is priced conservatively.
+    sizes.dense = layer_dense_;
     constexpr size_t fixed = 1;
     for (int64_t l = 0, qsa = 0; l < g.n_layers; ++l) {
         const bool is_qsa = is_qsa_layer(g, l);
-        sizes.dense.push_back(0);   // (outside the pools)
         sizes.expert.push_back((strata::kernels::cpu::expert_layout().blob_bytes(l) + page - 1) / page * page);
         sizes.fixed_state.push_back(is_qsa ? 0 : whole[0].unit_bytes / (uint64_t) g.n_gdn_layers());
         sizes.token_bytes.push_back(is_qsa
@@ -745,7 +780,7 @@ strata::core::LayerSizes PagedQwen::get_layer_sizes(uint64_t page) const {
 bool PagedQwen::can_run_layers(int64_t lb, int64_t le) const {
     // a card needs a GDN layer and a QSA layer
     const int64_t interval = std::max<int64_t>(m_.g.qsa_interval, 1), qsa = le / interval - lb / interval;
-    return qsa != 0 && qsa != le - lb;
+    return layer_dense_ok_ && qsa != 0 && qsa != le - lb;
 }
 
 strata::core::RegionSpan PagedQwen::get_gpu_span(const PagedCard& card) const {
@@ -1435,8 +1470,8 @@ std::string get_split_hop_refusal(const Options& o) {
 PagedCard& add_card(Model& m, Conversation& conv, PagedCards& cards, ModelCards& model_cards, GpuStage* stage) {
     PagedCard& card = strata::serve::add_paged_card(
         cards, stage != nullptr ? stage->dev : m.primary_device, stage != nullptr ? stage->lb : 0,
-        stage != nullptr ? stage->le : m.split_at.empty() ? m.g.n_layers : m.split_at[0], m.g.n_layers,
-        m.stage_weights_trimmed, kProgram, strata::kernels::cpu::expert_layout().max_blob);
+        stage != nullptr ? stage->le : m.split_at.empty() ? m.g.n_layers : m.split_at[0], kProgram,
+        strata::kernels::cpu::expert_layout().max_blob);
     ModelCard& mc = model_cards.emplace_back();
     mc.stage = stage;
     mc.cache = stage != nullptr ? &stage->cache : &m.xcache;

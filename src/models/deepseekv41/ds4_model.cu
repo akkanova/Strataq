@@ -16182,6 +16182,17 @@ bool Model::reseed_drafter(int64_t position, std::string& err) {
 }
 
 uint64_t Model::get_weight_bytes(int dev) const { return p_->devs[(size_t) dev].weights; }
+
+std::vector<uint64_t> Model::get_layer_dense_bytes() const {
+    std::vector<uint64_t> bytes;
+    for (int il = 0; il < p_->g.nl; ++il) {
+        const Layer& layer = p_->L[(size_t) il];
+        bytes.push_back(layer.weight_bytes + layer.dense_scratch_bytes +
+                        (layer.slot_tab != nullptr ? align256((size_t) layer.n_exp * 8) : 0) +
+                        (layer.vs_dev != nullptr ? align256((size_t) layer.n_exp * 4) : 0));
+    }
+    return bytes;
+}
 uint64_t Model::get_scratch_bytes(int dev) const {
     const uint64_t hop = (size_t) dev < p_->hops.size() && p_->hops[(size_t) dev]
         ? p_->hops[(size_t) dev]->d.scratch : 0;

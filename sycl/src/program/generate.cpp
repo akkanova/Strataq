@@ -647,9 +647,6 @@ struct Options {
     /// sent as `BGEN <slot> <max_new> ...` reads its prompt and its first token through the usual path, then
     /// continues in slot <slot> of the batch windows (`BT <slot> <id>` lines, then `BDONE <slot> ...`).
     int batch = 0;
-    /// With an explicit --layer-split, every GPU loads only its own layers' dense weights instead of the whole
-    /// model's: the VRAM they took goes back to the expert cache (opt-in)
-    bool trim_stage_weights = false;
     /// The --batch slots in this many groups pipelined through the stages of a layer split (stage k
     /// runs one group while stage k+1 runs another).  1 = every slot in one window, stage after stage.
     /// 0: not given (two Arc B-series cards with 8 or more slots pipeline 2 groups, anything else 1), -1: `auto` (the most
@@ -871,7 +868,6 @@ void usage() {
                  "                       the MTP drafter, else 0): one conversation's verify windows\n"
                  "                       with the GPUs overlapped - 1 = the prompt's short reads, 2 = decode as well\n"
                  "                       (stage 0 runs the next window while stage 1 verifies this one); docs/MULTI_GPU.md\n"
-                 "  --trim-stage-weights an explicit --layer-split: each GPU loads only its own layers' dense weights\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
                  "  --prompt-cache-tail  --serve, single GPU: one extra checkpoint near the prompt's end, at an existing\n"
                  "                       chunk boundary (default off; requires --prompt-cache and --prompt-cache-every > 0)\n"
@@ -1959,7 +1955,7 @@ int main(int argc, char **argv) try {
         else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
         else if (a == "--spec") o.spec = std::atoi(next("--spec"));
         else if (a == "--batch") o.batch = std::atoi(next("--batch"));
-        else if (a == "--trim-stage-weights") o.trim_stage_weights = true;
+        else if (a == "--trim-stage-weights") {}   // accepted for older run configs: every layer split trims now
         else if (a == "--batch-groups") {
             const std::string bg = next("--batch-groups");
             o.batch_groups = bg == "auto" ? -1 : std::atoi(bg.c_str());
@@ -2991,29 +2987,18 @@ int main(int argc, char **argv) try {
         }
         if (native_pack) skip.insert("token_embd.weight");
     }
-    // Layer split: every GPU holds only the dense weights of ITS layers (the PLE tensors stay everywhere).
-    // Without this each card keeps a full copy (~3.4 GB for the Coder) that its stage never reads - VRAM the
-    // expert cache wants.  Opt-in, STRATA_STAGE_TRIM=1, on HIP and CUDA alike: measured on 2x MI50 (PR #639),
-    // and the default waits for its author's re-run of the release branch on his cards.
+    // Layer split: every GPU holds only the dense weights of ITS layers (the PLE tensors stay everywhere), so no
+    // card keeps a full copy (~3.4 GB for the Coder) that its stage never reads - VRAM the expert cache wants.
     const std::set<std::string> skip_base = skip;
-    // --trim-stage-weights (PR #559) is the same switch as STRATA_STAGE_TRIM=1 (PR #639)
-    const bool trim_asked = o.trim_stage_weights || [] {
-        const char* v = std::getenv("STRATA_STAGE_TRIM");
-        return v != nullptr && v[0] != 0 && std::string(v) != "0";
-    }();
     // CUDA0'S ARENA IS BUILT BEFORE THE SPLIT IS KNOWN.  The prompt path's PLE tables are read out of it, here,
     // and `auto` does not choose its split points until 590 lines below - so CUDA0 can still only trim an
     // explicit --layer-split.  It is also the cheapest card to leave alone: it runs layers 0..split_at[0] on
     // the device with the most room, and on the 4-way IQ3_S rig the trim buys it 4598 -> 4608 slots.  The VRAM
     // is on the later cards (CUDA2 1241 -> 2485, CUDA3 533 -> 1772), and THEIR weights load after the search,
     // so they trim under `auto` too - see the block past it.
-    const bool stage_trim = trim_asked && multi_gpu && !split_auto && !split_at.empty();
-    if (o.trim_stage_weights && !multi_gpu)
-        std::fprintf(stderr, "strata generate: --trim-stage-weights needs a layer split across GPUs (ignored)\n");
-    // Only `--layer-split auto` WITH the trim asked loads the later stages' weights after the split search (they can
-    // only be trimmed once the split is known).  Every other run keeps the 0.1.39 order: weights first, then the
-    // search - so without the trim nothing about a split moves.
-    const bool late_weights = trim_asked && multi_gpu && split_auto;
+    // `--layer-split auto` loads the later stages' weights after the split search (they can only be trimmed once the
+    // split is known); an explicit split loads them in the stage loop.
+    const bool late_weights = multi_gpu && split_auto;
     // keep_routers: CUDA0 with --mmap-experts keeps every layer's router (ffn_gate_inp, ~2.5 MiB a layer) - the file
     // tier's routing-aware prefetch (RouterLookahead, below) copies all of them from CUDA0's arena, and would
     // otherwise turn itself off
@@ -3031,9 +3016,8 @@ int main(int argc, char **argv) try {
         }
         std::fclose(f);
     };
-    if (stage_trim) {
+    if (multi_gpu && !split_auto) {
         add_foreign(0, split_at[0], skip, o.mmap_experts);
-        strata::core::NativeDense::set_layer_range(0, (int) split_at[0]);
         std::fprintf(stderr, "strata generate: layer split: CUDA0 loads the dense weights of layers 0-%lld only\n",
                      (long long) split_at[0] - 1);
     }
@@ -3105,7 +3089,8 @@ int main(int argc, char **argv) try {
 
     strata::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
-        if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
+        if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key, 0,
+                               multi_gpu && !split_auto ? split_at[0] : -1)) {
             std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
             return 1;
         }
@@ -3534,24 +3519,18 @@ int main(int argc, char **argv) try {
     // ---- layer split across GPUs: each later stage's own copy of the dense weights, its session and (the last) the
     // head, made on its device before the host arena is mapped (as the drafter below, for the same WDDM reason)
     std::vector<std::unique_ptr<GpuStage>> stages;
-    // One stage's dense weights on its device (the caller has made it current): `trim` = only layers [lb, le).
-    auto load_stage_weights = [&](GpuStage &st, int64_t lb, int64_t le,
-                                  bool trim) -> bool {
+    // One stage's dense weights on its device (the caller has made it current): those of layers [lb, le) only.
+    auto load_stage_weights = [&](GpuStage &st, int64_t lb, int64_t le) -> bool {
         try {
     std::set<std::string> skip_s = skip_base;
-        uint64_t pool_s = pool_bytes;
-        if (trim) {
-            add_foreign(lb, le, skip_s, false);
-            strata::core::NativeDense::set_layer_range((int) lb, (int) le);
-            if (!strata::core::WeightTable::pool_bytes(o.pack, pool_s, err, &skip_s)) {
-                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-                return false;
-            }
-            std::fprintf(stderr, "strata generate: layer split: CUDA%d loads the dense weights of layers %lld-%lld only\n",
-                         st.dev, (long long) lb, (long long) le - 1);
-        } else {
-            skip_s = skip;
+        uint64_t pool_s = 0;
+        add_foreign(lb, le, skip_s, false);
+        if (!strata::core::WeightTable::pool_bytes(o.pack, pool_s, err, &skip_s)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return false;
         }
+        std::fprintf(stderr, "strata generate: layer split: CUDA%d loads the dense weights of layers %lld-%lld only\n",
+                     st.dev, (long long) lb, (long long) le - 1);
         void* arena_s = nullptr;
         if (DPCT_CHECK_ERROR(arena_s = (void *)strata::malloc_device_guarded(
                                  pool_s, dpct::get_in_order_queue())) != 0 ||
@@ -3575,7 +3554,7 @@ int main(int argc, char **argv) try {
                          (unsigned long long) (total_b >> 20));
             return false;
         }
-        if (!o.native_dense_gguf.empty() && !st.dense.load(o.native_dense_gguf, st.wt, err, o.native_ple_key)) {
+        if (!o.native_dense_gguf.empty() && !st.dense.load(o.native_dense_gguf, st.wt, err, o.native_ple_key, lb, le)) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d native dense projections: %s\n", st.dev,
                          err.c_str());
             return false;
@@ -3598,13 +3577,10 @@ int main(int argc, char **argv) try {
             return 1;
         }
         const strata::core::OnDevice on(st.dev);
-        // Later stages' weights load here (0.1.39), except `--layer-split auto` with the trim asked: those load after
-        // the split search (see late_weights), so `auto` can trim them too.
-        if (!late_weights) {
-            const int64_t lb = stage_trim ? split_at[i] : 0;
-            const int64_t le = stage_trim ? (i + 1 < split_at.size() ? split_at[i + 1] : g.n_layers) : 0;
-            if (!load_stage_weights(st, lb, le, stage_trim)) return 1;
-        }
+        // an explicit split's stage loads its weights here, `auto`'s after the split search (late_weights)
+        if (!late_weights &&
+            !load_stage_weights(st, split_at[i], i + 1 < split_at.size() ? split_at[i + 1] : g.n_layers))
+            return 1;
         // THE SESSION AND THE HEAD WAIT FOR THE SPLIT SEARCH.  `session_bytes` prices a stage's session by its
         // LAYER RANGE (the carve - every stage used to hold all 48 layers' state whatever it ran), so the
         // sessions are allocated after the search below has set `st.lb`/`st.le`; the last stage's head follows.
@@ -3780,7 +3756,7 @@ int main(int argc, char **argv) try {
     // smaller, which measured cost no decode (K=28 on 9070 XT + R9700: 58.4 tok/s own vs 58.5 borrowing), while a
     // search with the reserve moved the boundary to K=32 and decode to 54.8. STRATA_SPLIT_OWN_PLACE=reserve: the
     // search sees the reserve.
-    // ---- `--layer-split auto` with the trim asked: a later stage's weights load after this search, so its arena is
+    // ---- `--layer-split auto`: a later stage's weights load after this search, so its arena is
     // not in `cudaMemGetInfo` yet.  Price it from the pack index as the full (untrimmed) copy the search has always
     // seen on the card (`pool_bytes` reads the index and allocates nothing), so the split it picks is the split it
     // has always picked: this buys cache, not a different placement.  Every other run has its weights loaded: 0.
@@ -4105,7 +4081,7 @@ int main(int argc, char **argv) try {
         }
     }
 
-    // ---- `--layer-split auto` with the trim asked: THE STAGES' WEIGHTS, NOW THAT THE SPLIT IS KNOWN.  Each later card
+    // ---- `--layer-split auto`: THE STAGES' WEIGHTS, NOW THAT THE SPLIT IS KNOWN.  Each later card
     // loads the dense weights of the layers it runs and nothing else (before this they loaded in the loop above, a
     // full copy per card: on the 4-way IQ3_S rig CUDA1 3650 expert slots, CUDA2 1241, CUDA3 533 and a 768-token prompt
     // chunk; carved 4608 / 2485 / 1772 and 6144).  The search priced these arenas from the pack index (`stage_pool`).
@@ -4113,7 +4089,7 @@ int main(int argc, char **argv) try {
         for (size_t i = 0; i < stages.size(); ++i) {
             GpuStage& st = *stages[i];
             const strata::core::OnDevice on(st.dev);
-            if (!load_stage_weights(st, st.lb, st.le, true)) return 1;
+            if (!load_stage_weights(st, st.lb, st.le)) return 1;
             size_t fb = 0, tb = 0;
             /*
             DPCT1106: 'cudaMemGetInfo' was migrated with the Intel
@@ -5430,9 +5406,8 @@ int main(int argc, char **argv) try {
         if (later_misses > 0 && no_host_split) {
             std::fprintf(stderr, "strata generate: REFUSED: %lld experts of the later layer-split stages are neither in VRAM nor mirrored "
                                  "(the host mirror covers the first stage only); with STRATA_VERIFY_NO_HOST the device plan cannot run them "
-                                 "and the card is lost at the first verify window - set STRATA_STAGE_TRIM=1 (with --layer-split N) to free "
-                                 "each card's duplicate dense weights, lower --max-context or --vram-reserve-mib, or unset "
-                                 "STRATA_VERIFY_NO_HOST\n", (long long) later_misses);
+                                 "and the card is lost at the first verify window - lower --max-context or "
+                                 "--vram-reserve-mib, or unset STRATA_VERIFY_NO_HOST\n", (long long) later_misses);
             refuse_exit(2);
         }
         if (later_misses > 0)

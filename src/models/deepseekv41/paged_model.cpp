@@ -69,7 +69,6 @@ struct ProgramOptions {
     float adapt_min_gain = 1.5f;   ///< --adapt-min-gain: the routings a move must gain (choose_expert_swaps)
     float adapt_decay = 0.7f;      ///< --adapt-decay: the routing counts' factor per 4 decode steps
     std::string layer_split, split_device;  ///< Existing stage bounds and physical devices.
-    bool trim_stage_weights = false;       ///< Keeps the cut within the initial dense-weight ranges.
     bool drafting = true;          ///< --dspark is not off: the drafter starts switched on (--drafter)
 };
 
@@ -587,8 +586,7 @@ int run_paged_engine(int argc, char** argv) {
     }
     for (size_t i = 0; i < devices.size(); ++i)
         strata::serve::add_paged_card(cards, devices[i], i == 0 ? 0 : cuts[i - 1], i == cuts.size() ? g.nl : cuts[i],
-                                      g.nl, x.trim_stage_weights, kProgram,
-                                      *std::max_element(blobs.begin(), blobs.end()));
+                                      kProgram, *std::max_element(blobs.begin(), blobs.end()));
     if (has_drafter && !settings.drafter && !m.switch_drafter_weights(false, err)) {
         std::fprintf(stderr, "%s: %s\n", kProgram.c_str(), err.c_str());
         return 1;
@@ -831,7 +829,9 @@ bool PagedDeepSeek::rewind(const PagedParts& parts, int64_t tokens, std::string&
 }
 
 strata::core::LayerSizes PagedDeepSeek::get_layer_sizes(uint64_t page) const {
-    return get_split_sizes(m_.geometry(), m_.get_expert_bytes(), page);
+    strata::core::LayerSizes sizes = get_split_sizes(m_.geometry(), m_.get_expert_bytes(), page);
+    sizes.dense = m_.get_layer_dense_bytes();   // (a cut move trades them against the cards' pools)
+    return sizes;
 }
 
 bool PagedDeepSeek::read_prompt(const PagedParts& parts, const std::vector<int64_t>& ids, int64_t from, int64_t n,
@@ -1252,8 +1252,9 @@ int read_model_options(int argc, char** argv, Options& o, ProgramOptions& x, std
             x.layer_split = val("--layer-split");
         else if (a == "--split-device")
             x.split_device = val("--split-device");
-        else if (a == "--trim-stage-weights")
-            x.trim_stage_weights = true;
+        else if (a == "--trim-stage-weights") {
+            // accepted for older run configs: every split now moves its layers' weights with the cut
+        }
         else if (a != "--serve") {
             std::fprintf(stderr, "%s: unknown option %s\n", kProgram.c_str(), a.c_str());
             return 2;

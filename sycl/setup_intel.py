@@ -498,14 +498,11 @@ def install(argv) -> None:
             selector = "level_zero:*" if split else f"level_zero:{idx}"
             cfg.setdefault("env", {}).setdefault("ONEAPI_DEVICE_SELECTOR", selector)
         if split:
-            # #1980: without it every card keeps a full copy of the dense weights (1.4 GiB each on Flash-Next IQ2_XS) and the
-            # load stops at 96-97% resident; the later stage's missing experts have no host mirror (STRATA_VERIFY_NO_HOST)
-            cfg.setdefault("env", {}).setdefault("STRATA_STAGE_TRIM", "1")
             # #1980: a later stage short of VRAM is refused under NO_HOST=1; with the host path on it runs (the host
             # computes those experts).  Only when the experts will likely not fit; a value the user set is kept.
             cards = [intel[i]["vram_gb"] for i in gsel if isinstance(i, int) and 0 <= i < len(intel)]
             arena = S.MODELS.get(model, {}).get("arena_gb", 0)
-            if split_likely_short(arena, cards) and "STRATA_VERIFY_NO_HOST" not in cfg["env"]:
+            if split_likely_short(arena, cards) and "STRATA_VERIFY_NO_HOST" not in cfg.setdefault("env", {}):
                 cfg["env"]["STRATA_VERIFY_NO_HOST"] = "0"
                 S.say(f"  {model}'s {arena:.0f} GB of experts will likely not all fit the {len(cards)} cards' "
                       f"{sum(cards):.0f} GB of VRAM: the config sets STRATA_VERIFY_NO_HOST=0, so the CPU computes the "

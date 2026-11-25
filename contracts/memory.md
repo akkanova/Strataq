@@ -39,6 +39,13 @@ allocations. `other_apps` is memory outside the engine's accounted use, and is
 drawn after free memory at the right of the bar. Where Windows provides the
 engine's dedicated usage, unclassified runtime bytes remain under Strata's Other.
 
+With a layer split, `memory_mib.<card>` is the size of that card's pool, and the card's
+memory also holds the dense weights of its layers. When a pool change moves the layer
+cut, the moved layers' weights take their bytes from the pool of the card that gains
+them (whole chunks, at least as many) and give them back to the pool of the card that
+loses them (at most as many). So a pool can change size after a move, but its end on
+the bar stays within one chunk (256 MiB) of where it was set.
+
 Pool growth is limited by actual allocation capacity and configured pool limits.
 There is no automatic Windows commit reserve. The operating system and allocator
 can still refuse an allocation, which is reported through the existing refusal

@@ -40,9 +40,6 @@ struct PagedCard {
     /// its memory's id in GET_MEMORY_USE and CHANGE_SETTINGS: gpu<dev>, and gpu<dev>.<index> for a card on the GPU of
     /// an earlier card (the test of a split on one GPU)
     std::string id;
-    /// Bounds the cut to layers whose dense tensors the model can address or reload on this card.
-    /// --trim-stage-weights restricts this to the initial interval.
-    int64_t weights_lb = 0, weights_le = 0;
     strata::core::LinkSpeed link;                 ///< its link to RAM, measured at start
     double layer_ms = 0;                          ///< the predicted ms of one layer of a decode window on it
     strata::core::ExpertPages experts;            ///< the page pool: its experts and the conversations' pages

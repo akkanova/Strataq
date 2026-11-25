@@ -190,6 +190,8 @@ public:
     std::vector<int64_t> get_layer_cuts() const;
     /// Changes a stage's interval, reloading moved dense tensors when the physical GPU changes.
     bool set_stage_layers(int stage, int lb, int le, std::string& err);
+    /// Gets each trunk layer's device memory that set_stage_layers moves with it: its dense tensors and scratch.
+    std::vector<uint64_t> get_layer_dense_bytes() const;
     /// Opens a stage's compute buffers for experts lent by the shared paged engine.
     bool attach_expert_hop(int stage, std::function<const uint8_t*(int, int)> find, std::string& err);
     /// Publishes the shared planner's per-layer destination card, or null when hopping is off.
