@@ -403,7 +403,7 @@ int check_tables() {
     int bad = 0;
     const char* e89 = std::getenv("STRATA_MMVQ_IL_89");
     // sm_89's own tables are ON by default (#3453, 0.2.7) unless STRATA_MMVQ_IL_89=0 or STRATA_DEFAULTS=026
-    const bool opt89 = strata::mmvq_il_89_resolve(e89, false, 89, strata::qwen_defaults_026());
+    const bool opt89 = strata::mmvq_il_89_resolve(e89, false, 89, strata::defaults_026());
     for (int type : {23, 12, 13, 14, 11})
         for (int nc = 2; nc <= 4; ++nc)
             for (int n_out : {512, 2560, 6144, 10240, 12288, 248320}) {

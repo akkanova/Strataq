@@ -25,7 +25,7 @@ bool ConversationDrafter::init(Model& m, int sessions, std::string& err) {
     const GpuStage* st = m.get_drafter_stage();
     const strata::core::OnDevice on(device_ = mtp_->device());
     if (rows_ == nullptr && strata::core::allocate_device((void**) &rows_, (size_t) max_t * row_floats_ * sizeof(float),
-        {"other", "Device allocations", "Drafter snapshots"}) != cudaSuccess) {
+        {"drafter", "Device allocations", "Drafter snapshots"}) != cudaSuccess) {
         (void) cudaGetLastError();
         err = "the drafter's residual rows do not fit";
         return false;
@@ -49,7 +49,7 @@ bool ConversationDrafter::read_prompt(strata::prefill::Prefill* sp, const Conver
 bool ConversationDrafter::reserve_snapshots(const float* residuals, std::string& err) {
     const strata::core::OnDevice on(device_);
     if (saved_rows_ == nullptr && strata::core::allocate_device((void**) &saved_rows_,
-        last_.size() * (size_t) max_rows_ * row_floats_ * sizeof(float), {"other", "Device allocations",
+        last_.size() * (size_t) max_rows_ * row_floats_ * sizeof(float), {"drafter", "Device allocations",
             "Drafter snapshots"}) != cudaSuccess) {
         err = "the drafter's per-conversation residual snapshots do not fit";
         return false;
@@ -71,20 +71,17 @@ bool ConversationDrafter::note_window(const std::vector<strata::spec::StepRow>& 
     if (residuals == nullptr)
         for (Last& l : last_)
             l.rows = 0;
-    for (size_t r = 0, c = 0; r < rows.size(); ++c) {
-        Last& l = last_.at((size_t) rows[r].session);
-        l.row0 = (int) r;
-        l.pos = rows[r].pos;
-        l.kept = kept[c];
-        while (r < rows.size() && rows[r].session == rows[(size_t) l.row0].session)
-            ++r;
-        l.rows = (int) r - l.row0;
-        l.picks.assign(picks + l.row0, picks + r);
+    size_t c = 0;
+    return strata::spec::for_each_window(rows, [&](size_t first, size_t end) {
+        Last& l = last_.at((size_t) rows[first].session);
+        l.row0 = (int) first;
+        l.pos = rows[first].pos;
+        l.kept = kept[c++];
+        l.rows = (int) (end - first);
+        l.picks.assign(picks + first, picks + end);
         l.saved = false;
-        if (residuals && !save_residuals(rows[(size_t) l.row0].session, residuals, err))
-            return false;
-    }
-    return true;
+        return !residuals || save_residuals(rows[first].session, residuals, err);
+    });
 }
 
 int ConversationDrafter::propose(int session, const ConversationPages& pages, strata::core::SessionState& ss,

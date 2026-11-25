@@ -34,6 +34,8 @@ def table() -> list[dict]:
         row = {"id": s.id, "label": s.label, "hint": s.effect, "default": s.default, "env": _entries(s.env)}
         if s.legacy:
             row["legacy"] = _entries(s.legacy)
+        if s.cleanup_env:
+            row["cleanup_env"] = list(s.cleanup_env)
         out.append(row)
     return out
 

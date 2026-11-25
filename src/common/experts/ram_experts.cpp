@@ -21,10 +21,18 @@ double get_seconds_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
+/// Counts in `traffic` one SSD read, of `bytes` of experts, that started at `t0`.
+void count_ssd_read(ExpertTraffic& traffic, std::chrono::steady_clock::time_point t0, uint64_t bytes) {
+    traffic.ssd_wait_us += (uint64_t) (get_seconds_since(t0) * 1e6);
+    ++traffic.ssd_reads;
+    traffic.ssd_bytes += bytes;
+}
+
 }  // namespace
 
 RamExperts::~RamExperts() {
     free(ring_);
+    free(gpu_staging_);
 }
 
 bool RamExperts::open(ExpertSource& files, uint64_t bytes, int ring, const StateLayout& layout, PagePoolConfig config,
@@ -51,28 +59,26 @@ bool RamExperts::open(ExpertSource& files, uint64_t bytes, int ring, const State
     // every expert may come in (the pool's room decides how many)
     if (ring_ == nullptr || pool == 0 ||
         !pages_.open(std::move(memory), pool, layout, config, blob_bytes, n_expert, (int64_t) first_page_.size(),
-                     ranking, err)) {
+                     ranking, {}, err)) {
         err = "the RAM's page pool: no room for " + std::to_string(bytes >> 20) + " MiB" +
               (err.empty() ? "" : " (" + err + ")");
         return false;
     }
     ExpertPages::Hooks hooks;
-    hooks.load = [this](ExpertKey key, int32_t first, std::string& e) {
-        if (copy_from_ != nullptr) {
-            if (gpu_copy(get_page(first), copy_from_, (size_t) blob_bytes_[(size_t) key.layer]))
+    hooks.load = [this](const ExpertKey* keys, const int32_t* firsts, size_t n, std::string& e) {
+        if (copy_from_ != nullptr) {   // (keep_copy's one expert)
+            if (gpu_copy(get_page(firsts[0]), copy_from_, (size_t) blob_bytes_[(size_t) keys[0].layer]))
                 return true;
-            e = "copying layer " + std::to_string(key.layer) + " expert " + std::to_string(key.expert) + " in failed";
+            e = "copying layer " + std::to_string(keys[0].layer) + " expert " + std::to_string(keys[0].expert) +
+                " in failed";
             return false;
         }
-        if (refill_reads_ != nullptr) {
-            refill_reads_->add(key.layer, key.expert, get_page(first));
+        Reads reads;
+        for (size_t i = 0; i < n; ++i)
+            reads.add(keys[i].layer, keys[i].expert, get_page(firsts[i]));
+        if (read_from_ssd(reads))
             return true;
-        }
-        Reads one;
-        one.add(key.layer, key.expert, get_page(first));
-        if (read_from_ssd(one))
-            return true;
-        e = "the SSD read of layer " + std::to_string(key.layer) + " expert " + std::to_string(key.expert) + " failed";
+        e = "the RAM's page pool: an SSD read of " + std::to_string(n) + " experts failed";
         return false;
     };
     hooks.moved = [this](ExpertKey key, int32_t first) { first_page_[index_of(key.layer, key.expert)] = first; };
@@ -83,15 +89,44 @@ bool RamExperts::open(ExpertSource& files, uint64_t bytes, int ring, const State
 
 int RamExperts::refill(int max, uint64_t& wait_ms, std::string& err) {
     const std::unique_lock lock(mu_);
-    Reads reads;
-    refill_reads_ = &reads;
-    const int loaded = pages_.refill(max, wait_ms, err);
-    refill_reads_ = nullptr;
-    if (!read_in(reads)) {
-        err = "the RAM's page pool: an SSD read failed";
-        return -1;
+    return pages_.refill(max, wait_ms, err);
+}
+
+bool RamExperts::use_blobs(const ExpertKey* keys, const uint64_t* bytes, size_t n,
+                           const std::function<bool(const uint8_t* const*)>& use) {
+    const std::unique_lock lock(mu_);
+    uint64_t need = 0;
+    for (size_t i = 0; i < n; ++i)
+        if ((size_t) keys[i].layer >= blob_bytes_.size() || !holds(keys[i].layer, keys[i].expert))
+            need += bytes[i];
+    if (need > gpu_staging_bytes_) {
+        free(gpu_staging_);
+        gpu_staging_ = alloc(need);
+        gpu_staging_bytes_ = gpu_staging_ != nullptr ? need : 0;
+        if (gpu_staging_ == nullptr)
+            return false;
     }
-    return loaded;
+    Reads reads;
+    std::vector<const uint8_t*> from(n);
+    uint8_t* next = gpu_staging_;
+    for (size_t i = 0; i < n; ++i)
+        if (const ExpertKey& k = keys[i]; (size_t) k.layer < blob_bytes_.size() && holds(k.layer, k.expert)) {
+            from[i] = get_page((int32_t) pages_.pool().use_expert(k));
+        } else {
+            reads.add(k.layer, k.expert, next);
+            from[i] = next;
+            next += bytes[i];
+        }
+    pages_.traffic().hits += n - reads.dst.size();
+    pages_.traffic().misses += reads.dst.size();
+    // The drafter's layers have no entry in blob_bytes_, which read_from_ssd needs.
+    if (!reads.dst.empty()) {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!files_->copy_blobs(reads.layers.data(), reads.experts.data(), reads.dst.data(), reads.dst.size()))
+            return false;
+        count_ssd_read(pages_.traffic(), t0, need);
+    }
+    return use(from.data());
 }
 
 bool RamExperts::keep_copy(ExpertKey key, const uint8_t* bytes, const std::vector<float>& usage) {
@@ -131,7 +166,10 @@ double RamExperts::time_ssd_reads(int round) {
         bytes += blob_bytes_[layer];
     }
     const auto t0 = std::chrono::steady_clock::now();
-    return read_from_ssd(reads) ? (double) bytes / 1e9 / std::max(get_seconds_since(t0), 1e-9) : 0.0;
+    // (not read_from_ssd: a speed test is no traffic)
+    return files_->copy_blobs(reads.layers.data(), reads.experts.data(), reads.dst.data(), ring_slots_)
+               ? (double) bytes / 1e9 / std::max(get_seconds_since(t0), 1e-9)
+               : 0.0;
 }
 
 double RamExperts::time_copy_in(const uint8_t* bytes, uint64_t n) {
@@ -145,8 +183,11 @@ double RamExperts::time_copy_in(const uint8_t* bytes, uint64_t n) {
 
 const uint8_t* RamExperts::blob(int64_t layer, int64_t expert) {
     const std::unique_lock lock(mu_);
-    if (holds(layer, expert))
+    if (holds(layer, expert)) {
+        ++pages_.traffic().hits;
         return get_page((int32_t) pages_.pool().use_expert({(int32_t) layer, (int32_t) expert}));
+    }
+    ++pages_.traffic().misses;
     if (const uint8_t* staged = find_staged(layer, expert))
         return staged;
     Reads one;
@@ -178,6 +219,8 @@ bool RamExperts::copy_blobs(const int32_t* layers, const int32_t* experts, uint8
             else
                 reads.add(layers[i], experts[i], dst[i]);
     }
+    pages_.traffic().hits += n - reads.dst.size();
+    pages_.traffic().misses += reads.dst.size();
     return read_from_ssd(reads, kStagerReadBytes);
 }
 
@@ -228,13 +271,17 @@ void RamExperts::free(uint8_t* p) {
 /// Reads `reads` from the SSD (nothing: true), at most `most` bytes of experts (or one expert) a read.
 bool RamExperts::read_from_ssd(const Reads& reads, uint64_t most) {
     for (size_t i = 0, end = 0; i < reads.layers.size(); i = end) {
-        for (uint64_t bytes = 0; end < reads.layers.size(); ++end) {
-            bytes += blob_bytes_[(size_t) reads.layers[end]];
-            if (end > i && bytes > most)
+        uint64_t bytes = 0;
+        for (; end < reads.layers.size(); ++end) {
+            const uint64_t next = blob_bytes_[(size_t) reads.layers[end]];
+            if (end > i && bytes + next > most)
                 break;
+            bytes += next;
         }
+        const auto t0 = std::chrono::steady_clock::now();
         if (!files_->copy_blobs(&reads.layers[i], &reads.experts[i], &reads.dst[i], end - i))
             return false;
+        count_ssd_read(pages_.traffic(), t0, bytes);
     }
     return true;
 }
@@ -246,6 +293,7 @@ bool RamExperts::read_in(const Reads& reads) {
     for (size_t i = 0; i < reads.dst.size(); ++i)
         if (const ExpertKey key{reads.layers[i], reads.experts[i]}; holds(key.layer, key.expert)) {
             pages_.pool().remove_expert(key);
+            --pages_.traffic().loads;
             first_page_[index_of(key.layer, key.expert)] = kNotResident;
         } else {
             ring_owner_[(size_t) (reads.dst[i] - ring_) / slot_bytes_] = -1;
@@ -259,6 +307,7 @@ uint8_t* RamExperts::take_place(int64_t layer, int64_t expert) {
     const int32_t first = pages_.admit(layer, expert, layer_t0_);
     if (first == kNotResident)
         return take_slot(layer, expert);
+    ++pages_.traffic().loads;
     first_page_[index_of(layer, expert)] = first;
     return get_page(first);
 }

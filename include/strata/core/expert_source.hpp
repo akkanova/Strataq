@@ -52,6 +52,8 @@ struct ExpertLayout;
 
 namespace strata::core {
 
+struct ExpertFileLayout;   // (strata/common/experts/expert_files.hpp)
+
 class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hpp)
 class RemoteExperts;
 struct LoadStats;
@@ -277,6 +279,7 @@ struct GpuPlanSink {
     /// holds the arena's device alias.
     int pcie_mode = 0;
     int32_t cpu_jobs = 0;   ///< host only: the distinct experts the pool computes for the layer just published
+    int device = -1;        ///< the GPU the plan runs on: its PCIe share and the CPU's rows are counted as its traffic
 };
 
 /// Verifier::set_pcie_balance: a verify window's costs, fitted to each layer's measured times (ms, least squares with
@@ -792,6 +795,10 @@ public:
     /// 32 measured 2.35 GB/s with experts.bin mapped and 3.57 GB/s without.  After this every file read goes through
     /// read_direct (mapped_blob answers nullptr).  Returns whether the view was closed; `why` says why not.
     bool drop_mapping(std::string& why);
+    /// Describes where every layer's experts lie in the files it opened, as ExpertFiles reads them (`paths`, which
+    /// the layouts' file numbers index): strata-q38 reads its experts that way once its load is done, and closes this
+    /// source.  False when no files are open.
+    bool get_file_layout(std::vector<std::string>& paths, std::vector<ExpertFileLayout>& layers) const;
     /// Windows, experts.bin, a file tier that reads through the file cache (--resident-experts): the startup reads -
     /// the GPU cache's fill from the profile and the RAM copy (pin_cache_complement) - go unbuffered (read_direct)
     /// with the view closed meanwhile.  Through the mapping they put the file's pages in the working set beside the
@@ -969,8 +976,7 @@ private:
     std::atomic<int64_t> async_end_ns_{0};
     std::chrono::steady_clock::time_point async_t0_{};
     double async_fill_us_ = 0;
-    /// #286: the blobs from the drive, unbuffered: every role's 4 KiB-aligned window is read at once (overlapped on
-    /// Windows, io_submit on Linux) into this thread's aligned buffer, then copied into place.  False when a read fails.
+    /// #286: the blobs from the drive, unbuffered, as one platform::read_pieces batch.  False when a read fails.
     bool read_direct(const Fill* fills, size_t n) const;
     bool open_direct(std::string& why);
     /// Windows: experts.bin mapped again as `open` maps it (begin/end_startup_unbuffered).

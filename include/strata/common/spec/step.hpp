@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -21,7 +22,6 @@ struct StepSettings {
     int rows = 8;         ///< the most rows each group computes; at least its active conversation count
     int lookahead = 0;    ///< the most guesses one conversation may add to a step; 0 turns drafting off
     int model_lookahead = -1; ///< --mtp-max-t minus one; negative leaves the model draft width uncapped.
-    int max_draft_conversations = 0; ///< Above this count guesses are suppressed; 0 imposes no limit.
     int groups = 1;       ///< The pipeline groups selected from live concurrency; 1 keeps the serial path.
 };
 
@@ -40,10 +40,32 @@ struct StepRow {
     int parent = -1;   ///< the row whose token this one follows; -1: the conversation's last kept token
 };
 
-/// Selects confidence floors and the model's capacity restrictions for the shared step.
+/// Calls `fn(first, end)` for each run [first, end) of consecutive rows among `count` whose `session_of(row)` is the
+/// same, in row order. A `fn` that returns bool can stop the walk by returning false; this then returns false.
+/// Returns true after visiting all runs, including when there are no rows. The lookup must have no side effects.
+template <class Index, class SessionOf, class Fn>
+bool for_each_window(Index count, SessionOf&& session_of, Fn&& fn) {
+    for (Index first = 0, end = 0; first < count; first = end) {
+        end = first + 1;
+        while (end < count && session_of(end) == session_of(first))
+            ++end;
+        if constexpr (std::is_void_v<decltype(fn(first, end))>)
+            fn(first, end);
+        else if (!fn(first, end))
+            return false;
+    }
+    return true;
+}
+
+/// Walks a step's windows: the runs of consecutive rows of one conversation (see the overload above).
+template <class Fn>
+bool for_each_window(const std::vector<StepRow>& rows, Fn&& fn) {
+    return for_each_window(rows.size(), [&](size_t r) { return rows[r].session; }, fn);
+}
+
+/// Selects confidence floors and the model's drafting restrictions for the shared step.
 struct DraftLimits {
     float confidence = 0.0f, cumulative = 0.0f;
-    int max_conversations = 0; ///< Zero imposes no limit on simultaneous drafting.
     bool cool_after_rejection = false; ///< Allows a plain step after the whole model proposal failed its cut.
 };
 
@@ -140,6 +162,10 @@ struct Decoding {
     /// Steps take conversations of higher priority first; among equal ones they take turns at the extra guess rows.
     int64_t priority = 0;
     int64_t guessed = 0;         ///< the guesses its steps ran
+    /// The row allowance summed over steps that ran this conversation: spare rows capped by the lookahead and
+    /// remaining output tokens (excluding its next token), or zero when drafting is off. Source limits, confidence
+    /// cuts, cooling and memory constraints may leave some of this allowance unused.
+    int64_t guess_room = 0;
     int64_t guessed_right = 0;   ///< the guesses it kept: the model picked the same tokens
 
     DraftLimits draft_limits; ///< This request's confidence cuts and drafting restrictions.
@@ -178,8 +204,7 @@ private:
         std::vector<size_t> start;
     };
     /// Builds a group's windows before any pipeline work starts; -1 uses the serial rotation.
-    /// wave_conversations includes peers whose windows belong to other groups.
-    void prepare(const std::vector<Decoding*>& active, Work& work, int group = -1, int wave_conversations = 0);
+    void prepare(const std::vector<Decoding*>& active, Work& work, int group = -1);
     /// Applies the model's picks after its stages have drained.
     bool complete(Work& work, int group, double ms, std::string& err);
     /// Gets how many of the `n` rows of `d` (its token, then its guesses) from `picks` it keeps, and sets its

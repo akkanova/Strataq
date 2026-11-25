@@ -1,7 +1,7 @@
 """Adapts saved server settings for the opt-in page-pool engines."""
 from pathlib import Path
 
-from . import draft_layer
+from . import draft_layer, user_args
 
 
 def is_paged_engine(cfg: dict) -> bool:
@@ -12,30 +12,32 @@ def is_paged_engine(cfg: dict) -> bool:
 def translate_args(cfg: dict, args: list[str]) -> list[str]:
     """Keeps supported options and reports settings with no page-pool equivalent."""
     deepseek = get_engine_name(cfg) == "strata-ds41"
+    if not deepseek:
+        args = user_args.flat(user_args.groups(args))
     model_off = cfg.get("mtp") is False or cfg.get("drafting") == "off"
     if model_off:
         args, _ = draft_layer.strip(args)
     lookup_values = {"--suffix-draft": "0", "--lookup-chain": "0"}
     # Both paged families use the shared stage scheduler, including live batch-group sizing.
-    common = set("""pack max-context batch batch-groups expert-cache expert-profile layer-split split-device
-        adapt-every adapt-swaps adapt-min-gain adapt-decay expert-popularity-decay
+    common = set("""pack max-context batch batch-groups vram-reserve-mib reserve-mib eos-ids eos
+        expert-cache expert-profile layer-split split-device
+        adapt-every adapt-swaps adapt-min-gain adapt-decay expert-popularity-decay expert-half-life
+        route-tail-skip route-prior-pct draft-confidence-pct draft-cumulative-pct
         tokens-min tokens-max conversation-tokens vram-conversations gpu-mib ram-mib ssd-pause-mib
         rows lookahead concurrent pause-dir copy-back conversation-idle-seconds decode-share-percent prompt-turn-ms
-        drafter remote-experts save-on-shutdown step-profile
+        drafter draft-rule remote-experts save-on-shutdown prompt-order step-profile
         suffix-draft mtp-max-t
         lookup-chain lookup-chain-min""".split())
-    model = set(("""vision eos gpus reserve-mib cpu-threads dspark dspark-conf experts dspark-block prefill-chunk threads"""
-                 if deepseek else """eos-ids native native-dense-gguf embd-gguf ple-gguf kv prefill mtp spec-min-p
-                 gpu pcie-frac pool-cores aux-cpus pool-affinity vram-reserve-mib vram-reserve-later-mib""").split())
+    model = set(("""vision gpus cpu-threads dspark dspark-conf experts dspark-block prefill-chunk threads"""
+                 if deepseek else """native native-dense-gguf embd-gguf ple-gguf kv prefill mtp spec-min-p
+                 gpu pcie-frac pool-cores aux-cpus pool-affinity vram-reserve-later-mib""").split())
     switches = {"serve", "trim-stage-weights"} | ({"no-expert-cache"} if deepseek else
                  {"vision", "no-ple", "no-prefill-borrow", "no-host-worker", "no-ple-prefetch", "stop-eos", "stats"})
+    # Installed engines may predate shared option names, so emit each family's original spelling.
     aliases = {"--slots": "--batch"}
-    aliases["--gpu" if deepseek else "--gpus"] = "--gpus" if deepseek else "--gpu"
-    if deepseek:
-        aliases["--vram-reserve-mib"] = "--reserve-mib"
-    else:
-        aliases["--resident-budget-gib"] = "--ram-mib"
-        aliases["--eos"] = "--eos-ids"
+    aliases.update({"--gpu": "--gpus", "--vram-reserve-mib": "--reserve-mib", "--eos-ids": "--eos"} if deepseek else
+                   {"--gpus": "--gpu", "--resident-budget-gib": "--ram-mib", "--model": "--native",
+                    "--reserve-mib": "--vram-reserve-mib", "--eos": "--eos-ids"})
     supported = common | model | switches
     out, omitted = [], []
     i = 0

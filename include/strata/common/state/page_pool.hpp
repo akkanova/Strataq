@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <tuple>
@@ -60,6 +61,12 @@ struct PagePoolConfig {
 struct PagePoolHooks {
     std::function<void*(size_t)> alloc;   ///< gets a chunk; nullptr when the memory has not that much
     std::function<void(void*)> free;      ///< gives a chunk back
+    /// Tells whether a chunk `alloc` gave lies outside the memory's own, in slower memory it borrows: on Windows, an
+    /// integrated GPU's chunk that went to the system RAM the GPU shares (ChunkMemory::is_outside).
+    std::function<bool(void*)> is_outside = [](void*) { return false; };
+    /// Gets the bytes no one holds in the memory's own part, besides the pool's chunks: on Windows, what is left of an
+    /// integrated GPU's dedicated memory (ChunkMemory::get_own_room).  No value when not known.
+    std::function<std::optional<uint64_t>()> get_own_room = [] { return std::optional<uint64_t>(); };
     /// Gets the time for the experts' recency and the hysteresis: milliseconds by default.
     std::function<uint64_t()> now = [] {
         return (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -90,6 +97,7 @@ struct PagePoolReport {
     Use allocated;    ///< all but the free runs: experts, blocks, and the pages of holes no block holds yet
     /// The free pages in runs shorter than the smallest expert of the ranking: free memory no expert can use.
     Use fragmented;
+    Use outside;   ///< the pages of the chunks outside the memory's own (PagePoolHooks::is_outside)
     int active_conversations = 0, paused_conversations = 0;
     int64_t tokens = 0;   ///< held by all the pool's conversations
 };
@@ -100,6 +108,21 @@ struct PoolResize {
     /// Conversations holding pages in the chunks a shrink would give back, when the rest of the pool has no room for
     /// those pages: pausing (and removing) some of them, or any others, makes the room.
     std::vector<ConversationId> to_pause;
+    /// A growth stopped because the next chunk lay outside the memory's own (PoolGrowth::outside_ok off).
+    bool own_memory_full = false;
+};
+
+/// How PagePool::resize grows a pool.
+struct PoolGrowth {
+    /// Keep chunks outside the memory's own (PagePoolHooks::is_outside); else the first such chunk is given back and
+    /// the growth stops there.
+    bool outside_ok = false;
+    /// The bytes a growth leaves free in the memory's own part: room for the allocations outside the pools and for
+    /// other programs, which would otherwise land outside the memory's own or fail.  After a growth without
+    /// `outside_ok`, the pool gives back chunks it took until PagePoolHooks::get_own_room is at least this. When that
+    /// room is not known, it gives back this much after an early stop, else none. With `outside_ok` and known room,
+    /// the caller keeps the spare free.
+    uint64_t spare = 0;
 };
 
 /// Outcome of PagePool::lend.
@@ -157,9 +180,11 @@ public:
     /// experts' home points for the new size.  A shrink gives back the last chunks: their experts are evicted and
     /// their conversation blocks copied below (so read conversation_blocks again).  It is refused, changing nothing,
     /// while a run is lent or when an active conversation or the token minimum would not fit, and stops (having moved
-    /// some blocks) when a block has no room.
-    PoolResize resize(uint64_t bytes);
-    /// Lends the top `pages` pages of the pool (one run, inside the joined chunks at its top) for a prompt's buffers
+    /// some blocks) when a block has no room.  A growth stops early when a chunk cannot be had, or lies outside the
+    /// memory's own as `growth` says, and gives back of the chunks it took what PoolGrowth::spare says.
+    PoolResize resize(uint64_t bytes, const PoolGrowth& growth = {});
+    /// Lends the top `pages` pages of the pool's own memory (one run, inside the joined chunks below any chunk outside
+    /// it, as prompt buffers are read more than other pages) for a prompt's buffers
     /// until give_back.  Makes them free first: an expert there is copied into free pages elsewhere (above the
     /// reserve, else in the reserve's free pages) while that leaves `keep_free` free pages besides what the
     /// conversations' blocks there need, else evicted; a conversation's block there is copied elsewhere, evicting
@@ -196,6 +221,9 @@ public:
     /// Gets the first page of each block of one region of a conversation, in order; a block is block_bytes(region)
     /// of consecutive pages.
     const std::vector<PageId>& conversation_blocks(ConversationId id, size_t region) const;
+    /// Gets how many blocks region `region` of a conversation of `tokens` tokens takes: a fixed region one (none when
+    /// it is empty).
+    uint64_t region_blocks(size_t region, int64_t tokens) const;
 
     /// Gets the first of an expert's `pages` consecutive pages: the ones it has, the free run nearest its size's home
     /// point (open to experts, and above the token minimum's reserve; in the reserve's pages only past the reserve's
@@ -279,13 +307,13 @@ private:
         return page % pages_per_chunk_ == 0 && (c >= joined_.size() || !joined_[c]);
     }
     PageId page_count() const { return (PageId) (chunks_.size() * pages_per_chunk_); }
+    PageId get_lend_end() const;
     PageId get_top_stretch() const;
     std::string place_blocks();
     void place_homes();
     PoolResize shrink(size_t chunks);
     std::string check_limits(uint64_t pages, int64_t min, int64_t max) const;
     std::string check_growth(const Conversation& c, int64_t tokens) const;
-    uint64_t region_blocks(size_t region, int64_t tokens) const;
     PageId get_minimum_pages() const;
     uint64_t reserved_pages() const;
     void open_due();
@@ -323,6 +351,7 @@ private:
     uint32_t smallest_expert_ = 0;           ///< the pages of the ranking's smallest expert (0: no ranking)
     std::vector<void*> chunks_;
     std::vector<bool> joined_;   ///< per chunk: it starts where the previous one ended
+    std::vector<bool> outside_;  ///< per chunk: it lies outside the memory's own (PagePoolHooks::is_outside)
     PageId lent_first_ = no_page;
     uint32_t lent_pages_ = 0;
     /// While `lend` clears a run: its first page, so that a block moved out takes no hole of the run (no_page:

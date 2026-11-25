@@ -1,5 +1,5 @@
-// --adapt-decay validation (include/strata/models/qwen38/adapt_decay.hpp), CPU only, no model (#1284).
-#include "strata/models/qwen38/adapt_decay.hpp"
+// --adapt-decay validation (include/strata/models/common/adapt_decay.hpp), CPU only, no model (#1284).
+#include "strata/models/common/adapt_decay.hpp"
 
 #include <cmath>
 #include <cstdio>

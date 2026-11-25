@@ -24,8 +24,10 @@ import threading
 import time
 
 from strata_base.memory import read_ram
+from strata_base.rate_statistic import RateStatistic
 
 HISTORY = 60
+MOVED_DECAY = 0.5 ** 0.5   # the traffic's moving average keeps half its weight after two seconds
 
 
 # ------------------------------------------------------------------------------------------------ NVML
@@ -104,6 +106,7 @@ class _Nvml:
         out["pcie_gen"] = self._uint("nvmlDeviceGetCurrPcieLinkGeneration")        # drops at idle (power saving)
         out["pcie_gen_max"] = self._uint("nvmlDeviceGetMaxPcieLinkGeneration")
         out["pcie_width"] = self._uint("nvmlDeviceGetCurrPcieLinkWidth")
+        out["pcie_width_max"] = self._uint("nvmlDeviceGetMaxPcieLinkWidth")
         rx = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(1))                 # NVML_PCIE_UTIL_RX_BYTES, KB/s
         tx = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(0))
         out["pcie_rx_mb"] = rx / 1024.0 if rx is not None else None
@@ -233,7 +236,7 @@ class _Amd:
         gen = min(gens) if (whole and gens) else own_gen
         width = min(widths) if (whole and widths) else self._int(os.path.join(own, "current_link_width"))
         return {"pcie_gen": gen, "pcie_gen_max": gen, "pcie_own_gen": own_gen, "pcie_width": width,
-                "pcie_path": "%d/%d" % (read, len(hops))}
+                "pcie_width_max": width, "pcie_path": "%d/%d" % (read, len(hops))}
 
 
     def read(self):
@@ -659,17 +662,20 @@ class _CpuRamFallback:
 
 # ------------------------------------------------------------------------------------------------ the sampler
 class Telemetry:
-    def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False):
-        """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
+    def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False, transfers=None):
+        """`extra()` -> dict of more series to record each second (the server's tok/s).  `transfers()` -> the
+        engine's traffic totals, (seconds, {card index: (bytes to the card, bytes from it)}), or None (the server's
+        reading of the engine's STATS lines).  `gpu_index`: the card the
         engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
         the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
         PCIe traffic), mean (load) or hottest (temperature), and "gpus" has each card's own.  `amd`: the AMD backend's
         cards, numbered as HIP numbers them, read from sysfs (#301)."""
         self.extra = extra
+        self.transfers = transfers
         self.lock = threading.Lock()
         self.now: dict = {}
         self.hist = collections.defaultdict(lambda: collections.deque(maxlen=HISTORY))
-        idx = list(gpu_indices) if gpu_indices and len(gpu_indices) > 1 else [gpu_index]
+        idx = self.indices = list(gpu_indices) if gpu_indices else [gpu_index]
         self.gpus = [(i, gpu_reader(i, amd)) for i in idx]
         self.gpus = [(i, g) for i, g in self.gpus if g.ok()] or self.gpus[:1]
         self.gpu = self.gpus[0][1]
@@ -687,6 +693,12 @@ class Telemetry:
             cards = windows_amd_cards()
             win_amd = [cards[i] for i in idx if 0 <= i < len(cards)] or cards[:1]
             gpu_name = " + ".join(c["name"] for c in win_amd) if win_amd else None
+        self.names = ({i: c["name"] for i, c in zip(idx, win_amd)} if win_amd else
+                      {i: g.name() for i, g in self.gpus if g.ok()})
+        self.moved = {}           # per card index: RateStatistics in MB/s of its traffic (to it, from it)
+        self.moved_sources = {}   # the source whose intervals each card's statistics contain
+        self.moved_totals = {}    # per card index: the engine's last (seconds, to, from) that _moved counted
+        self.moved_at = None      # time.monotonic() of _moved's last call
         # the macOS reader knows the device's working set (the VRAM budget of the unified memory); None elsewhere
         vram_total = None
         if win_amd is None and isinstance(self.gpu, _Metal) and self.gpu.ok():
@@ -732,8 +744,8 @@ class Telemetry:
 
     def sample(self):
         s = {}
-        if self.gpu.ok():
-            reads = [(i, g.read()) for i, g in self.gpus]
+        reads = [(i, g.read()) for i, g in self.gpus] if self.gpu.ok() else []
+        if reads:
             g = dict(reads[0][1])
             if len(reads) > 1:
                 def vals(k):
@@ -749,6 +761,10 @@ class Telemetry:
                               "mem_total": r.get("mem_total"), "temp": r.get("temp"), "power": r.get("power")}
                              for (i, r), (_, reader) in zip(reads, self.gpus)]
             s.update({f"gpu_{k}": v for k, v in g.items()})
+        s["moved"] = self._moved(dict(reads))
+        rates = [c[d]["moving"] for c in s["moved"] for d in ("to", "from")
+                 if c["source"] and c[d]["moving"] is not None]
+        s["moved_mb_s"] = sum(rates) if rates else None
         if self.ps:
             try:
                 s["cpu"] = self.ps.cpu_percent(interval=None)
@@ -766,6 +782,44 @@ class Telemetry:
             except Exception:  # noqa: BLE001 - telemetry must never take the server down
                 pass
         return s
+
+    def _moved(self, reads: dict) -> list:
+        """Gets each card's traffic with host memory for the Monitor's Transfers tile: from the driver's PCIe counters
+        where it has them (NVML), else from the engine's STATS totals.  `reads`: the cards' readings by index.
+        Returns [{"index", "name", "pcie_gen", "pcie_gen_max", "pcie_width", "pcie_width_max", "source": "driver",
+        "engine" or None (neither), "to", "from": RateStatistic.to_dict in MB/s}]."""
+        now = time.monotonic()
+        dt, self.moved_at = now - (self.moved_at or now), now
+        try:
+            seconds, totals = (self.transfers() if self.transfers else None) or (None, {})
+        except Exception:  # noqa: BLE001 - telemetry must never take the server down
+            seconds, totals = None, {}
+        cards = []
+        for i in self.indices:
+            r = reads.get(i, {})
+            source = ("driver" if all(r.get(k) is not None for k in ("pcie_rx_mb", "pcie_tx_mb")) else
+                      "engine" if i in totals else None)
+            last = self.moved_totals.get(i)
+            restarted = source == "engine" and last and (
+                seconds < last[0] or any(new < old for new, old in zip(totals[i], last[1:])))
+            if self.moved_sources.get(i) != source or restarted:
+                self.moved.pop(i, None)
+                self.moved_totals.pop(i, None)
+                last = None
+            self.moved_sources[i] = source
+            stats = self.moved.setdefault(i, (RateStatistic(MOVED_DECAY), RateStatistic(MOVED_DECAY)))
+            if source == "driver":
+                for stat, mib_s in zip(stats, (r["pcie_rx_mb"], r["pcie_tx_mb"])):
+                    stat.add(mib_s * (2**20 / 1e6) * dt, dt)
+            elif source == "engine":
+                self.moved_totals[i] = (seconds, *totals[i])
+                if last and seconds > last[0]:
+                    for stat, now_bytes, last_bytes in zip(stats, totals[i], last[1:]):
+                        stat.add((now_bytes - last_bytes) / 1e6, seconds - last[0])
+            cards.append({"index": i, "name": self.names.get(i), "source": source,
+                          **{k: r.get(k) for k in ("pcie_gen", "pcie_gen_max", "pcie_width", "pcie_width_max")},
+                          "to": stats[0].to_dict(), "from": stats[1].to_dict()})
+        return cards
 
     def close(self):
         """Ends the sampler thread (a server that stops, a test's service): it used to run for the life of the process."""
@@ -791,8 +845,8 @@ class Telemetry:
                 continue
             with self.lock:
                 self.now = s
-                for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used",
-                          "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
+                for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "moved_mb_s", "cpu",
+                          "ram_used", "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
                     v = s.get(k)
                     self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
             self._stop.wait(1.0)

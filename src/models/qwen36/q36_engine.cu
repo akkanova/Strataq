@@ -19,9 +19,11 @@
 // [--force IDS] [--dump-full-logits F] (tools/qwen35/kl.py's reference interface), --bench-pp N / --bench-tg N.
 #include "strata/base/platform/env.hpp"
 #include "strata/base/gpu/memory_info.hpp"
+#include "strata/base/gpu/shape_graph_cache.hpp"
 #include "strata/common/artifact/gguf_reader.hpp"
 #include "strata/models/common/family_layout.hpp"
 #include "strata/common/serve/loop.hpp"
+#include "strata/common/serve/option_names.hpp"
 #include "strata/common/serve/request.hpp"
 #include "strata/common/state/state_layout.hpp"
 #include "strata/common/state/token_listing.hpp"
@@ -30,6 +32,7 @@
 #include "strata/common/kernels/native_mmvq.hpp"
 #include "strata/models/common/kernels/native_moe.hpp"
 #include "strata/models/common/kernels/native_router.hpp"
+#include "strata/models/common/prompt_images.hpp"
 #include "strata/common/kernels/prefill/gemm.hpp"
 #include "strata/common/kernels/prefill/moe_mmq.hpp"
 #include "strata/models/qwen36/engine.hpp"
@@ -1183,13 +1186,11 @@ struct Engine {
     // the MTP block (when loaded)
     float *mtp_cat = nullptr, *hmtp = nullptr, *logits_m = nullptr;
     int32_t *tok_m = nullptr, *pos0_m = nullptr, *pick_m = nullptr;
-    // graphs: [0] the decode step, [T] a verify window of T rows, mtp1 the MTP draft step
-    // (the graphs hold the current session's state pointers as kernel arguments: one set per session)
-    struct GSet {
-        cudaGraphExec_t g1 = nullptr, gv[kVerify + 1] = {}, gm1 = nullptr;
-    };
-    std::vector<GSet> gsets;
-    GSet& gs() { return gsets[(size_t) cur]; }
+    /// The captured graphs by (session, kind): a session's graphs hold its state pointers as kernel arguments, so
+    /// each session has its own (kind 0: the decode step, T: a verify window of T rows, kMtpGraph: the MTP draft
+    /// step); session kRowsGraph holds the batch windows by (rows, groups, kind).
+    strata::core::ShapeGraphCache<std::pair<int, int>> graphs;
+    static constexpr int kMtpGraph = kVerify + 1, kRowsGraph = -1;
     strata::prefill::Gemm gemm;
     cublasHandle_t blas = nullptr;
     float* att_s = nullptr;            // the prompt attention's scores / probabilities, kAttScoreFloats floats
@@ -1478,7 +1479,6 @@ struct Engine {
             pick_m = dalloc_t<int32_t>(1);
         }
         sess.resize((size_t) n_sess);
-        gsets.resize((size_t) n_sess);
         describe_session();
         {   // the sessions' memory, said before it fails
             const size_t per = (size_t) layout.bytes_for(ctx);
@@ -2375,29 +2375,14 @@ struct Engine {
         att_p16 = dalloc_t<__half>(kAttScoreFloats);
         CK(cudaDeviceSynchronize());
     }
-    void reset_graphs() {
-        for (GSet& gset : gsets) {
-            for (cudaGraphExec_t* g : {&gset.g1, &gset.gm1})
-                if (*g) { CK(cudaGraphExecDestroy(*g)); *g = nullptr; }
-            for (auto& g : gset.gv)
-                if (g) { CK(cudaGraphExecDestroy(g)); g = nullptr; }
-        }
-        for (auto& kv : row_graphs)
-            if (kv.second) CK(cudaGraphExecDestroy(kv.second));
-        row_graphs.clear();
-    }
-
-    template <class F> void graph_run(cudaGraphExec_t& gx, F body) {
+    /// Runs `body`'s launches, through the graph captured for `kind` of session `sess_id` when graphs are on.
+    template <class F> void graph_run(int sess_id, int kind, F&& body) {
         if (!use_graph) { body(); return; }
-        if (!gx) {
-            cudaGraph_t graph = nullptr;
-            CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
-            body();
-            CK(cudaStreamEndCapture(st, &graph));
-            CK(cudaGraphInstantiate(&gx, graph, 0));
-            CK(cudaGraphDestroy(graph));
+        std::string err;
+        if (!graphs.run({sess_id, kind}, st, body, err)) {
+            std::fprintf(stderr, "strata-q36: %s\n", err.c_str());
+            std::exit(1);
         }
-        CK(cudaGraphLaunch(gx, st));
     }
 
     // ---- pictures (--vision).  A request with pictures hands the engine its rows (the encoder's, in prompt order), the
@@ -2472,7 +2457,7 @@ struct Engine {
             rows_deferred = true;
             // a prompt cell of a picture request (its rotary position is in the table, its row a picture's) runs eagerly
             if (mtab_now || map_on) forward(1, pos, 1, false, false);
-            else graph_run(gs().g1, [&] { forward(1, pos, 1, use_graph, false); });
+            else graph_run(cur, 0, [&] { forward(1, pos, 1, use_graph, false); });
             mtab_now = nullptr;
             map_on = false;
             rows_deferred = false;
@@ -2516,17 +2501,11 @@ struct Engine {
     // ---- batch rows: one decode window for the next token of several sessions
     struct Row { int slot; int32_t tok; };
     long long win_count = 0;
-    std::map<int, cudaGraphExec_t> row_graphs;   // by (rows, groups, kind): graphs of the batch windows
     /// A slot's rows of one window: `n` consecutive cells from the session's position (1: the next token; 2: also an MTP
     /// proposal the window verifies).
     struct Group { int slot; int n; int32_t tok[2]; };
     int32_t rows_pick[kVerify] = {};
     int rows_G_last = 0;   // groups of the window run last (commit_rows takes their keep counts)
-
-    void run_graph_key(int key, const std::function<void()>& body) {
-        if (!use_graph) { body(); return; }
-        graph_run(row_graphs[key], body);
-    }
 
     /// One window over the groups' rows.  `verify`: a verify window - the GDN state is read, not written (commit_rows writes
     /// it for the kept rows) and the sessions' positions stay.  The greedy picks end up in rows_pick (one per row), every
@@ -2562,7 +2541,7 @@ struct Engine {
         rows_mode = true;
         rows_G = G;
         rows_deferred = true;
-        run_graph_key((verify ? 1000 : 0) + G * 10 + (T - G), [&] { forward(T, pmax, T, use_graph, verify); });
+        graph_run(kRowsGraph, (verify ? 1000 : 0) + G * 10 + (T - G), [&] { forward(T, pmax, T, use_graph, verify); });
         rows_deferred = false;
         rows_mode = false;
         CK(cudaMemcpyAsync(hrow + 32, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
@@ -2593,7 +2572,7 @@ struct Engine {
         CK(cudaMemcpyAsync(d_gcnt, hrow + 56, (size_t) G * 4, cudaMemcpyHostToDevice, st));
         rows_mode = true;
         rows_G = G;
-        run_graph_key(2000 + G, [&] {
+        graph_run(kRowsGraph, 2000 + G, [&] {
             for (size_t l = 0; l < m->layers.size(); ++l) {
                 const Layer& L = m->layers[l];
                 if (L.attn) continue;
@@ -2644,7 +2623,7 @@ struct Engine {
         rows_mode = true;
         rows_G = T;
         rows_deferred = true;
-        run_graph_key(3000 + T, [&] {
+        graph_run(kRowsGraph, 3000 + T, [&] {
             K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok_m, T, N, y, st);
             k_rms_ld<<<T, kThreads, 0, st>>>(y, N, m->mtp_enorm, mtp_cat, 2 * N, N, m->eps);                 // [e | ...]
             k_rms_ld<<<T, kThreads, 0, st>>>(mtp_seed(), N, m->mtp_hnorm, mtp_cat + N, 2 * N, N, m->eps);   // [... | h]
@@ -2726,7 +2705,7 @@ struct Engine {
             CK(cudaMemcpyAsync(pos0_m, hpin + 1, 4, cudaMemcpyHostToDevice, st));
             CK(cudaMemcpyAsync(seeds, hmtp + (size_t) last_row * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, st));
             last_row = 0;
-            if (mtp_graph) graph_run(gs().gm1, [&] { forward_mtp(1, pos + d, seeds, true, use_graph); });
+            if (mtp_graph) graph_run(cur, kMtpGraph, [&] { forward_mtp(1, pos + d, seeds, true, use_graph); });
             else forward_mtp(1, pos + d, seeds, true, false);
             CK(cudaMemcpyAsync(hpin + 2, pick_m, 4, cudaMemcpyDeviceToHost, st));
             CK(cudaStreamSynchronize(st));
@@ -2740,7 +2719,7 @@ struct Engine {
         CK(cudaMemcpyAsync(tok, hpin + 16, (size_t) T * 4, cudaMemcpyHostToDevice, st));
         CK(cudaMemcpyAsync(pos0, hpin + 1, 4, cudaMemcpyHostToDevice, st));
         rows_deferred = true;
-        graph_run(gs().gv[T], [&] { forward(T, pos, T, use_graph, true); });
+        graph_run(cur, T, [&] { forward(T, pos, T, use_graph, true); });
         rows_deferred = false;
         CK(cudaMemcpyAsync(hpin + 2, pick, (size_t) T * 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
@@ -2839,7 +2818,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
             CK(cudaFree(std::get<1>(pk)));
         }
         m.packed.clear();
-        E.reset_graphs();
+        E.graphs.clear();
         CK(cudaMemGetInfo(&fr, &tot));
         std::fprintf(stderr, "strata-q36: the packed Q8_0 decode copies (%.2f GiB) given back so that every routed "
                      "expert fits in VRAM (STRATA_Q36_KEEP_PACKED=1 keeps them and runs the hybrid mode)\n",
@@ -3073,13 +3052,6 @@ std::vector<int32_t> parse_ids(const char* s) {
 bool is_eos(int t) { return t == 248044 || t == 248046; }
 
 // ------------------------------------------------------------------------------------------------ pictures
-constexpr int32_t kImagePad = 248056;   // <|image_pad|>
-
-uint64_t fnv1a(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
-    const uint8_t* b = (const uint8_t*) p;
-    for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
-    return h;
-}
 
 /// A request's pictures: the encoder's rows in prompt order, each picture's cell run, and the positions.
 struct ImgReq {
@@ -3090,70 +3062,28 @@ struct ImgReq {
     int32_t delta = 0;               // the text after the prompt: rotary position = cell + delta
 };
 
-/// Reads a strata-vision file (one or more records: int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats, in prompt
-/// order) and lays the pictures over the prompt's <|image_pad|> runs.  Positions as mtmd's: text counts up by one; a
-/// picture's cells take (t, h, w) = (p, p + row, p + column) and the text after it continues at p + max(nx, ny).  "" or
-/// the error.  `keys`: the server's key for each picture (img_keys=), else the embeddings' hash.
+/// Fills `r` from a strata-vision file (see strata::models::read_prompt_images); returns "" or the error.
 std::string build_images(const std::string& path, const std::vector<int32_t>& ids, int64_t n_embd,
                          const std::vector<uint64_t>& keys, ImgReq& r) {
-    struct Img { int64_t n, nx, ny; size_t off; };
-    std::vector<Img> imgs;
-    std::FILE* f = std::fopen(path.c_str(), "rb");
-    if (!f) return "cannot open " + path;
-    std::string ve;
-    while (ve.empty()) {
-        int32_t hdr[5];
-        const size_t got = std::fread(hdr, sizeof(int32_t), 5, f);
-        if (got == 0) break;
-        if (got != 5 || hdr[0] != 0x31455653 || hdr[1] < 1 || hdr[2] < 1 || hdr[3] < 1 || (int64_t) hdr[2] * hdr[3] != hdr[1] ||
-            hdr[4] != (int32_t) n_embd) {
-            ve = "bad embeddings file (expected strata-vision records of width " + std::to_string((long long) n_embd) + ")";
-            break;
-        }
-        const size_t off = r.rows.size(), cnt = (size_t) hdr[1] * (size_t) hdr[4];
-        r.rows.resize(off + cnt);
-        if (std::fread(r.rows.data() + off, sizeof(float), cnt, f) != cnt) { ve = "short embeddings file"; break; }
-        imgs.push_back({hdr[1], hdr[2], hdr[3], off});
-    }
-    std::fclose(f);
-    if (!ve.empty()) return ve;
     const int64_t n = (int64_t) ids.size();
-    r.cell_row.assign((size_t) n, -1);
+    std::vector<const float*> row_ptr;
+    std::vector<std::pair<int64_t, uint64_t>> starts;   // per picture: its first cell, its hash
+    std::string ve;
     r.mrope.assign((size_t) n * 3, 0);
-    auto put = [&](int64_t c, int64_t t, int64_t h, int64_t w) {
-        r.mrope[(size_t) c * 3] = (int32_t) t;
-        r.mrope[(size_t) c * 3 + 1] = (int32_t) h;
-        r.mrope[(size_t) c * 3 + 2] = (int32_t) w;
-    };
-    int64_t p = 0, i = 0;
-    size_t k = 0;
-    while (i < n) {
-        if (ids[(size_t) i] != kImagePad) { put(i, p, p, p); ++p; ++i; continue; }
-        if (k >= imgs.size()) return "the prompt has more images than the embeddings file";
-        const Img& im = imgs[k++];
-        uint64_t h;
-        {   // what the conversation cache compares: a picture is its grid and its key (or its embeddings)
-            const int64_t grid[3] = {im.n, im.nx, im.ny};
-            h = fnv1a(grid, sizeof grid);
-            if (keys.size() == imgs.size()) h = fnv1a(&keys[k - 1], sizeof(uint64_t), h);
-            else h = fnv1a(r.rows.data() + im.off, (size_t) im.n * (size_t) n_embd * sizeof(float), h);
-        }
-        r.imgs.push_back({i, im.n, h});
-        for (int64_t j = 0; j < im.n; ++j)
-            if (i + j >= n || ids[(size_t) (i + j)] != kImagePad)
-                return "image " + std::to_string(k) + " has " + std::to_string((long long) im.n) +
-                       " rows but fewer <|image_pad|> tokens";
-        for (int64_t j = 0; j < im.n; ++j) {
-            const int64_t y = j / im.nx, x = j % im.nx;
-            put(i + j, p, p + y, p + x);
-            r.cell_row[(size_t) (i + j)] = (int32_t) ((im.off / (size_t) n_embd) + (size_t) j);
-        }
-        i += im.n;
-        p += std::max(im.nx, im.ny);
+    if (!strata::models::read_prompt_images(path, ids, n_embd, keys, r.mrope, r.rows, row_ptr, starts, ve))
+        return ve;
+    r.cell_row.assign((size_t) n, -1);
+    for (int64_t c = 0; c < n; ++c)
+        if (row_ptr[(size_t) c] != nullptr)
+            r.cell_row[(size_t) c] = (int32_t) ((row_ptr[(size_t) c] - r.rows.data()) / n_embd);
+    // the pictures' rows follow each other in `rows`, so a picture's rows run to the next picture's first
+    for (size_t k = 0; k < starts.size(); ++k) {
+        const int64_t first = r.cell_row[(size_t) starts[k].first];
+        const int64_t end = k + 1 < starts.size() ? r.cell_row[(size_t) starts[k + 1].first] :
+                                                     (int64_t) r.rows.size() / n_embd;
+        r.imgs.push_back({starts[k].first, end - first, starts[k].second});
     }
-    if (k != imgs.size()) return "the embeddings file has more images than the prompt";
-    if (n > 0 && ids[(size_t) (n - 1)] == kImagePad) return "the prompt cannot end in an image";
-    r.delta = (int32_t) (p - n);
+    r.delta = r.mrope[(size_t) (n - 1) * 3] + 1 - (int32_t) n;   // the prompt is not empty and ends in text
     return "";
 }
 
@@ -3711,23 +3641,22 @@ int strata::qwen35::run(int argc, char** argv) {
     int expert_slots = 0, batch = 0, draft_vocab = -1;
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false;
     for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
+        const std::string a = strata::serve::get_primary_option(argv[i]);
         auto next = [&]() -> std::string {
             if (i + 1 >= argc) { std::fprintf(stderr, "strata-q36: %s needs a value\n", a.c_str()); std::exit(2); }
             return argv[++i];
         };
         // strata's names where they mean the same thing (the family switch passes strata's command line on)
-        if (a == "--model" || a == "--native") model = next();
+        if (a == "--model") model = next();
         else if (a == "--max-new") n_gen = std::atoi(next().c_str());
         else if (a == "--no-token-graph") graph = false;
         else if (a == "--pool-workers") cpu_threads = std::atoi(next().c_str());
         else if (a == "--gpu") (void) next();   // applied by strata before the switch (CUDA/HIP_VISIBLE_DEVICES)
         else if (a == "--greedy") {}            // --tokens decodes greedily here anyway
         else if (a == "--serve") serve_mode = true;
-        else if (a == "--max-context" || a == "--ctx") ctx = std::atoi(next().c_str());
-        else if (a == "--chunk" || a == "--prefill") { const std::string v = next(); chunk = v == "auto" ? 0 : std::atoi(v.c_str()); }
+        else if (a == "--max-context") ctx = std::atoi(next().c_str());
+        else if (a == "--prefill") { const std::string v = next(); chunk = v == "auto" ? 0 : std::atoi(v.c_str()); }
         else if (a == "--tokens") tokens = next();
-        else if (a == "--n") n_gen = std::atoi(next().c_str());
         else if (a == "--force") force = next();
         else if (a == "--emb") emb_file = next();   // --tokens with pictures: a strata-vision file (the ids carry <|image_pad|> runs)
         else if (a == "--dump-full-logits") dump_full = next();
@@ -3744,7 +3673,7 @@ int strata::qwen35::run(int argc, char** argv) {
         }
         else if (a == "--draft-vocab") draft_vocab = std::atoi(next().c_str());   // the MTP drafts pick among the first N token ids
         else if (a == "--vision") vision = true;                                  // pictures (GENI): the encoder is strata-vision's
-        else if (a == "--batch" || a == "--slots") batch = std::atoi(next().c_str());   // sessions decoding together
+        else if (a == "--batch") batch = std::atoi(next().c_str());                     // sessions decoding together
         else if (a == "--batch-mtp") batch_mtp = true;                                  // ... each verifying an MTP proposal
         else if (a == "--expert-vram") expert_vram = std::atof(next().c_str());   // GiB for the routed experts
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
@@ -3759,8 +3688,8 @@ int strata::qwen35::run(int argc, char** argv) {
             if (val) ++i;
         } else {
             std::fprintf(stderr,
-                         "usage: strata-q36 --model GGUF [--max-context 32768] [--chunk 512] [--no-graph]\n"
-                         "       (--serve | --tokens IDS [--n 64] [--force IDS] [--dump-full-logits F] | --bench-pp N "
+                         "usage: strata-q36 --model GGUF [--max-context 32768] [--prefill 512] [--no-graph]\n"
+                         "       (--serve | --tokens IDS [--max-new 64] [--force IDS] [--dump-full-logits F] | --bench-pp N "
                          "--bench-tg N)\n");
             return 2;
         }
@@ -3770,7 +3699,7 @@ int strata::qwen35::run(int argc, char** argv) {
     strata::platform::set_env("STRATA_Q8_PACKED", "1", false);   // the packed Q8_0 decode copy unless STRATA_Q8_PACKED is set otherwise
     strata::platform::set_env("STRATA_MMQ_KQ", "1", false);      // the K-quant MMQ prompt kernels (every expert of this family is a K-quant)
     if (mtp_d < 0 || mtp_d > 7) { std::fprintf(stderr, "strata-q36: --mtp takes 0 .. 7 drafts\n"); return 2; }
-    if (chunk < 0 || chunk > 4096 || ctx < 256) { std::fprintf(stderr, "strata-q36: bad --chunk / --max-context\n"); return 2; }
+    if (chunk < 0 || chunk > 4096 || ctx < 256) { std::fprintf(stderr, "strata-q36: bad --prefill / --max-context\n"); return 2; }
     Model m;
     std::string err;
     try {

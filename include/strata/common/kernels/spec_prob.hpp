@@ -32,6 +32,7 @@
 // the bonus token.  Rows after the first reject are computed and ignored.
 #pragma once
 
+#include "strata/base/platform/env.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -65,10 +66,7 @@ inline float spec_draft_temp_scale() {
 /// sampled request).  Measured on the RTX 3060 and 5070: sampled drafting gains at temperature 1.0 and loses below
 /// about 0.7, where the draft head's argmax is the better guess; below x the drafter keeps its argmax drafts.
 inline float spec_min_temp() {
-    static const float s = [] {
-        const char* e = std::getenv("STRATA_SPEC_MIN_TEMP");
-        return e != nullptr ? (float) std::atof(e) : 0.0f;
-    }();
+    static const float s = (float) strata::platform::env_double("STRATA_SPEC_MIN_TEMP", 0.0);
     return s;
 }
 

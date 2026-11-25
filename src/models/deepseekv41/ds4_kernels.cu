@@ -13,6 +13,8 @@
 #include "ds4_attn_split.cuh"
 #include "ds4_wmma.cuh"
 #include "ds4_experts_rule.hpp"
+#include "strata/base/gpu/traffic.hpp"
+#include "strata/base/platform/env.hpp"
 
 #include <cuda_fp16.h>
 
@@ -2103,10 +2105,7 @@ bool device_is_gfx1151win() {
 #endif
 #endif
 bool fast_attn_enabled() {
-    static const int env = [] {
-        const char* e = std::getenv("DS4_FAST_ATTN");
-        return e == nullptr ? -1 : (std::atoi(e) != 0 ? 1 : 0);
-    }();
+    static const int env = strata::platform::env_tri("DS4_FAST_ATTN");
 #if defined(STRATA_USE_HIP)
 #if defined(_WIN32)
     return strata::ds4::fast_attn_default(env, device_is_gfx12(), device_is_gfx1151win(), strata::ds4::defaults_026());
@@ -2671,9 +2670,10 @@ void combine(const float* ed, const float* cpu, const float* sh, const Combine& 
     strata_ds4_launch(combine_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, ed, cpu, sh, c, dim, out);
 }
 
-void xfer_put(const Xfer& x, unsigned* flag, unsigned seq, unsigned* cnt, cudaStream_t s) {
+void xfer_put(const Xfer& x, unsigned* flag, unsigned seq, unsigned* cnt, cudaStream_t s, int device) {
     size_t total = 0;
     for (int i = 0; i < x.n; ++i) total += x.bytes[i] / 16;
+    strata::core::count_gpu_traffic(device, 0, (uint64_t) total * 16);
     const int blocks = (int) std::max<size_t>(1, std::min<size_t>(64, (total + kThreads - 1) / kThreads));
     strata_ds4_launch(xfer_put_kernel, blocks, kThreads, 0, s, x, flag, seq, cnt);
     // (another GPU, or the host, waits for this flag: on Windows the put must not sit in the queue - #303: two RTX 3080s
@@ -2682,10 +2682,7 @@ void xfer_put(const Xfer& x, unsigned* flag, unsigned seq, unsigned* cnt, cudaSt
 }
 void win_submit(cudaStream_t s) {
 #if defined(_WIN32)
-    static const bool on = [] {
-        const char* v = std::getenv("DS4_WIN_SUBMIT");
-        return v == nullptr || std::atoi(v) != 0;
-    }();
+    static const bool on = strata::platform::env_tri("DS4_WIN_SUBMIT") != 0;
     if (on) {
         (void) cudaStreamQuery(s);
         (void) cudaGetLastError();
@@ -2694,9 +2691,10 @@ void win_submit(cudaStream_t s) {
     (void) s;
 #endif
 }
-void xfer_get(const Xfer& x, const unsigned* flag, unsigned seq, cudaStream_t s) {
+void xfer_get(const Xfer& x, const unsigned* flag, unsigned seq, cudaStream_t s, int device) {
     size_t total = 0;
     for (int i = 0; i < x.n; ++i) total += x.bytes[i] / 16;
+    strata::core::count_gpu_traffic(device, (uint64_t) total * 16, 0);
     const int blocks = (int) std::max<size_t>(1, std::min<size_t>(64, (total + kThreads - 1) / kThreads));
     strata_ds4_launch(xfer_get_kernel, blocks, kThreads, 0, s, x, flag, seq);
 }
@@ -2710,7 +2708,8 @@ void set_flag(unsigned* flag, unsigned v, cudaStream_t s) {
     strata_ds4_launch(set_flag_kernel, 1, 1, 0, s, flag, v);
     win_submit(s);   // (the writer on another GPU waits for this acknowledgement before its next put - #384)
 }
-void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s) {
+void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt,
+               cudaStream_t s, int device) {
     const int slot = (int) (seq % (unsigned) a.slots);
     if (a.nm > 2 && a.sums != nullptr && a.bflags != nullptr) {   // (the reduce-scatter: ar_rs_kernel)
         static const bool f16 = [] {
@@ -2719,6 +2718,19 @@ void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned
         }();
         const int n4 = n / 4;
         const int blocks = std::max(1, std::min(kArBlocks, cdiv(n4, kThreads)));
+        uint64_t own = 0;
+        const int per = (n4 + blocks - 1) / blocks;
+        for (int b = 0; b < blocks; ++b) {
+            const int lo = b * per, hi = std::min(n4, lo + per);
+            if (lo >= hi)
+                continue;
+            const int cs = (hi - lo + a.nm - 1) / a.nm;
+            const int c0 = std::min(hi, lo + mi * cs), c1 = std::min(hi, c0 + cs);
+            own += (uint64_t) (c1 - c0);
+        }
+        const uint64_t bytes = f16 ? 8 : 16;
+        strata::core::count_gpu_traffic(device, (own * (a.nm - 1) + n4 - own) * bytes,
+                                        (n4 + own) * bytes);
         if (f16)
             strata_ds4_launch(ar_rs16_kernel, blocks, kThreads, 0, s, x, n4, a.data, a.sums, a.stride, a.bflags, a.nm, mi, slot, a.slots, seq);
         else
@@ -2730,7 +2742,8 @@ void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned
     xp.src[0] = x;
     xp.dst[0] = a.data + ((size_t) mi * a.slots + slot) * a.stride;
     xp.bytes[0] = (size_t) n * 4;
-    xfer_put(xp, a.flags + ((size_t) mi * a.slots + slot) * 32, seq, cnt, s);
+    xfer_put(xp, a.flags + ((size_t) mi * a.slots + slot) * 32, seq, cnt, s, device);
+    strata::core::count_gpu_traffic(device, (uint64_t) (n / 4) * 16 * (a.nm - 1), 0);
     const int n4 = n / 4;
     const int blocks = std::max(1, std::min(64, cdiv(n4, kThreads)));
     strata_ds4_launch(ar_sum_kernel, blocks, kThreads, 0, s, x, n4, a.data, a.stride, a.flags, a.nm, mi, slot, a.slots, seq);

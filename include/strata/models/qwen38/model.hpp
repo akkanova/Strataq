@@ -384,15 +384,10 @@ bool pcie_auto_split_ok();
 double get_pcie_share(double link_gbps, double pool_gbps);
 /// Tells whether the HIP defaults of the decode speed push apply to the current card (gfx12; always on CUDA).
 bool decode_defaults_arch_ok();
-/// Picks the route tail skip's rank for a serve start and says on stderr whether it is on (STRATA_ROUTE_TAIL_SKIP: a
-/// missed expert that every token of a verify window routes at that rank or lower is neither copied nor computed;
-/// answers differ slightly, KL ~0.003-0.006, docs/DETAILS.md).  Sets it (strata::core::set_tail_skip_rank) and gets
-/// it; 0 is off.  `host_res` holds each expert's VRAM slot (negative: not in VRAM) and may be empty before the cache
-/// fills; `mixed_windows`: one verify window may hold several requests' rows (then one request's skips would depend
-/// on another's tokens, so there is no default); `peer`: a peer or helper GPU takes misses (the dispatch skips none).
-int choose_tail_skip_rank(const std::vector<int32_t>& host_res, int n_stages, bool native_pack, bool mixed_windows,
-                          bool peer);
-
+/// Enables rank-7 skipping of low-ranked missed experts when the environment leaves STRATA_ROUTE_TAIL_SKIP unset
+/// and the serving configuration allows it. Logs the choice with the prefix `who`. `gpu_experts` counts resident
+/// experts across all stages, or their total planned capacity for the paged engine's caches, which fill on demand.
+void set_tail_skip_default(const Model& m, int64_t gpu_experts, const char* who);
 /// Refines the share of the missed experts that the PCIe link carries from what the CPU pool measures in the first
 /// decode windows (0.1.42; CUDA serve without --pcie-frac).  The balance share is link / (link + CPU rate): the link
 /// is the start-up probe, the CPU rate the expert bytes over the pool's wall time per missed expert

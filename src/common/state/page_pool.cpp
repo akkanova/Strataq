@@ -112,17 +112,21 @@ PagePool::~PagePool() {
         hooks_.free(chunk);
 }
 
-PoolResize PagePool::resize(uint64_t bytes) {
+PoolResize PagePool::resize(uint64_t bytes, const PoolGrowth& growth) {
     open_due();
-    const size_t chunks = bytes / config_.chunk_bytes;
-    if (chunks < chunks_.size())
+    const size_t chunks = bytes / config_.chunk_bytes, had = chunks_.size();
+    if (chunks < had)
         return shrink(chunks);
-    std::string refusal;
+    PoolResize out;
     while (chunks_.size() < chunks) {
         void* chunk = hooks_.alloc(config_.chunk_bytes);
-        if (chunk == nullptr) {
-            refusal = "the memory had room for " + std::to_string(chunks_.size()) + " of " +
-                      std::to_string(chunks) + " chunks";
+        const bool outside = chunk != nullptr && hooks_.is_outside(chunk);
+        if (chunk == nullptr || (outside && !growth.outside_ok)) {
+            if (chunk != nullptr)
+                hooks_.free(chunk);
+            out.own_memory_full = chunk != nullptr;
+            out.refusal = std::string(out.own_memory_full ? "its own memory" : "the memory") + " had room for " +
+                          std::to_string(chunks_.size()) + " of " + std::to_string(chunks) + " chunks";
             break;
         }
         get_memory_manager().mark_pool_backing(chunk, config_.chunk_bytes, config_.label);
@@ -130,12 +134,26 @@ PoolResize PagePool::resize(uint64_t bytes) {
         joined_.push_back(config_.join_chunks && !chunks_.empty() &&
                           chunk == (uint8_t*) chunks_.back() + config_.chunk_bytes);
         chunks_.push_back(chunk);
+        outside_.push_back(outside);
         runs_[first].pages = (uint32_t) pages_per_chunk_;
         runs_[first].use = RunUse::lent;   // (released at once: it joins a free run that ends where it starts)
         release(first, 0);
     }
+    // Only this growth's chunks can be returned; a token minimum or a current loan can prevent releasing spare.
+    if (chunks_.size() > had && growth.spare > 0) {
+        const bool stopped = !out.refusal.empty();
+        const std::optional<uint64_t> room = hooks_.get_own_room();
+        // With outside_ok, the caller holds the spare until resize returns.
+        const uint64_t lack = room ? (growth.outside_ok ? 0 : growth.spare - std::min(*room, growth.spare))
+                                   : (stopped ? growth.spare : 0);
+        const uint64_t chunk = config_.chunk_bytes;
+        const size_t back = (size_t) std::min<uint64_t>(chunks_.size() - had,
+                                                       lack / chunk + (lack % chunk != 0));
+        if (back > 0)
+            (void) shrink(chunks_.size() - back);   // (new chunks hold no conversation yet)
+    }
     place_homes();
-    return {refusal, {}};
+    return out;
 }
 
 std::string PagePool::set_token_limits(int64_t min, int64_t max) {
@@ -318,6 +336,7 @@ PagePoolReport PagePool::report() const {
     out.total = use(page_count());
     out.allocated = use(page_count() - free_pages_);
     out.fragmented = use(fragmented_pages_);
+    out.outside = use((uint64_t) std::count(outside_.begin(), outside_.end(), true) * pages_per_chunk_);
     return out;
 }
 std::vector<MemoryBlock> PagePool::get_memory_blocks() const {
@@ -351,13 +370,15 @@ void PagePool::set_conversation_label(ConversationId id, std::string label) {
 }
 
 bool PagePool::can_lend(uint32_t pages) const {
-    const PageId end = page_count();
+    const PageId end = get_lend_end();
     if (lent_pages_ > 0 || pages == 0 || pages > end - get_top_stretch())
         return false;
     uint64_t blocks = 0, room = free_pages_ + expert_pages_;   // the pages the blocks there may go to
-    for (auto it = std::prev(runs_.upper_bound(end - pages)); it != runs_.end(); ++it) {
+    for (auto it = std::prev(runs_.upper_bound(end - pages)); it != runs_.end() && it->first < end; ++it) {
         const Run& r = it->second;
-        if (r.use == RunUse::free || r.use == RunUse::expert)
+        if (r.use == RunUse::free)
+            room -= std::min(end, it->first + r.pages) - std::max(end - pages, it->first);
+        else if (r.use == RunUse::expert)
             room -= r.pages;
         else
             blocks += get_block_pages(r);
@@ -370,12 +391,12 @@ PoolLend PagePool::lend(uint32_t pages, uint64_t keep_free) {
     PoolLend out;
     if (!can_lend(pages)) {
         out.refusal = lent_pages_ > 0 ? "a run is lent already"
-                      : pages > page_count() - get_top_stretch()
-                          ? "the pool's top holds " + gib(page_count() - get_top_stretch()) + " in one piece"
+                      : pages > get_lend_end() - get_top_stretch()
+                          ? "the pool's top holds " + gib(get_lend_end() - get_top_stretch()) + " in one piece"
                           : "the conversations' blocks there have no room elsewhere";
         return out;
     }
-    const PageId end = page_count(), from = end - pages;
+    const PageId end = get_lend_end(), from = end - pages;
     lending_from_ = from;
     claim_free(from, end);
     uint64_t blocks = 0;   // the conversations' pages there, which experts moving out leave room for
@@ -534,6 +555,7 @@ PoolResize PagePool::shrink(size_t chunks) {
         hooks_.free(chunks_[c]);
     chunks_.resize(chunks);
     joined_.resize(chunks);
+    outside_.resize(chunks);
     place_homes();
     return {};
 }
@@ -577,8 +599,6 @@ std::string PagePool::check_growth(const Conversation& c, int64_t tokens) const 
     return {};
 }
 
-/// Gets how many blocks region `region` of a conversation of `tokens` tokens takes: a fixed region one (none when
-/// it is empty).
 uint64_t PagePool::region_blocks(size_t region, int64_t tokens) const {
     if (is_fixed(region))
         return block_pages_[region] > 0 ? 1 : 0;
@@ -622,9 +642,17 @@ PageId PagePool::find_expert_place(uint32_t pages, uint64_t keep) const {
     return first;
 }
 
-/// Gets the first page of the joined chunks at the pool's top: the most `lend` may lend.
+/// Gets the end of the pages `lend` may lend: the first page of the lowest chunk outside the memory's own, else the
+/// pool's end.  Other programs freeing memory can let dedicated chunks follow shared ones; without remapping,
+/// lending stays below the first shared chunk even then.
+PageId PagePool::get_lend_end() const {
+    return (PageId) ((size_t) (std::find(outside_.begin(), outside_.end(), true) - outside_.begin()) *
+                     pages_per_chunk_);
+}
+
+/// Gets the first page of the joined chunks that end at get_lend_end: the most `lend` may lend.
 PageId PagePool::get_top_stretch() const {
-    size_t c = chunks_.size();
+    size_t c = get_lend_end() / pages_per_chunk_;
     while (c > 1 && joined_[c - 1])
         --c;
     return (PageId) ((c == 0 ? 0 : c - 1) * pages_per_chunk_);
@@ -878,7 +906,8 @@ void PagePool::release_lent(PageId from, PageId end) {
 
 /// Tells whether the run that starts at `first` reaches into the run `lend` is clearing.
 bool PagePool::is_lending(PageId first) const {
-    return lending_from_ != no_page && first + runs_.at(first).pages > lending_from_;
+    return lending_from_ != no_page && first < get_lend_end() &&
+           first + runs_.at(first).pages > lending_from_;
 }
 
 /// Adds a free run to the indexes (of all free runs, and of the open ones or the closed ones) and the count of

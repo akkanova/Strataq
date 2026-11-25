@@ -2,6 +2,7 @@
 //
 // The per-token arithmetic of every kernel here is transcribed from its single-token original (fused_gdn.cu,
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
+#include "strata/base/platform/env.hpp"
 #include "strata/models/qwen38/kernels/verify_kernels.hpp"
 #include "strata/common/kernels/native_mmvq.hpp"
 #include "strata/core/bw_dense_defaults.hpp"
@@ -1027,10 +1028,7 @@ bool multi_block_head_ops() {
 #if defined(STRATA_HIP_GFX906)
     return false;
 #else
-    static const int env = [] {
-        const char* v = std::getenv("STRATA_MULTI_BLOCK_ARGMAX");
-        return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1;
-    }();
+    static const int env = strata::platform::env_tri("STRATA_MULTI_BLOCK_ARGMAX");
     if (env == 0) return false;
 #if defined(__HIPCC__)
     static int arch[64] = {};   // 0 unknown, 1 gfx12 (RDNA4: the only HIP target #3264 was run on), 2 other
@@ -1051,10 +1049,7 @@ bool argmax_rows_wanted() {
 #if defined(STRATA_HIP_GFX906)
     return false;
 #else
-    static const int env = [] {
-        const char* v = std::getenv("STRATA_ARGMAX_ROWS");
-        return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1;
-    }();
+    static const int env = strata::platform::env_tri("STRATA_ARGMAX_ROWS");
     if (env >= 0) return env != 0 && multi_block_head_ops();
 #if defined(__HIPCC__)
     static int arch[64] = {};   // 0 unknown, 1 gfx12 (RDNA4), 2 other
@@ -1296,10 +1291,7 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         check("gdn_step_norm_multi (split)");
         return;
     }
-    static const bool commit_split = [] {
-        const char* e = std::getenv("STRATA_GDN_COMMIT_SPLIT");
-        return !e || e[0] != '0';
-    }();
+    static const bool commit_split = !strata::platform::is_env_off("STRATA_GDN_COMMIT_SPLIT");
     if (commit_split && n_keep != nullptr && t_out_begin >= n_tok) {
         static const bool dbg = [] { const char* e = std::getenv("STRATA_DBG_GDN"); return e && e[0] == '1'; }();
         if (dbg) gdn_step_commit_kernel<true><<<dim3((unsigned) h_v, 4u), dim3(32, RG), 0, (cudaStream_t) stream>>>(

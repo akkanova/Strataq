@@ -98,10 +98,11 @@ struct LayerSizes {
     uint64_t get_range_bytes(int64_t lb, int64_t le, int64_t conversations, int64_t tokens) const;
 };
 
-/// Gets the problem of splitting a model of `sizes` over cards whose pools take `pool_bytes` each (their memory
-/// settings), keeping the state of `conversations` conversations of `tokens` tokens each on the card that runs their
-/// layers.  The cards' speeds and the profile are left to the caller.
+/// Builds a split problem reserving `conversations` states of `tokens` tokens on their layers' cards. Pool sizes,
+/// layer times (ms) and host-link speeds (GB/s, 0 unknown) must have one entry per card. Slower links increase the
+/// cost of missing experts (split_rules::link_miss_scale). The caller supplies the expert ranking.
 SplitProblem make_paged_split_problem(const LayerSizes& sizes, const std::vector<uint64_t>& pool_bytes,
+                                      const std::vector<double>& layer_ms, const std::vector<double>& link_gbps,
                                       int64_t conversations, int64_t tokens);
 
 }  // namespace strata::core

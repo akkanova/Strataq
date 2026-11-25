@@ -15,6 +15,8 @@ engine).
 - `request.hpp`: a request line (`RUN`, `RUNI`, plus legacy handler forms) split into its parts, its token ids, and the
   sampling keys every engine reads; the logprobs keys and their `LP` lines (`format_logprob_line`, and `RowLogprobs`,
   which the paged engine's models fill as they pick tokens).
+- `option_names.hpp`: the older command-line names of a setting (`--reserve-mib`, `--eos`, `--slots`, ...) that each
+  parser built from `src/` reads as the primary name (`get_primary_option`). Header only.
 - `gpu_fatal.hpp`: how an engine ends after a fatal GPU error (#4350): `ERR fatal GPU error: <reason>` and exit code
   3, by which the server fails the request with a 503 and starts the engine again. Header only; the old engines and
   the paged engine call it where a step or a prompt read fails.
@@ -28,6 +30,8 @@ engine).
   own options, the runtime's environment, the cards' links, the pools' sizes and their GPU memory, and the RAM's pool
   and the copy-back rule (`open_ram_pool`). The pools open empty: the engine says `READY` and then fills them while
   it serves, the GPUs' first, and the RAM's with the experts no GPU holds.
+- `chunk_pieces.hpp`: on an integrated GPU under Windows, a GPU pool's chunk that lands in shared memory as one
+  physical piece is taken again in 16 MiB pieces (`take_chunk_in_pieces`), which fill more of the dedicated memory.
 - `decode_selection.hpp`: selects the highest-priority requests for a paged decode step. Equal priorities keep
   request order until completion or preemption; requests waiting for a turn do not rotate into the selected set.
   Cancellations drain first without generating rows. `concurrent` limits this selected set, not admitted requests

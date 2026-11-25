@@ -75,3 +75,46 @@ test('a start that still dies for lack of cache room (the reporter\'s own log) i
   assert.equal(flag(tight.config.args, '--vram-reserve-mib'), '1024');
   assert.ok(Number(flag(tight.config.args, '--max-context')) < 262144, 'the rest comes from the context');
 });
+
+test('page-pool executable paths on Windows and Linux get the display and headless reserves', () => {
+  for (const name of ['strata-q38', 'strata-ds41']) {
+    for (const exe of [name, `${name}.exe`, `C:\\Strata\\engine\\${name}.exe`, `/opt/strata/engine/${name}`]) {
+      const cfg = { gpu: 0, args: [], exe };
+      for (const gb of [12, 24]) {
+        const hardware = card(gb);
+        assert.equal(defaultReserves(cfg, hardware).performance, 512, exe);
+        assert.equal(defaultReserves(cfg, card(gb, { drives_display: false })).performance, 256, exe);
+        assert.equal(resourceSettings(cfg, hardware, 'performance').vram_reserve_mib, 512, exe);
+      }
+    }
+  }
+});
+
+test('page-pool reserves preserve Work, GPU pictures, baselines and explicit choices', () => {
+  const cfg = { gpu: 0, args: [], exe: '/opt/strata/strata-q38' };
+  assert.deepEqual(defaultReserves(cfg, card(12)), { work: 1536, performance: 512 });
+  assert.deepEqual(defaultReserves(cfg, card(24)), { work: 4915, performance: 512 });
+  assert.deepEqual(defaultReserves(cfg, card(24, { unified: true })), { work: 512, performance: 512 });
+  assert.deepEqual(defaultReserves(cfg, card(24, { drives_display: false })), { work: 256, performance: 256 });
+  for (const drives_display of [true, false]) {
+    const hardware = card(12, { drives_display });
+    assert.deepEqual(defaultReserves({ ...cfg, vision: { gpu: true } }, hardware),
+      { work: 2048, performance: 2048 });
+    assert.equal(defaultReserves({ ...cfg, vision: { gpu: false } }, hardware).performance,
+      drives_display ? 512 : 256);
+  }
+  assert.equal(defaultReserves(cfg, card(24), 900).performance, 900);
+  assert.equal(resourceSettings(cfg, card(24), 'performance', {}, { vram_reserve_mib: 0 }).vram_reserve_mib, 0);
+});
+
+test('older executables and similar names keep the old reserve policy', () => {
+  for (const exe of ['strata.exe', 'strata-dsv41', 'strata-q36.exe', '/opt/strata/not-strata-q38',
+    '/opt/strata/strata-q38.bak', 'C:\\Strata\\strata-q38Xexe']) {
+    const cfg = { gpu: 0, args: [], exe };
+    assert.equal(defaultReserves(cfg, card(12)).performance, 1536, exe);
+    assert.equal(defaultReserves(cfg, card(24)).performance, 1024, exe);
+    assert.equal(defaultReserves(cfg, card(24, { drives_display: false })).performance, 512, exe);
+    assert.equal(defaultReserves({ ...cfg, vision: { gpu: true } },
+      card(24, { drives_display: false })).performance, 700, exe);
+  }
+});

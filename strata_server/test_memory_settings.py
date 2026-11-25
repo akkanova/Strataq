@@ -153,6 +153,15 @@ class MemorySettings(FakeEngineCase):
         self.assertEqual(self.saved(), cfg)
         self.assertEqual(got["settings"]["rows"], 6)
 
+    def test_the_reserve_is_changed_live_and_saved_as_its_flag(self):
+        self.start(config=True)
+        status, got = self.post({"set": {"vram_reserve_mib": 1024}, "save": "default"})
+        self.assertEqual(status, 200, got)
+        self.assertEqual(self.sent(), ["CHANGE_SETTINGS vram_reserve_mib=1024"])
+        self.assertEqual(got["defaults"]["vram_reserve_mib"], 1024)
+        self.assertEqual(self.saved()["args"], [*CFG["args"], "--vram-reserve-mib", "1024"])
+        self.assertEqual(self.post({"set": {"vram_reserve_mib": -1}})[0], 400)
+
     def test_a_layer_split_saves_every_card(self):
         from strata_server import runconfig
         settings = {"rows": 8, "memory_mib.gpu0": 9216, "memory_mib.gpu0.1": 9216, "memory_mib.ram": 8192}

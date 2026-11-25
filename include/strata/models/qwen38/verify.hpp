@@ -37,10 +37,16 @@
 #include <functional>
 #include <map>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
 namespace strata::core {
+
+/// Gets the logit bonus verify windows give GPU-resident experts (0: the router's own choice).
+float get_route_prior();
+/// Changes the bonus for subsequent windows; negative values turn it off.
+void set_route_prior(float lambda);
 
 /// 0.1.43 (STRATA_ADAPT_OVERLAP): the adaptive tier's copies still landing while a decode window runs.  The window's
 /// residency tables are the baseline's (the swapped-in experts are resident from the window's first layer), but their
@@ -336,6 +342,12 @@ public:
         }
         if (next_) next_->set_slot_sampling(slot, sp);
     }
+    /// Sets which drafts the batch window's sampled rows keep (strata-q38's draft rule; draft_rule.hpp).  Set on the
+    /// first stage, it reaches the last.
+    void set_draft_rule(strata::kernels::DraftRule rule) {
+        draft_rule_ = rule;
+        if (next_) next_->set_draft_rule(rule);
+    }
     /// Reserves the sampler's device history before a pipeline wave starts.
     bool reserve_batch_history(size_t tokens, std::string& err);
     /// Supplies host penalty histories in the order of the next batch window's rows (strata-q38; set_slot_history is
@@ -491,6 +503,12 @@ public:
 private:
     /// Checks whether each conversation owns exactly one row, so no rejected state needs replaying.
     bool can_self_commit(const int* rows, int count) const;
+    /// Writes each slot group's accepted prefix (`keep[slot]` rows, or all its rows if `keep` is null) and the rows'
+    /// positions `pos` into the slot's commit record in `records`; fails if a prefix is empty or overruns its group.
+    bool write_slot_prefixes(const int* rows, int S, const int* keep, const int64_t* pos, int32_t* records,
+                             std::string& err) const;
+    /// Moves each slot's last two PLE hash tokens past its accepted rows' `tokens` (the host's side of a commit).
+    void advance_ple_prev(const int* rows, int S, const int* keep, const int32_t* tokens);
     bool batch_self_commit_default_ = false; ///< The caller's policy when no environment override is set.
     bool batch_self_commit_ = false; ///< The policy resolved before any graphs are captured.
     bool resident_shared_inline_ = false; ///< Avoids competing weight reads when a resident batch plans on device.
@@ -512,6 +530,12 @@ private:
     std::vector<int> bkey(const int* rows, int S, int hbase) const {   // #871: the doorbell variant has its own graphs
         std::vector<int> k = batch_key(rows, S, hbase);
         k.push_back(ar_off_ ? 1 : 0);
+        // Kernel scalar arguments are captured in the graph, so each bonus needs its own decode graph.
+        const float prior = get_route_prior();
+        int prior_bits = 0;
+        static_assert(sizeof(prior_bits) == sizeof(prior));
+        std::memcpy(&prior_bits, &prior, sizeof(prior));
+        k.push_back(prior_bits);
         return k;
     }
     static std::vector<int> batch_key(const int* rows, int S, int hbase) {
@@ -561,6 +585,8 @@ private:
     int32_t* slot_hist_d_ = nullptr;                     ///< the penalty-history rows of the current batch window (device)
     size_t slot_hist_cap_ = 0;
     bool sample_rows(int S, std::string& err);   ///< applies sampling and penalties to the last batch window
+    /// Copies `n` drafts to the head of d_spec_ (allocated on first use) on cs_; null when it cannot.
+    int32_t* stage_drafts(const int32_t* drafts, int n);
     int slot_row_draw(int S, int t, strata::kernels::SamplerParams& sp, const int32_t*& hist, int& hlen, std::vector<int32_t>& hrows, std::string& err);   ///< one row's draw from its slot's reply tail
     int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
     int32_t* commitb_ = nullptr;
@@ -631,6 +657,8 @@ private:
     int spec_nq_ = 0;
     bool spec_measure_ = false;   ///< explicit per-call measure borrow
     int32_t* d_spec_ = nullptr;          ///< device: kVerifyMaxT draft ids, then kVerifyMaxT q rows
+    /// set_draft_rule; Exact: a sampled batch row is drawn as without drafts and compared with its draft
+    strata::kernels::DraftRule draft_rule_{strata::kernels::DraftRule::Exact};
     int hist_len_ = 0;
     bool head_sampling_ = true;          ///< set_head_sampling
 #if defined(STRATA_GPU_METAL)

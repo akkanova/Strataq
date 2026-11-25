@@ -543,7 +543,7 @@ int Model::load() {
                 const strata::GgufFile meta(o.native_shards.front());
                 const std::string why = strata::model_family_not_supported(strata::model_family(meta));
                 if (strata::model_family(meta) != strata::ModelFamily::Unknown && !why.empty()) {
-                    std::fprintf(stderr, "strata generate: --native %s: %s\n", o.native_preset.c_str(), why.c_str());
+                    std::fprintf(stderr, "strata generate: --model %s: %s\n", o.native_preset.c_str(), why.c_str());
                     return 2;
                 }
             }
@@ -555,11 +555,11 @@ int Model::load() {
                 if (model.find("per_layer_token_embd.weight", &at) != nullptr) o.ple_gguf = o.native_shards[at];
             }
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "strata generate: --native %s: %s\n", o.native_preset.c_str(), e.what());
+            std::fprintf(stderr, "strata generate: --model %s: %s\n", o.native_preset.c_str(), e.what());
             return 2;
         }
         if (o.no_ple || o.ple_gguf.empty()) {
-            std::fprintf(stderr, "strata generate: --native requires --ple-gguf (the PLE key is native too), and no "
+            std::fprintf(stderr, "strata generate: --model requires --ple-gguf (the PLE key is native too), and no "
                                  "shard of the model holds per_layer_token_embd.weight\n");
             return 2;
         }
@@ -950,7 +950,7 @@ int Model::load() {
         // 0.2.7: gfx12 native packs start at 0.15 (see pcie_share_gfx12_default), in strata-q38 as well; other cards
         // and STRATA_PCIE_FRAC_DEFAULT=old keep the x16 share measured for them.
         const double base = strata::pcie_start_frac(nvfp4_pack, native_pack, pcie_share_gfx12_default(),
-                                                    pf_old, strata::qwen_defaults_026());
+                                                    pf_old, strata::defaults_026());
         std::string bursts;
 #if !defined(STRATA_USE_HIP) && defined(_WIN32)
         // Windows: opt-in (STRATA_PCIE_AUTO_CANON=1); an RTX 5070 decoded a short Q2_0 answer 3% slower with it, code 2.5% faster
@@ -1156,7 +1156,7 @@ int Model::load() {
     if (native_pack) {
         if (o.native_preset.empty() || o.spec < 2 || o.keep_canonical ||
             (o.prefill_chunk <= 0 && o.tokens.size() > 1)) {
-            std::fprintf(stderr, "strata generate: %s is a native (IQ) pack: it needs --native SHARD1, --spec T (T >= 2) "
+            std::fprintf(stderr, "strata generate: %s is a native (IQ) pack: it needs --model SHARD1, --spec T (T >= 2) "
                                  "and --prefill CHUNK\n", o.pack.c_str());
             return 2;
         }
@@ -1602,7 +1602,7 @@ int Model::load() {
         if (pio.mode == strata::kernels::PleIo::Direct && !o.ple_io_explicit) {
             const strata::kernels::PleIoOptions direct_pio = pio;
             const char* auto_ram = std::getenv("STRATA_PLE_AUTO_RAM");
-            bool allowed = strata::core::ple_auto_ram_allowed(auto_ram, strata::qwen_defaults_026());
+            bool allowed = strata::core::ple_auto_ram_allowed(auto_ram, strata::defaults_026());
 #if defined(__APPLE__)
             // Not on the Mac unless asked (STRATA_PLE_AUTO_RAM=1): unified memory with the experts mapped from the file cache.  M5 Max,
             // IQ3_S, 3 interleaved pairs: with the 26.8 GiB table locked, a cold 4K prompt after decode work is 10.6% slower (-10.7 -10.6
@@ -2235,7 +2235,7 @@ int Model::load() {
         const int64_t pf = search && ((split_own_auto && !place_with_reserve) || is_paged()) ? 0 : split_pf_mib;
         // what a later stage allocates after its cache and nothing prices (cuBLAS, the modules and the MMQ pool the prompt path warms up, ~250 MiB measured): the single card prices
         // it (kLateAllocMib, #4474); a stage did not, and two 16 GB cards ended a start with 131 MiB free and ran out of memory in the first long prompt.  Not under STRATA_DEFAULTS=026.
-        const int64_t late_alloc = later && !strata::qwen_defaults_026() ? strata::program::split_walk::kStageLateAllocMib : 0;
+        const int64_t late_alloc = later && !strata::defaults_026() ? strata::program::split_walk::kStageLateAllocMib : 0;
         const int64_t base_reserve =
             (later && o.vram_reserve_later_mib >= 0 ? o.vram_reserve_later_mib : o.vram_reserve_mib) + late_alloc;
         strata::program::stage_reserve::Inputs rin;
@@ -2660,7 +2660,7 @@ int Model::load() {
         // NVIDIA, 2 cards: the pipelined groups by default (0.2.7); one serial group, the 0.2.1-0.2.6 default, with
         // STRATA_BATCH_GROUPS_NV_SERIAL=1 or STRATA_DEFAULTS=026 (batch_groups.hpp nv_serial_wanted)
         bin.nv_serial_faster = strata::program::batch_groups::nv_serial_wanted(std::getenv("STRATA_BATCH_GROUPS_NV_SERIAL"),
-                                                                              strata::qwen_defaults_026());
+                                                                              strata::defaults_026());
 #endif
         { const char* mp = std::getenv("STRATA_PIPED_MTP"); bin.mtp_piped = mp != nullptr && mp[0] != '\0' && mp[0] != '0'; }
         return strata::program::batch_groups::resolve(bin);
@@ -3748,7 +3748,7 @@ int Model::load() {
         // keep (459 MiB free at --vram-reserve-mib 700: under the 512 MiB line the serve check warns about, #2065).  The cache now leaves it too.
         // Not on a card that could not keep min_slots after it, and not under STRATA_DEFAULTS=026 (the v0.2.6 sizing).
         strata::core::AutoCacheSlots auto_slots = strata::core::auto_cache_slots(
-            (int64_t) free_b, reserve, blob, min_slots, strata::qwen_defaults_026() ? 0 : strata::core::kLateAllocMib);
+            (int64_t) free_b, reserve, blob, min_slots, strata::defaults_026() ? 0 : strata::core::kLateAllocMib);
         int64_t slots = auto_slots.slots;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
 #if defined(STRATA_GPU_METAL)
@@ -3803,7 +3803,7 @@ int Model::load() {
                              o.expert_cache, (long long) min_slots, (long long) kTightKeep);
                 min_slots = tight_min;
                 g_lend_keep = kTightKeep;
-                auto_slots = strata::core::auto_cache_slots((int64_t) free_b, reserve, blob, min_slots, strata::qwen_defaults_026() ? 0 : strata::core::kLateAllocMib);
+                auto_slots = strata::core::auto_cache_slots((int64_t) free_b, reserve, blob, min_slots, strata::defaults_026() ? 0 : strata::core::kLateAllocMib);
                 int64_t s3 = auto_slots.slots;
                 if (!profile.empty()) s3 = std::min<int64_t>(s3, (int64_t) profile.size());
                 o.expert_cache = (int) std::max<int64_t>(s3, 0);
@@ -3846,7 +3846,7 @@ int Model::load() {
             int64_t pick_chunk = 0, pick_slots = 0, pick_own = 0, pick_late = 0;
             for (const int64_t c : {(int64_t) 1024, (int64_t) 512, (int64_t) 256}) {
                 const int64_t own = ((int64_t) strata::prefill::Prefill::bytes_needed_owned(g, ss, c, srcp != nullptr) >> 20) + 64;
-                const int64_t late = strata::qwen_defaults_026() ? 0 : (int64_t) strata::core::kLateAllocMib;
+                const int64_t late = strata::defaults_026() ? 0 : (int64_t) strata::core::kLateAllocMib;
                 const int64_t room = (int64_t) free_b - mtp_bind - pipe_first - ((own + late + kSpillFloorMib) << 20);
                 const int64_t s = room > 0 ? std::min<int64_t>(room / blob, (int64_t) profile.size()) : 0;
                 if (s >= 64 || (s >= 1 && pick_slots < 64)) { pick_chunk = c; pick_slots = s; pick_own = own; pick_late = late; }
@@ -3874,7 +3874,7 @@ int Model::load() {
             std::string herr;
             if (native_head.to_host(herr)) {
                 free_b = strata::core::device_free_bytes();
-                strata::core::AutoCacheSlots a2 = strata::core::auto_cache_slots((int64_t) free_b, reserve, blob, min_slots, strata::qwen_defaults_026() ? 0 : strata::core::kLateAllocMib);
+                strata::core::AutoCacheSlots a2 = strata::core::auto_cache_slots((int64_t) free_b, reserve, blob, min_slots, strata::defaults_026() ? 0 : strata::core::kLateAllocMib);
                 int64_t s4 = a2.slots;
                 if (!profile.empty()) s4 = std::min<int64_t>(s4, (int64_t) profile.size());
                 if (s4 < min_slots && o.vram_reserve_mib > kSmallReserveMib) {   // the reserve lowered for the smaller cache, as above
@@ -4336,7 +4336,7 @@ int Model::load() {
 #if defined(STRATA_HAVE_DFLASH2)
         // DFlash2's own draft head and logits (and, in serve, the prompt staging) are bound on its card AFTER the caches, as the single card prices them (mtp_bind above): without
         // this term the last stage ended its load with 130-400 MiB less than the plan kept (the serve check's LOW at 8 and 12 GB).  Not under STRATA_DEFAULTS=026.
-        if (use_df2 && &st == last_st && !df2_first && !strata::qwen_defaults_026()) {
+        if (use_df2 && &st == last_st && !df2_first && !strata::defaults_026()) {
             df2_after = get_df2_head_bytes() + (48 << 20) + (o.serve ? (112 << 20) : 0);
             room = std::max<int64_t>(room - df2_after, 0);
         }
@@ -4516,10 +4516,7 @@ int Model::load() {
     // predicates on the chosen split: every participant must lend a 512-token chunk, or afford its own buffers
     // with the 512 MiB headroom.  Serve's live checks stay as the guard; this is the pre-flight confirmation.
     // STRATA_LAYER_SPLIT_PROBE=0 skips it.
-    static const bool split_probe = [] {
-        const char* v = std::getenv("STRATA_LAYER_SPLIT_PROBE");
-        return v == nullptr || v[0] != '0';
-    }();
+    static const bool split_probe = !strata::platform::is_env_off("STRATA_LAYER_SPLIT_PROBE");
     if (multi_gpu && split_auto && split_probe && !split_at.empty()) {
         const int ns = (int) stages.size() + 1;
         const int64_t kPct = get_auto_lend_pct();
@@ -5535,64 +5532,10 @@ void mem_mark(const char* where) {
     }
 }
 
-int choose_tail_skip_rank(const std::vector<int32_t>& host_res, int n_stages, bool native_pack, bool mixed_windows,
-                          bool peer) {
-    // STRATA_ROUTE_TAIL_SKIP: ON BY DEFAULT on CUDA builds (owner decision, 0.1.42) and on HIP gfx1200/gfx1201 (0.1.43): a missed expert that every token of
-    // a verify window routes at rank 7 or lower is neither copied nor computed (answers differ slightly from 0.1.41,
-    // KL ~0.003-0.006; docs/DETAILS.md).  =0 restores 0.1.41's bytes.  Nothing to do, so no default and no line, when every
-    // expert is in VRAM; off when a window mixes requests (--batch slots; one request's skip would then depend on
-    // another's tokens) and, as in the dispatch, with a peer or helper GPU.  A layer split is fine: each stage skips by itself.
-    const bool all_experts_resident = !host_res.empty() &&
-        std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
-    const char* tse = std::getenv("STRATA_ROUTE_TAIL_SKIP");
-    // #1884: with nearly every expert in the GPU cache (V100 32 GB, Coder IQ1_M: 94.8% of the experts, 99.9% decode hits) the few
-    // misses are cheap and the skip costs more draft acceptance (70.1% -> 68.2%) than it saves: -1..2% decode.  No default then.
-    size_t cached_experts = 0;
-    for (int32_t r : host_res) cached_experts += r >= 0 ? 1 : 0;
-    // (STRATA_TAIL_SKIP_MAX_CACHED=<percent>, default 90, moves the line; 101 = never).  0.1.43: 60 on a HIP layer split, where
-    // 2x R9700 (5 pairs, skip on vs off): Q2_0 story -6.2% at 70% cached, -1.8% at 60%; IQ3_S +6..15% at 44-52%, about 0 at 60%.
-#if defined(STRATA_USE_HIP)
-    const double max_cached_default = n_stages > 1 ? 0.60 : 0.90;
-#else
-    (void) n_stages;
-    const double max_cached_default = 0.90;
-#endif
-    const char* mcs = std::getenv("STRATA_TAIL_SKIP_MAX_CACHED");
-    const double max_cached = mcs != nullptr && mcs[0] != 0 ? std::atof(mcs) / 100.0 : max_cached_default;
-    const bool nearly_all_cached = !host_res.empty() && !all_experts_resident &&
-                                   (double) cached_experts >= max_cached * (double) host_res.size();
-    // NVFP4 experts (any layer): no default (sergqwer/strata-nvfp4 c83625c3).  On the fork's qwen-nvfp4-gptq pack the
-    // skip moved the answers by teacher-forced KL 0.035 against it off - as much as the GPTQ quantization's own error
-    // against an all-Q8_0 reference (0.038) - for +11.5% decode (RTX 5090).  STRATA_ROUTE_TAIL_SKIP=7 opts in.
-    bool nvfp4_experts = false;
-    if (native_pack)
-        for (const auto& f : strata::kernels::cpu::expert_layout().fmt)
-            nvfp4_experts = nvfp4_experts || f.gu_type == strata::kernels::cpu::kNvfp4Type ||
-                            f.d_type == strata::kernels::cpu::kNvfp4Type;
-    const bool tail_default_path = tse == nullptr && !all_experts_resident && !nearly_all_cached && !mixed_windows &&
-                                   decode_defaults_arch_ok() &&
-                                   !peer;
-    const bool tail_default_ok = tail_default_path && !nvfp4_experts;
-    if (tail_default_path && nvfp4_experts)
-        std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP is off by default with NVFP4 experts (it moved an NVFP4 "
-                             "pack's answers by about as much as its quantization does); STRATA_ROUTE_TAIL_SKIP=7 turns it on\n");
-    if (tse == nullptr && nearly_all_cached && !mixed_windows && !peer && decode_defaults_arch_ok())
-        std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP is off by default: %.1f%% of the experts are in the GPU cache, so "
-                             "few are missed and skipping them costs more draft acceptance than it saves; "
-                             "STRATA_ROUTE_TAIL_SKIP=7 turns it on\n", 100.0 * (double) cached_experts / (double) host_res.size());
-    if (tail_default_ok) strata::core::set_tail_skip_rank(7);
-    if (strata::core::tail_skip_rank() > 0 && !all_experts_resident)
-        std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP=%d is ON%s: a missed expert that every token of a verify window routes at rank %d or "
-                             "lower is skipped (+10..20%% decode on 12-16 GB cards that miss experts, answers differ slightly from 0.1.41); "
-                             "STRATA_ROUTE_TAIL_SKIP=0 turns it off\n", strata::core::tail_skip_rank(),
-                     tse == nullptr ? " (default)" : "", strata::core::tail_skip_rank());
-    return strata::core::tail_skip_rank();
-}
-
 double get_pcie_share(double link_gbps, double pool_gbps) {
-    static const double ceiling = strata::pcie_share_ceiling(spill_discrete_gpu(), strata::qwen_defaults_026(),
+    static const double ceiling = strata::pcie_share_ceiling(spill_discrete_gpu(), strata::defaults_026(),
                                                              std::getenv("STRATA_PCIE_SHARE_MAX"));
-    static const bool k_rule = strata::pcie_k_rule_default(spill_discrete_gpu(), strata::qwen_defaults_026(),
+    static const bool k_rule = strata::pcie_k_rule_default(spill_discrete_gpu(), strata::defaults_026(),
                                                            std::getenv("STRATA_PCIE_K_RULE"));
     return strata::pcie_share_for(link_gbps, pool_gbps, ceiling, k_rule);
 }
@@ -5606,7 +5549,7 @@ bool pcie_auto_split_ok() {
 #else
         const bool hip = false;
 #endif
-        return strata::pcie_auto_split_default(hip, spill_discrete_gpu(), strata::qwen_defaults_026(), std::getenv("STRATA_PCIE_AUTO_SPLIT"));
+        return strata::pcie_auto_split_default(hip, spill_discrete_gpu(), strata::defaults_026(), std::getenv("STRATA_PCIE_AUTO_SPLIT"));
     }();
     return on;
 }
@@ -5622,6 +5565,64 @@ bool decode_defaults_arch_ok() {
 #else
     return true;
 #endif
+}
+
+void set_tail_skip_default(const Model& m, int64_t gpu_experts, const char* who) {
+    const Options& o = m.o;
+    const int64_t n_experts = m.is_paged() ? m.g.n_layers * m.g.n_expert : (int64_t) m.host_res.size();
+    const bool all_experts_resident = n_experts > 0 && gpu_experts >= n_experts;
+    // STRATA_ROUTE_TAIL_SKIP: ON BY DEFAULT on CUDA builds (owner decision, 0.1.42) and on HIP gfx1200/gfx1201
+    // (0.1.43): a missed expert that every token of a verify window routes at rank 7 or lower is neither copied nor
+    // computed (answers differ slightly from 0.1.41, KL ~0.003-0.006; docs/DETAILS.md).  =0 restores 0.1.41's bytes.
+    // Nothing to do, so no default and no line, when every expert is in VRAM; off with --batch slots (a window then
+    // mixes requests, and one request's skip would depend on another's tokens) and, as in the dispatch, with a peer
+    // or helper GPU.  A layer split is fine: each stage skips by itself.  The paged engine's windows mix its
+    // conversations too, but there the dispatch decides for each conversation by its own tokens
+    // (ExpertDispatch::token_owner), and a pipelined group that mixes them skips nothing (PagedQwen::prepare_group),
+    // so the default stays.
+    const char* tse = std::getenv("STRATA_ROUTE_TAIL_SKIP");
+    // #1884: with nearly every expert in the GPU cache (V100 32 GB, Coder IQ1_M: 94.8% of the experts, 99.9% decode
+    // hits) the few misses are cheap and the skip costs more draft acceptance (70.1% -> 68.2%) than it saves:
+    // -1..2% decode.  No default then.
+    // (STRATA_TAIL_SKIP_MAX_CACHED=<percent>, default 90, moves the line; 101 = never).  0.1.43: 60 on a HIP layer
+    // split, where 2x R9700 (5 pairs, skip on vs off): Q2_0 story -6.2% at 70% cached, -1.8% at 60%; IQ3_S +6..15%
+    // at 44-52%, about 0 at 60%.
+#if defined(STRATA_USE_HIP)
+    const double max_cached_default = !m.split_devs.empty() ? 0.60 : 0.90;
+#else
+    const double max_cached_default = 0.90;
+#endif
+    const char* mcs = std::getenv("STRATA_TAIL_SKIP_MAX_CACHED");
+    const double max_cached = mcs != nullptr && mcs[0] != 0 ? std::atof(mcs) / 100.0 : max_cached_default;
+    const bool nearly_all_cached = n_experts > 0 && !all_experts_resident &&
+                                   (double) gpu_experts >= max_cached * (double) n_experts;
+    // NVFP4 experts (any layer): no default (sergqwer/strata-nvfp4 c83625c3).  On the fork's qwen-nvfp4-gptq pack the
+    // skip moved the answers by teacher-forced KL 0.035 against it off - as much as the GPTQ quantization's own error
+    // against an all-Q8_0 reference (0.038) - for +11.5% decode (RTX 5090).  STRATA_ROUTE_TAIL_SKIP=7 opts in.
+    bool nvfp4_experts = false;
+    if (m.native_pack)
+        for (const auto& f : strata::kernels::cpu::expert_layout().fmt)
+            nvfp4_experts = nvfp4_experts || f.gu_type == strata::kernels::cpu::kNvfp4Type ||
+                            f.d_type == strata::kernels::cpu::kNvfp4Type;
+    const bool start_allows = tse == nullptr && o.batch == 0 && o.peer_device < 0 && decode_defaults_arch_ok();
+    const bool tail_default_path = start_allows && !all_experts_resident && !nearly_all_cached;
+    if (tail_default_path && nvfp4_experts)
+        std::fprintf(stderr, "%s: STRATA_ROUTE_TAIL_SKIP is off by default with NVFP4 experts (it moved an NVFP4 "
+                             "pack's answers by about as much as its quantization does); "
+                             "STRATA_ROUTE_TAIL_SKIP=7 turns it on\n", who);
+    if (start_allows && nearly_all_cached)
+        std::fprintf(stderr, "%s: STRATA_ROUTE_TAIL_SKIP is off by default: %.1f%% of the experts are in the GPU "
+                             "cache, so few are missed and skipping them costs more draft acceptance than it saves; "
+                             "STRATA_ROUTE_TAIL_SKIP=7 turns it on\n", who,
+                     100.0 * (double) gpu_experts / (double) n_experts);
+    if (tail_default_path && !nvfp4_experts)
+        strata::core::set_tail_skip_rank(7);
+    if (strata::core::tail_skip_rank() > 0 && !all_experts_resident)
+        std::fprintf(stderr, "%s: STRATA_ROUTE_TAIL_SKIP=%d is ON%s: a missed expert that every token of a verify "
+                             "window routes at rank %d or lower is skipped (+10..20%% decode on 12-16 GB cards "
+                             "that miss experts, answers differ slightly from 0.1.41); "
+                             "STRATA_ROUTE_TAIL_SKIP=0 turns it off\n", who, strata::core::tail_skip_rank(),
+                     tse == nullptr ? " (default)" : "", strata::core::tail_skip_rank());
 }
 
 double get_last_h2d_gbps() { return g_last_h2d_gbps; }

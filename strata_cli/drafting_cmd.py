@@ -12,7 +12,7 @@ import json
 import sys
 from pathlib import Path
 
-from strata_common import acquisition, drafting
+from strata_common import acquisition, drafting, user_args
 from strata_control.discovery import MTP_FETCH_GB
 
 
@@ -55,7 +55,7 @@ def _split_expected(cfg: dict, args: list, unloading: bool = False) -> bool:
             import dataclasses
             probe = lambda idx: [dataclasses.replace(c, free_mib=None) for c in SE.probe_cards(idx)]   # noqa: E731
         return SE.expected({"split_engine": cfg.get("split_engine"), "drafting": cfg.get("drafting"), "user_args": cfg.get("user_args"),
-                            "replicas": cfg.get("replicas")}, indexes=cards, native=flag("--native"),
+                            "replicas": cfg.get("replicas")}, indexes=cards, native=user_args.find_model_file(flags),
                            context=int(flag("--max-context") or SE.TESTED_CONTEXT), kv=flag("--kv"), probe=probe)
     except Exception:                                        # noqa: BLE001 - an early question is never a reason to stop
         return False

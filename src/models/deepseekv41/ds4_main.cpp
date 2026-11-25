@@ -1,3 +1,4 @@
+#include "strata/base/platform/env.hpp"
 #include "strata/common/serve/request_output.hpp"
 #include "ds4_images.hpp"
 // Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
@@ -39,6 +40,7 @@
 #include "ds4_slotmeta.hpp"
 #include "strata/common/serve/gpu_fatal.hpp"
 #include "strata/common/serve/loop.hpp"
+#include "strata/common/serve/option_names.hpp"
 #include "strata/common/serve/request.hpp"
 #include "strata/common/state/token_listing.hpp"
 
@@ -101,11 +103,11 @@ using strata::ds4::parse_ids;
 
 void usage() {
     std::fprintf(stderr,
-                 "maya-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--max-context N] [--reserve-mib N]\n"
+                 "maya-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--max-context N] [--vram-reserve-mib N]\n"
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--profile-readonly] [--ssd-cache GB] [--ssd-policy lru|lfu|lfulru] [--no-expert-cache] [--verbose]\n"
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none|auto] [--dspark-block N] [--dspark-conf F] [--experts N|auto]\n"
                  "           [--vision on|off] [--vision-resident (--serve: keep the picture tower on the card; default: in RAM between pictures)] [--mmap-experts on|off|auto] [--parallel N (--serve: N conversations at once)]\n"
-                 "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --serve\n"
+                 "           (--ids I,J,... [--images FILE] [--max-new N] [--dump-logits FILE] | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT\n"
                  "           | --pack-info)\n");
 }
@@ -711,10 +713,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // request.
     std::atomic<bool> settle_cancel{false};
     std::thread settle_th;
-    const bool settle_idle_on = [] {
-        const char* v = std::getenv("DS4_SETTLE_IDLE");
-        return v == nullptr || std::atoi(v) != 0;
-    }();
+    const bool settle_idle_on = strata::platform::env_tri("DS4_SETTLE_IDLE") != 0;
     const auto settle_stop = [&] {
         if (!settle_th.joinable()) return;
         settle_cancel.store(true, std::memory_order_release);
@@ -2274,7 +2273,7 @@ int main(int argc, char** argv) {
     std::string score_ids, score_out, prof_ids, spec_ids;
     int enc_w = 0, enc_h = 0;
     for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
+        const std::string a = strata::serve::get_primary_option(argv[i]);
         auto val = [&](const char* what) -> std::string {
             if (i + 1 >= argc) {
                 std::fprintf(stderr, "%s needs a value\n", what);
@@ -2284,8 +2283,8 @@ int main(int argc, char** argv) {
         };
         if (strata::ds4::read_option(a, val, o, spec))
             continue;
-        if (a == "--eos") {
-            eos = val("--eos");
+        if (a == "--eos-ids") {
+            eos = val("--eos-ids");
         } else if (a == "--dspark-depth") {
             g_spec_depth = std::max(1, std::atoi(val("--dspark-depth").c_str()));
         } else if (a == "--vision-resident") {
@@ -2310,7 +2309,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         else if (a == "--ids") ids_s = val("--ids");
-        else if (a == "--n") n = std::atoi(val("--n").c_str());
+        else if (a == "--max-new") n = std::atoi(val("--max-new").c_str());
         else if (a == "--window") window = std::max(1, std::atoi(val("--window").c_str()));   // (> 16: the chunked prompt path)
         else if (a == "--dump-logits") dump = val("--dump-logits");
         else if (a == "--score") score_ids = val("--score");

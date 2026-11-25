@@ -1,6 +1,7 @@
 // src/models/qwen38/kernels/cuda/qsa_prompt_attn.cu - see include/strata/kernels/qsa_prompt_attn.hpp.
 #include "strata/base/gpu/emulate.hpp"
 #include "strata/base/gpu/sm120_series.hpp"
+#include "strata/base/platform/env.hpp"
 #include "strata/core/defaults_026.hpp"
 #include "strata/base/gpu/sm75_series.hpp"
 #include "strata/core/geometry.hpp"
@@ -2508,10 +2509,7 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         return false;
     cudaStream_t st = (cudaStream_t) stream;
     if (pools.k_q4 != nullptr) {   // Q4_0 K and V (--kv q4_0): mode 4.  STRATA_PROMPT_ATTN_Q4=0: the old kernel (A/B)
-        static const bool q4_off = [] {
-            const char* v = std::getenv("STRATA_PROMPT_ATTN_Q4");
-            return v != nullptr && v[0] == '0';
-        }();
+        static const bool q4_off = strata::platform::is_env_off("STRATA_PROMPT_ATTN_Q4");
         // Turing runs mode 4 as pairs of m16n8k8 MMAs (another summation order than the FP32 kernel it replaces): manual
         // opt-in STRATA_PROMPT_ATTN_Q4_TC=1 (#1581, c3c: qsa_prompt_attn_parity at 4096/512 and 1500/512 on an RTX 2080 Super).
         static const bool q4_tc = [] {
@@ -2552,7 +2550,7 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
             const char* v = std::getenv("STRATA_PROMPT_ATTN_IMMA");
             g_pa_imma = v == nullptr ? 2 : (v[0] == '1' ? 1 : 0);   // 2: the default (on where the kernel can run)
         }
-        if (!turing && (g_pa_imma == 1 || (g_pa_imma == 2 && strata::prompt_attn_imma_default(false, 80, strata::qwen_defaults_026())))) return launch_i8v3(q, pools, ids, steps, cap, s, attn, n_q, st);
+        if (!turing && (g_pa_imma == 1 || (g_pa_imma == 2 && strata::prompt_attn_imma_default(false, 80, strata::defaults_026())))) return launch_i8v3(q, pools, ids, steps, cap, s, attn, n_q, st);
         return launch_i8(q, pools, ids, steps, cap, s, attn, n_q, st);
     }
     if (!pools.k_pool || !pools.v_pool) return false;

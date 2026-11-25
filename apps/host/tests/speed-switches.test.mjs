@@ -15,7 +15,7 @@ const ENV = {      // what each switch writes outside its default
   faster_long_prompts: { STRATA_KVA: '1' },
   faster_12gb_nvidia: { STRATA_ROUTE_PRIOR: '1.5' },
   faster_radeon_9000: { STRATA_PCIE_FRAC_DEFAULT: 'old' },
-  deepseek_speedups: { DS4_DEFAULTS: '026', DS4_FAST_ATTN: '0', DS4_ATTN_SLAB: '0', DS4_COPY_PIN: '0', DS4_COPY_HUGETLB: '0', DS4_STORE_SPARE: '0', DS4_STORE_PUT: '0' },
+  deepseek_speedups: { STRATA_DEFAULTS: '026', DS4_FAST_ATTN: '0', DS4_ATTN_SLAB: '0', DS4_COPY_PIN: '0', DS4_COPY_HUGETLB: '0', DS4_STORE_SPARE: '0', DS4_STORE_PUT: '0' },
 };
 const SIX = ['DS4_FAST_ATTN', 'DS4_ATTN_SLAB', 'DS4_COPY_PIN', 'DS4_COPY_HUGETLB', 'DS4_STORE_SPARE', 'DS4_STORE_PUT'];
 const DEFAULT = { faster_long_prompts: 'off', faster_12gb_nvidia: 'off', faster_radeon_9000: 'on', deepseek_speedups: 'on' };
@@ -34,8 +34,8 @@ test('there are exactly four switches in the app (the Terminal has one more); ea
 });
 
 test('the Terminal\'s Qwen "0.2.6 behaviour" switch is not in the app', () => {
-  assert.ok(!SPEED_SWITCHES.some(s => s.env.STRATA_DEFAULTS || /0\.2\.6 behaviour/.test(s.label)));
-  assert.ok(!Object.values(SPEED_SWITCHES.flatMap(s => Object.keys(s.env))).includes('STRATA_DEFAULTS'));
+  assert.ok(!SPEED_SWITCHES.some(s => /0\.2\.6 behaviour/.test(s.label)));
+  assert.deepEqual(SPEED_SWITCHES.filter(s => s.env.STRATA_DEFAULTS).map(s => s.id), ['deepseek_speedups'], 'only DeepSeek writes it');
 });
 
 test('Faster answers on 12 GB NVIDIA cards: only for Qwen on a discrete CUDA card of 13 GiB or less; off by default since 0.2.8 (#4402), On writes STRATA_ROUTE_PRIOR=1.5', () => {
@@ -75,18 +75,23 @@ test('Faster answers on 12 GB NVIDIA cards: only for Qwen on a discrete CUDA car
   assert.match(hint, /long agent sessions it can repeat itself/);
 });
 
-test('DeepSeek speed-ups Off writes DS4_DEFAULTS=026 and the six; On removes all seven; the six alone (an earlier test build) still read as Off', () => {
+test('DeepSeek speed-ups Off writes STRATA_DEFAULTS=026 and the six; On removes all seven; what 0.2.7-0.2.13 wrote (DS4_DEFAULTS=026 and the six) still reads as Off', () => {
   const env = { DS4_ASYNC_T: '4' };
   const off = setSpeedSwitch(env, 'deepseek_speedups', false);
-  assert.deepEqual(Object.keys(off).slice(0, 2), ['DS4_ASYNC_T', 'DS4_DEFAULTS'], 'the master switch first');
-  assert.deepEqual(off, { DS4_ASYNC_T: '4', DS4_DEFAULTS: '026', ...Object.fromEntries(SIX.map(k => [k, '0'])) });
+  assert.deepEqual(Object.keys(off).slice(0, 2), ['DS4_ASYNC_T', 'STRATA_DEFAULTS'], 'the master switch first');
+  assert.deepEqual(off, { DS4_ASYNC_T: '4', STRATA_DEFAULTS: '026', ...Object.fromEntries(SIX.map(k => [k, '0'])) });
   assert.equal(speedSwitchIsOn(off, 'deepseek_speedups'), false);
   assert.deepEqual(setSpeedSwitch(off, 'deepseek_speedups', true), env);
-  const six = { DS4_ASYNC_T: '4', ...Object.fromEntries(SIX.map(k => [k, '0'])) };
+  const six = { ...env, ...Object.fromEntries(SIX.map(k => [k, '0'])) };
   assert.equal(speedSwitchIsOn(six, 'deepseek_speedups'), false);
-  assert.deepEqual(setSpeedSwitch(six, 'deepseek_speedups', true), env, 'turning it on removes the six too');
-  assert.equal(speedSwitchIsOn({ DS4_DEFAULTS: '026' }, 'deepseek_speedups'), true, 'the master switch alone is a hand-edited file: left alone');
-  assert.deepEqual(speedSwitchRows(six, { deepseek: true }).map(r => [r.id, r.on, Object.keys(r.legacy).length]), [['deepseek_speedups', false, 6]], 'the client gets the six to recognise and remove');
+  assert.deepEqual(setSpeedSwitch(six, 'deepseek_speedups', true), env);
+  assert.equal(speedSwitchIsOn({ DS4_DEFAULTS: '026' }, 'deepseek_speedups'), true);
+  assert.deepEqual(speedSwitchRows(six, { deepseek: true })[0].cleanup_env, ['DS4_DEFAULTS']);
+  const old = { DS4_ASYNC_T: '4', DS4_DEFAULTS: '026', ...Object.fromEntries(SIX.map(k => [k, '0'])) };
+  assert.equal(speedSwitchIsOn(old, 'deepseek_speedups'), false);
+  assert.deepEqual(setSpeedSwitch(old, 'deepseek_speedups', true), env, 'turning it on removes DS4_DEFAULTS too');
+  assert.equal(speedSwitchIsOn({ STRATA_DEFAULTS: '026' }, 'deepseek_speedups'), true, 'the master switch alone is a hand-edited file: left alone');
+  assert.deepEqual(speedSwitchRows(old, { deepseek: true }).map(r => [r.id, r.on, r.legacy]), [['deepseek_speedups', false, Object.fromEntries(SIX.map(k => [k, '0']))]], 'the client recognises the six legacy entries');
 });
 
 test('a default launch has none of the new environment entries: KVA reads as off, the others as on, and an environment in its default stays as it is', () => {
@@ -250,7 +255,7 @@ test('the Expert settings show the rows in the existing row layout with an On / 
   assert.match(screen, /<h3 className="h4">\{tr\("Speed"\)\}<\/h3>/);
   assert.match(screen, /<label className="native-setting-row" key=\{sw\.id\}><span><strong>\{tr\(sw\.label\)\}<\/strong><small>\{tr\(sw\.hint\)\}<\/small><\/span><Select /, 'the same row, the same Select');
   assert.match(screen, /\[\{ value: 'on', label: 'On \(recommended\)' \}, \{ value: 'off', label: 'Off' \}\] : \[\{ value: 'off', label: 'Off \(recommended\)' \}, \{ value: 'on', label: 'On' \}\]/);
-  assert.match(screen, /if \(write\) env\[name\] = value; else delete env\[name\];/, 'the default removes the entries');
+  assert.match(screen, /if \(write\) env\[name\] = value;\s*else delete env\[name\];/, 'the default removes the entries');
   const languages = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr'];
   const catalog = lang => JSON.parse(read(`../src/locales/fix-${lang}.json`));
   const words = [...SPEED_SWITCHES.flatMap(s => [s.label, s.hint]), 'On (recommended)', 'Off (recommended)'];

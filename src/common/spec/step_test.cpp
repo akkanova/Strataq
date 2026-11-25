@@ -73,6 +73,36 @@ Decoding conversation(int session, int32_t next, int64_t pos, int64_t max_new) {
 
 int main() {
     {
+        std::vector<std::pair<size_t, size_t>> windows;
+        check(!for_each_window(std::vector<StepRow>{{3}, {3}, {1}, {3}}, [&](size_t first, size_t end) {
+                  windows.emplace_back(first, end);
+                  return first == 0;
+              }) && windows == std::vector<std::pair<size_t, size_t>>{{0, 2}, {2, 3}},
+              "windows are runs of one conversation's rows, and a false return stops the walk");
+        windows.clear();
+        check(for_each_window(std::vector<StepRow>{{3}, {3}, {1}, {3}}, [&](size_t first, size_t end) {
+                  windows.emplace_back(first, end);
+              }) && windows == std::vector<std::pair<size_t, size_t>>{{0, 2}, {2, 3}, {3, 4}},
+              "void callbacks visit every run, including a repeated conversation and the final singleton");
+        check(for_each_window(std::vector<StepRow>{}, [](size_t, size_t) { return false; }), "no rows, no windows");
+    }
+    {
+        const int slots[] = {3, 3, 3, 1, 3, 3};
+        std::vector<std::pair<int, int>> windows;
+        check(for_each_window(4, [&](int r) { return slots[1 + r]; }, [&](int first, int end) {
+                  windows.emplace_back(1 + first, 1 + end);
+                  return true;
+              }) && windows == std::vector<std::pair<int, int>>{{1, 3}, {3, 4}, {4, 5}},
+              "signed indices preserve a subrange's clipped first and last runs");
+        int reads = 0, calls = 0;
+        check(for_each_window(0, [&](int) { ++reads; return 0; }, [&](int, int) { ++calls; }) &&
+                  reads == 0 && calls == 0,
+              "an empty range invokes neither the session lookup nor the callback");
+        reads = 0;
+        check(!for_each_window(4, [&](int r) { ++reads; return r; }, [](int, int) { return false; }) && reads == 2,
+              "stopping at the first window does not inspect later windows");
+    }
+    {
         std::vector<StepGroup> groups(1);
         std::string err;
         check(!run_stage_groups({}, groups, err), "missing stages are rejected without polling");
@@ -193,34 +223,6 @@ int main() {
         check(step.run({&a, &b, &c, &d}, err) && step.run({&a, &b, &c, &d}, err), "uneven grouped shares run");
         check(a.guessed == 5 && b.guessed == 5 && c.guessed == 5 && d.guessed == 5,
               "equal-priority conversations rotate the extra row within every group");
-    }
-    {
-        FakeModel fm;
-        fm.right = 3;
-        auto hooks = fm.hooks();
-        fm.add_drafter(hooks);
-        hooks.run_groups = [](std::vector<StepGroup>& groups, std::string&) {
-            for (auto& group : groups) {
-                check(group.rows.size() == 1, "single-conversation drafter stays paused across groups");
-                group.picks = {group.rows[0].token + 1};
-            }
-            return true;
-        };
-        hooks.keep_group = [](int, const std::vector<StepRow>&, const std::vector<int>&, std::string&) {
-            return true;
-        };
-        Step step(hooks, {});
-        step.settings = {2, 8, 3};
-        step.settings.groups = 2;
-        step.settings.max_draft_conversations = 1;
-        auto a = conversation(0, 10, 0, 32), b = conversation(1, 20, 0, 32);
-        std::string err;
-        check(step.run({&a, &b}, err) && fm.asked == std::vector<int>{0, 0},
-              "model draft limits count conversations across the whole wave");
-        fm.asked.clear();
-        auto c = conversation(2, 30, 0, 32);
-        check(step.run({&c}, err) && fm.asked == std::vector<int>{3} && c.emitted.size() == 4,
-              "single-conversation drafting resumes after a grouped wave");
     }
     {   // the plan's table: 3 conversations at once, 8 rows
         StepSettings s{3, 8, 8};
@@ -350,13 +352,6 @@ int main() {
                   b.emitted == std::vector<int32_t>({33, 34, 35}), "independent lookup windows");
         check(a.suffix_offered == 2 && a.suffix_kept == 2 && a.planner->sfx.history().back() == 15,
               "lookup counts and history include only accepted tokens");
-        a = conversation(0, 12, 8, 20);
-        a.produced = 1;
-        a.planner = std::make_unique<WindowPlanner>(8, 8, 3, 0, 3, 64);
-        a.planner->sfx.append(ah.data(), ah.size());
-        step.settings.max_draft_conversations = 1;
-        check(step.run({&a, &b}, err) && a.emitted.size() == 1 && a.suffix_offered == 0,
-              "multiple conversations suppress lookup where configured");
         Decoding first = conversation(0, 12, 8, 20);
         first.planner = std::make_unique<WindowPlanner>(8, 8, 3, 0, 3, 64);
         first.planner->sfx.append(ah.data(), ah.size());
@@ -492,7 +487,7 @@ int main() {
                 a.push_back(conversation(i, 100 + i * 20, 10 + i, 100));
                 b.push_back(conversation(i, 100 + i * 20, 10 + i, 100));
             }
-            a[0].draft_limits = b[0].draft_limits = {0.99f, 0, 0, true};
+            a[0].draft_limits = b[0].draft_limits = {0.99f, 0, true};
             std::vector<Decoding*> pa, pb;
             for (int i = 0; i < count; ++i) {
                 pa.push_back(&a[(size_t) i]);

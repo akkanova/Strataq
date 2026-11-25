@@ -62,6 +62,14 @@ int main() {
     fill.experts_loaded = true;
     check(format_memory_report(fill, {}).find("EXPERT_FILL loaded=1 pending=42") == 0,
           "loaded while experts wait for pages that conversations hold");
+    MemoryReport traffic;
+    traffic.experts_loaded = true;
+    traffic.gpu(0).traffic = {{"hits", 7}, {"loads", 3}};
+    traffic.at("ram").traffic = {{"hits", 1}, {"ssd_reads", 2}};
+    check(format_memory_report(traffic, {}) == "MEMORY gpu0\nMEMORY ram\nEXPERT_FILL loaded=1 pending=0\n"
+                                               "EXPERT_TRAFFIC gpu0 hits=7 loads=3\n"
+                                               "EXPERT_TRAFFIC ram hits=1 ssd_reads=2\nSETTINGS\nEND_MEMORY\n",
+          "each expert pool's counters follow the MEMORY lines, which they leave as they were");
     MemoryReport pool;
     Memory& card = pool.gpu(1);
     card.add("experts", 9);
@@ -84,6 +92,14 @@ int main() {
               "MEMORY gpu1 experts=9 pool_pages=1000 allocated_pages=973 fragmented_pages=2 setting=512 smallest=256 "
               "largest=2048 name=card\nSETTINGS\nEND_MEMORY\n",
           "a pool's setting and its range, before the name");
+    card.kept_free = 512;
+    card.dedicated_room = 64;
+    check(format_memory_report(pool, {}).find("largest=2048 kept_free=512 dedicated_room=64 name=card\n") !=
+              std::string::npos,
+          "the reserve and the usable dedicated memory, before the name");
+    card.dedicated_room = 0;
+    check(format_memory_report(pool, {}).find("dedicated_room=0 name=card\n") != std::string::npos,
+          "no dedicated room is distinct from an unknown limit");
     budget.at("ram").mapped = 7;
     budget.shortfall = "the GPU's pool: out of memory";
     check(format_memory_report(budget, {}) == "MEMORY ram paused_count=0 paused_budget=5 mapped=7\nSETTINGS\n"

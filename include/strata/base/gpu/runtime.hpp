@@ -8,10 +8,11 @@
 
 namespace strata::core {
 
-/// Allocates `bytes` of device memory and zeroes it; nullptr when the device has not that much.
-void* gpu_alloc_zeroed(size_t bytes);
+/// Allocates `bytes` of device memory and zeroes it; nullptr when the device has not that much.  `label` names it in
+/// the memory report.
+void* gpu_alloc_zeroed(size_t bytes, const char* label = "Engine buffers");
 /// Allocates uninitialized device memory; nullptr when the runtime refuses it.
-void* gpu_alloc(size_t bytes);
+void* gpu_alloc(size_t bytes, const char* label = "Engine buffers");
 void gpu_free(void* p);
 /// Queues a copy of `height` rows of `width` bytes, whose starts are `src_pitch` and `dst_pitch` bytes apart, between
 /// any two memories (the runtime tells host from device by the addresses).  Returns false when the runtime refuses it.
@@ -20,7 +21,8 @@ bool gpu_copy_2d_async(void* dst, size_t dst_pitch, const void* src, size_t src_
 bool gpu_memset_async(void* p, int value, size_t bytes, void* stream);
 /// Waits for queued work on stream; false when the runtime reports a failure.
 bool gpu_stream_synchronize(void* stream);
-/// Copies `bytes` between any two memories and waits for the copy; false when the runtime refuses it.
+/// Copies `bytes` between any two memories; false when the runtime refuses it. Pageable host sources may be staged
+/// before the device receives the bytes; synchronize the null stream before consuming them on another stream.
 bool gpu_copy(void* dst, const void* src, size_t bytes);
 /// Allocates `bytes` of page-locked host memory that the current device reads in place: `device_view` gets the
 /// device's address of it.  nullptr when the runtime cannot lock that much.

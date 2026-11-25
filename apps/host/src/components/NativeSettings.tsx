@@ -19,6 +19,8 @@ interface SpeedSwitch {
     env: Record<string, string>;
     /** What an earlier test build wrote for the same state: it reads as set, and goes with it. */
     legacy?: Record<string, string>;
+    /** Retired names cleared when the feature returns to its default state. */
+    cleanup_env?: string[];
 }
 const switchHas = (entries: Record<string, string> | undefined, env: Record<string, string> | undefined) => !!entries && Object.keys(entries).length > 0 && Object.entries(entries).every(([name, value]) => env?.[name] === value);
 const switchIsSet = (sw: SpeedSwitch, env: Record<string, string> | undefined) => switchHas(sw.env, env) || switchHas(sw.legacy, env);
@@ -68,7 +70,19 @@ export function NativeSettings({ model }: {
     }, [model,revision]);
     const change = (id: string, value: any) => { const next = { ...values, [id]: value }; setValues(next); setText(JSON.stringify(next, null, 2)); setNotice(''); };
     /** The default removes the switch's environment entries, the other state writes them: the model's file then carries nothing for a default launch. */
-    const changeSwitch = (sw: SpeedSwitch, on: boolean) => { const env = { ...(values.env ?? {}) }; const write = on !== (sw.default === 'on'); for (const [name, value] of Object.entries(sw.env)) { if (write) env[name] = value; else delete env[name]; } if (!write) for (const name of Object.keys(sw.legacy ?? {})) delete env[name]; change('env', env); };
+    const changeSwitch = (sw: SpeedSwitch, on: boolean) => {
+        const env = { ...(values.env ?? {}) };
+        const write = on !== (sw.default === 'on');
+        for (const [name, value] of Object.entries(sw.env)) {
+            if (write) env[name] = value;
+            else delete env[name];
+        }
+        if (!write) {
+            for (const name of [...Object.keys(sw.legacy ?? {}), ...(sw.cleanup_env ?? [])])
+                delete env[name];
+        }
+        change('env', env);
+    };
     async function save() {
         setPending(true);
         setError('');

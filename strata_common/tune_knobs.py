@@ -507,9 +507,10 @@ def apply_to_argv(argv: Sequence[str], args: dict[str, Any], bool_flags: frozens
     `bool_flags`: the engine's flags that take no value (strata-dsv41 gives --mmap-experts a word, see DSV41_WORD_FLAGS)."""
     out = list(argv)
     for flag, value in args.items():
+        flag = "--native" if flag in user_args.MODEL_FLAGS else flag
         i = 0
         while i < len(out):
-            if out[i] == flag:
+            if out[i] == flag or (flag == "--native" and out[i] in user_args.MODEL_FLAGS):
                 del out[i:i + 1 + _value_count(out, i, bool_flags)]
             else:
                 i += 1

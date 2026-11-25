@@ -47,6 +47,8 @@
 #include <unistd.h>
 #endif
 
+#include "strata/base/platform/env.hpp"
+
 namespace strata::platform {
 
 /// Windows sleeps in 15.6 ms ticks unless a process asks for finer ones: the CPU lane's service thread naps (sleep_for 20 us)
@@ -91,10 +93,7 @@ inline fd_t open_direct(const std::string& path) {
 #if defined(_WIN32)
     // FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED: the disk straight into an aligned buffer, any number of reads in flight on
     // one handle (DS4_WIN_DIRECT=0: none, the page cache's buffered reads as before)
-    static const bool off = [] {
-        const char* v = std::getenv("DS4_WIN_DIRECT");
-        return v != nullptr && std::atoi(v) == 0;
-    }();
+    static const bool off = strata::platform::env_tri("DS4_WIN_DIRECT") == 0;
     if (off) return kBadFd;
     HANDLE h = CreateFileW(widen_utf8(path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
                            FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
@@ -703,17 +702,11 @@ inline std::vector<std::vector<int>> node_cores(bool smt = false) {
     }
     return out;
 }
-/// The RAM this process can still get (~0: not known).
-inline uint64_t ram_avail() {
-    MEMORYSTATUSEX s{};
-    s.dwLength = sizeof(s);
-    return GlobalMemoryStatusEx(&s) ? (uint64_t) s.ullAvailPhys : ~uint64_t{0};
-}
 #endif
 
 /// Windows' commit (RAM + page file, what every private allocation is charged to - on an integrated GPU the GPU's
 /// own allocations too): the limit, what this process can still commit, the RAM; all ~0 where there is no such limit
-/// (Linux overcommits; its RAM is ram_avail's business).
+/// (Linux overcommits).
 struct Commit {
     uint64_t limit = ~uint64_t{0}, avail = ~uint64_t{0}, ram = ~uint64_t{0};
 };

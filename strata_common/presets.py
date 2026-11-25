@@ -27,7 +27,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from strata_common import tune_knobs, tune_machine
+from strata_common import tune_knobs, tune_machine, user_args
 from strata_base import atomic as _atomic_mod
 
 SCHEMA = "strata.preset/1"
@@ -85,7 +85,7 @@ def choices_from_config(cfg: dict[str, Any], *, use: str = "chat") -> dict[str, 
         return None
 
     ctx = val("--max-context")
-    native = val("--native") or val("--model") or ""
+    native = user_args.find_model_file(args) or ""
     quant = (_QUANT.search(Path(native).name) or _QUANT.search(str(cfg.get("model_name") or "")))
     profile = cfg.get("ui_resource_profile")
     reserve = cfg.get("vram_reserve_mib")
@@ -125,11 +125,7 @@ def current_identity(cfg: dict[str, Any], *, exe: str | None = None, pcie: str |
     from strata_common import engine_component
     args = [str(a) for a in cfg.get("args") or []]
     files = [a for a in args if a.lower().endswith(".gguf")]
-    native = None
-    for i, a in enumerate(args):
-        if a == "--native" and i + 1 < len(args):
-            native = args[i + 1]
-    first = native or (files[0] if files else None)
+    first = user_args.find_model_file(args) or (files[0] if files else None)
     engine_path = exe
     if engine_path is None:
         try:

@@ -52,7 +52,7 @@ int main() {
     CHECK_EQ(experts_per_word(-1, 32 * GiB, 6, false, false, false, false), 6);     // the same card size when it is not a single RDNA4 card
     CHECK_EQ(experts_per_word(6, 32 * GiB, 6, false, false, false, true), 6);       // --experts 6 still wins
     CHECK_EQ(experts_per_word(4, 32 * GiB, 6, false, false, false, true), 4);       // and so does any other --experts N
-    CHECK_EQ(experts_per_word(-1, 32 * GiB, 6, false, false, true, true), 6);       // DS4_DEFAULTS=026: back to the model's 6
+    CHECK_EQ(experts_per_word(-1, 32 * GiB, 6, false, false, true, true), 6);       // STRATA_DEFAULTS=026: back to the model's 6
     CHECK_EQ(experts_per_word(4, 4 * 32 * GiB, 6, false, true), 4);     // so does any other --experts N
     CHECK_EQ(experts_per_word(5, 4 * 32 * GiB, 6, false, false), 5);
     CHECK_EQ(experts_per_word(-1, 4 * 32 * GiB, 1, false, true), 1);    // a model of one expert a word has nothing to drop
@@ -226,18 +226,11 @@ int main() {
         // a 192 GB Windows PC with a 4 GB page file: 150 GB free RAM but only 100 GB of commit room: no
         CHECK_EQ(copy_all_fits(108 * GB, (uint64_t) (150 * GB), margin, 100 * GB), 0);
     }
-    // ---- DS4_DEFAULTS=026: every rule gives v0.2.6's answer (the last argument v026 = true); an explicit variable / flag still wins; the six old
+    // ---- STRATA_DEFAULTS=026 (its tokens: src/core/arch_defaults_test.cpp): every rule gives v0.2.6's answer (the last argument v026 = true); an explicit variable / flag still wins; the six old
     // DS4_*=0 switches keep working with v026 = false
     {
         using namespace strata::ds4;
         const double GB = 1e9;
-        CHECK_EQ(is_026_token("026"), 1);
-        CHECK_EQ(is_026_token("0.2.6"), 1);
-        CHECK_EQ(is_026_token("v0.2.6"), 1);
-        CHECK_EQ(is_026_token("0"), 0);
-        CHECK_EQ(is_026_token(""), 0);
-        CHECK_EQ(is_026_token("027"), 0);
-        CHECK_EQ(is_026_token(nullptr), 0);
         // the 5-experts default: 4 x R9700 goes back to 6; a small card and an integrated GPU were Faster in 0.2.6 already; --experts wins
         CHECK_EQ(experts_per_word(-1, 4 * 32 * GiB, 6, false, true, true), 6);
         CHECK_EQ(experts_per_word(-1, 4 * 32 * GiB, 6, false, true, false), 5);

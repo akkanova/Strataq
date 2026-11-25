@@ -21,6 +21,7 @@
 
 #include "strata/models/qwen38/layer.hpp"
 #include "strata/base/gpu/pinned_ring.hpp"
+#include "strata/base/gpu/shape_graph_cache.hpp"
 #include "strata/models/qwen38/session.hpp"
 #include "strata/common/kernels/sampler.hpp"
 
@@ -256,12 +257,12 @@ private:
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
     bool capture_round(int T, bool coupled, std::string& err);
     bool capture_step(int j, bool coupled, std::string& err);
-    cudaGraphExec_t step_exec_[9] = {};
+    /// Captures the missing graphs of a draft round over T rows and of its chain steps 1..steps-1, none of them
+    /// freeing another for VRAM: the round launches them all.
+    bool capture_draft(int T, int steps, bool coupled, std::string& err);
     // coupled draft sampling: its own round/step graphs (the argmax ones stay as they were), the request's
     // parameters and the penalty ring (mapped staging + device copies), the split scratch, token id -> subset index
     bool setup_coupled(std::string& err);
-    cudaGraphExec_t round_exec_c_[9] = {};
-    cudaGraphExec_t step_exec_c_[9] = {};
     bool coupled_ok_ = false, coupled_active_ = false;
     bool coupled_rec_ = false;   ///< record_forward: the full layer ends in the coupled sampler (draft coupled_j_)
     int coupled_j_ = 0;
@@ -313,14 +314,21 @@ private:
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
     cudaStream_t cs_ = nullptr;
-    cudaGraphExec_t prefill_exec_[9] = {};
-    cudaGraphExec_t prefill_dev_exec_[9] = {};
     PinnedRing pf_ring_;          ///< #1996: the records above go up from a pinned slot, not from the pageable vector they are built in
     int32_t* pf_dev_ = nullptr;   ///< E-4: a prompt's rows' token / step / position records, uploaded at once
     int64_t pf_cap_ = 0;          ///< its capacity in ints
     cudaStream_t side_ = nullptr;                    // the shared expert's branch of the draft graphs (CUDA)
     cudaEvent_t sh_fork_ = nullptr, sh_join_ = nullptr;
-    cudaGraphExec_t round_exec_[9] = {};
+    /// What a captured graph runs: a prompt chunk (from the mapped staging or, Dev, from device inputs), a draft
+    /// round, or one draft step of the chain; Coupled: with coupled draft sampling.
+    enum GraphKind { kPrefillGraph, kPrefillDevGraph, kRoundGraph, kRoundCoupledGraph, kStepGraph, kStepCoupledGraph };
+    /// The captured graphs by (kind, rows of the window or step index 1..8); short of VRAM, the least recently used
+    /// are freed and captured again when next used.
+    strata::core::ShapeGraphCache<std::pair<int, int>> graphs_;
+    /// Gets the graph of `kind` for `n` (null when not captured) and marks it as just used.
+    cudaGraphExec_t graph(GraphKind kind, int n) { return graphs_.find({kind, n}); }
+    /// Ends the capture on cs_ and, when `ok` (the recording succeeded), keeps it as the graph of (`kind`, `n`).
+    bool finish_capture(bool ok, GraphKind kind, int n, const char* what, std::string& err);
 
     struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
     std::vector<Tensor> tensors_;

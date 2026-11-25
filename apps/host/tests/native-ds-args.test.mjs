@@ -50,13 +50,21 @@ function strayWords(args, valued) {
 }
 
 test('the DeepSeek option list is a subset of what ds4_main.cpp and ds4_options.cpp parse (it cannot drift ahead of the engine)', () => {
-  const sources = ['ds4_main.cpp', 'ds4_options.cpp'].map(f => fileURLToPath(new URL(`../../../src/models/deepseekv41/${f}`, import.meta.url)));
+  const sources = [
+    'src/models/deepseekv41/ds4_main.cpp', 'src/models/deepseekv41/ds4_options.cpp',
+    'include/strata/common/serve/option_names.hpp',
+  ].map(f => fileURLToPath(new URL(`../../../${f}`, import.meta.url)));
   if (!sources.every(existsSync)) return;                            // a package without the engine source
-  const text = sources.map(f => readFileSync(f, 'utf8')).join('\n');
+  const [main, options, aliases] = sources.map(f => readFileSync(f, 'utf8'));
+  const text = [main, options].join('\n');
   const parsed = new Set([...text.matchAll(/a == "(-{1,2}[a-z][a-z0-9-]*)"/g)].map(m => m[1]));
-  assert.ok(parsed.has('--eos') && parsed.has('--reserve-mib'), 'the pattern found the engine option parser');
-  for (const flag of [...DS_VALUE_FLAGS, ...DS_SWITCH_FLAGS, ...Object.values(DS_RENAMED)]) assert.ok(parsed.has(flag), `${flag} is not an option of strata-dsv41`);
-  for (const flag of Object.keys(DS_RENAMED)) assert.ok(!parsed.has(flag), `${flag} is the Qwen engine's name, strata-dsv41 rejects it`);
+  for (const [, oldName, primary] of aliases.matchAll(/\{"([^"]+)", "([^"]+)"\}/g)) {
+    if (parsed.has(primary))
+      parsed.add(oldName);
+  }
+  assert.ok(parsed.has('--eos-ids') && parsed.has('--reserve-mib'), 'the pattern found the engine option parser');
+  for (const flag of [...DS_VALUE_FLAGS, ...DS_SWITCH_FLAGS, ...Object.keys(DS_RENAMED), ...Object.values(DS_RENAMED)])
+    assert.ok(parsed.has(flag), `${flag} is not an option of strata-dsv41`);
   assert.ok(!parsed.has('--pool-workers'), '--pool-workers is rejected by strata-dsv41');
 });
 
@@ -68,6 +76,11 @@ test('dsEngineArgs renames --vram-reserve-mib, leaves out --pool-workers with it
   assert.match(dsArgsNote(r), /--vram-reserve-mib is passed as --reserve-mib/);
   assert.match(dsArgsNote(r), /--pool-workers 20, --resident-budget-gib 40/);
   assert.equal(dsArgsNote(dsEngineArgs(DS_ARGS)), '', 'nothing changed, nothing said');
+});
+
+test('dsEngineArgs keeps primary EOS and context names compatible with older installed engines', () => {
+  assert.deepEqual(dsEngineArgs(['--eos-ids', '1,2', '--ctx', '8192']).args,
+    ['--eos', '1,2', '--max-context', '8192']);
 });
 
 test('dsEngineArgs: a reserve under both names keeps the engine\'s own, a switch at the end and values that look like numbers survive', () => {

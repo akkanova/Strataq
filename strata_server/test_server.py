@@ -5214,7 +5214,7 @@ class AmdTelemetry(unittest.TestCase):
             a.dev = hops[-1]
             with mock.patch.object(telemetry._Amd, "_hops", lambda self: hops):
                 self.assertEqual(a.link(), {"pcie_gen": 3, "pcie_gen_max": 3, "pcie_own_gen": 4, "pcie_width": 8,
-                                            "pcie_path": "3/3"})
+                                            "pcie_width_max": 8, "pcie_path": "3/3"})
             with mock.patch.object(telemetry._Amd, "_hops", lambda self: hops[:2] + [str(Path(d) / "hidden")]):
                 got = a.link()             # an unreadable hop: fall back to the card's own negotiated link
                 self.assertEqual((got["pcie_gen"], got["pcie_width"], got["pcie_path"]), (4, 16, "2/3"))
@@ -5237,6 +5237,7 @@ class AmdTelemetry(unittest.TestCase):
                 self.assertEqual(g.read(), {"util": 37, "mem_used": 2 << 30, "mem_total": 32 << 30, "temp": 51.0,
                                             "power": 85.0, "power_limit": 300.0, "pcie_gen": None,
                                             "pcie_gen_max": None, "pcie_own_gen": None, "pcie_width": None,
+                                            "pcie_width_max": None,
                                             "pcie_path": "0/0"})    # #1733: no PCIe files in this fake tree
                 r = telemetry.gpu_reader(1, amd=True).read()
                 self.assertEqual((r["util"], r["temp"], r["power"]), (99, 64.0, 120.0))     # power1_input
@@ -5261,6 +5262,64 @@ class AmdTelemetry(unittest.TestCase):
             self.tree(d)
             with mock.patch.object(telemetry, "SYSFS", d):
                 self.assertEqual(svc.free_vram_mib(), 26 << 10)
+
+
+class Transfers(unittest.TestCase):
+    """The Monitor's Transfers card: the bytes moved between host memory and each card, from the engine's STATS lines
+    (contracts/requests.md) where the driver has no PCIe counters."""
+
+    def test_rate_statistic(self):
+        from strata_base.rate_statistic import RateStatistic
+        r = RateStatistic(0.5)
+        self.assertEqual(r.to_dict(), {"moving": None, "average": None, "low": None, "high": None})
+        r.add(10, 1)
+        r.add(60, 2)    # 30 a second, over two seconds: the moving average keeps a quarter of what it was
+        r.add(5, 0)     # an interval of no length counts nothing
+        self.assertEqual(r.to_dict(), {"moving": 25.0, "average": 70 / 3, "low": 10.0, "high": 30.0})
+
+    def test_engine_totals_become_each_cards_rates(self):
+        from strata_common import telemetry
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x", max_context=CTX), tok,
+                      ChatTemplate(ROOT / "strata_server/chat_template.jinja"))
+        svc.terminal_visibility_order = [3, 1]          # the engine's gpu0 is card 3, its gpu1 card 1
+        stats = {"seconds": 1.0, "gpus": [{"id": "gpu0", "to_gpu": 0, "from_gpu": 0},
+                                          {"id": "gpu1", "to_gpu": 0, "from_gpu": 0}]}
+        svc.engine.live_stats = stats
+        self.assertEqual(svc._engine_transfers(), (1.0, {3: (0, 0), 1: (0, 0)}))
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(telemetry, "SYSFS", d):   # no readable GPU
+            t = telemetry.Telemetry(gpu_indices=[3, 1], amd=True, transfers=svc._engine_transfers)
+            t.close()
+            self.assertEqual([c["to"]["moving"] for c in t._moved({})], [None, None])   # one line: no interval yet
+            svc.engine.live_stats = {"seconds": 3.0, "gpus": [{"id": "gpu0", "to_gpu": 40 << 20, "from_gpu": 2 << 20},
+                                                              {"id": "gpu1", "to_gpu": 0, "from_gpu": 0}]}
+            cards = t._moved({})
+        self.assertEqual([(c["index"], c["source"], c["to"]["moving"], c["from"]["moving"]) for c in cards],
+                         [(3, "engine", (20 << 20) / 1e6, (1 << 20) / 1e6), (1, "engine", 0.0, 0.0)])
+
+    def test_sources_reset_and_use_decimal_megabytes(self):
+        from strata_common import telemetry
+        with mock.patch.object(telemetry.Telemetry, "_loop"):
+            t = telemetry.Telemetry(gpu_indices=[3], amd=True)
+            t.close()
+            t._thread.join()
+        sample = (1.0, {3: (0, 0)})
+        t.transfers = lambda: sample
+        self.assertEqual(t.indices, [3])
+        self.assertIsNone(t._moved({})[0]["to"]["moving"])
+        sample = (3.0, {3: (40_000_000, 2_000_000)})
+        self.assertEqual(t._moved({})[0]["to"]["moving"], 20)
+        sample = (0.5, {3: (0, 0)})
+        self.assertIsNone(t._moved({})[0]["to"]["moving"])
+        with mock.patch.object(telemetry.time, "monotonic", return_value=10):
+            t.moved_at = 9
+            c = t._moved({3: {"pcie_rx_mb": 1, "pcie_tx_mb": 2}})[0]
+        self.assertEqual(c["source"], "driver")
+        self.assertEqual(c["to"]["moving"], 2**20 / 1e6)
+        sample = None
+        c = t._moved({})[0]
+        self.assertIsNone(c["source"])
+        self.assertIsNone(c["to"]["moving"])
 
 
 IOREG_FIXTURE = '''

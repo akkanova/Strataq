@@ -60,7 +60,7 @@ def _hand_edits(prev: Mapping[str, Any] | None) -> list[str]:
         return []
     mine = user_args.capture({"args": prev.get("args"), user_args.USER_KEY: prev.get(user_args.USER_KEY),
                               user_args.WRITTEN_KEY: prev.get(user_args.WRITTEN_KEY)})
-    given = {str(f) for f in prev.get(EXPLICIT_KEY) or []}
+    given = {"--native" if f in user_args.MODEL_FLAGS else str(f) for f in prev.get(EXPLICIT_KEY) or []}
     return user_args.flat([g for g in user_args.groups(mine) if user_args.flag_of(g) not in given])
 
 
@@ -77,7 +77,7 @@ def layer(cfg: dict, explicit: Mapping[str, Any] | None = None, prev: Mapping[st
     """Put the four sources over each other in ``cfg`` (in place; ``cfg["args"]`` is the generated layer on entry).
     ``explicit``: the launch's own options as ``tune_knobs.apply_to_argv`` changes (value, True for present, None for off).
     ``prev``: the config this launch wrote last time (or None). ``bool_flags``: the engine's valueless switches (DeepSeek's --mmap-experts takes a word). Returns {"calibrated": bool, "persisted": [...], "explicit": [...]}."""
-    explicit = dict(explicit or {})
+    explicit = {"--native" if k in user_args.MODEL_FLAGS else k: v for k, v in (explicit or {}).items()}
     args = [str(a) for a in cfg.get("args") or []]
     # 3. calibrated values over the generated ones
     rec = None

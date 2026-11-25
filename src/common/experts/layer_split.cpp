@@ -365,10 +365,13 @@ uint64_t LayerSizes::get_range_bytes(int64_t lb, int64_t le, int64_t conversatio
 }
 
 SplitProblem make_paged_split_problem(const LayerSizes& sizes, const std::vector<uint64_t>& pool_bytes,
+                                      const std::vector<double>& layer_ms, const std::vector<double>& link_gbps,
                                       int64_t conversations, int64_t tokens) {
     SplitProblem p;
     p.n_layers = (int64_t) sizes.expert.size();
-    p.cards.resize(pool_bytes.size());
+    const std::vector<double> miss_scale = strata::program::split_rules::link_miss_scale(link_gbps);
+    for (size_t k = 0; k < pool_bytes.size(); ++k)
+        p.cards.push_back({layer_ms[k], miss_scale[k]});
     p.expert_bytes = [expert = sizes.expert](int64_t layer) { return (int64_t) expert[(size_t) layer]; };
     p.room = [sizes, pool_bytes, conversations, tokens](int card, int64_t lb, int64_t le) {
         return (int64_t) pool_bytes[(size_t) card] - (int64_t) sizes.get_range_bytes(lb, le, conversations, tokens);

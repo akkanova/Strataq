@@ -10,7 +10,7 @@ so category names do not determine the divider position.
 It is followed by any number of lines of this form:
 
 ```text
-MEMORY_BLOCK gpu0 1048576 other Device%20allocations Drafter
+MEMORY_BLOCK gpu0 1048576 drafter Device%20allocations Drafter
 ```
 
 The fields are memory ID, bytes, category, pool name and block label.
@@ -131,6 +131,12 @@ engine, when its command loop ends (QUIT or the end of stdin), pause its convers
 paused in RAM to the SSD, highest ranked first, within `ssd_pause_mib`. It keeps the files instead of deleting
 them, for the next start's adoption. CHANGE_SETTINGS takes `on` or `off`; the report gives 1 or 0.
 
+A paged engine on more than one GPU reports `batch_groups` (`--batch-groups`, default 1; 0 is `auto`),
+`batch_groups_now` (the groups its steps run now) and `pipeline_stages` (0 when DeepSeek has a drafter loaded, even
+if switched off; it runs one group). CHANGE_SETTINGS takes a whole number from 0 to 2147483647 for `batch_groups`,
+applied from the next step, as a change to `concurrent` is; an engine on one GPU refuses it. Qwen sizes a layer
+split's hand-offs for groups at every start, so that they can be turned on later.
+
 RAM checkpoints are serialized inside the shared pause-file host header, so named
 SAVE/RESTORE and automatic SSD pauses retain them. Disk-paused payloads are released
 from RAM after writing and read back on resume. Qwen uses layout identity 4; files
@@ -140,9 +146,21 @@ existing host-state file layout is unchanged.
 The report may include `MEMORY_DETAIL <key> <percent-encoded-value>` lines.
 Python exposes these as the `details` dictionary. The paged engines supply
 `drafter_label`, `drafter_details`, `suffix_label` and `kv_quantization` for
-settings help. Drafter cost includes reloadable dense weights and prediction
-experts; per-conversation state is accounted separately. Older engines omit
+settings help. While enabled, drafter cost includes allocations in the GPUs'
+`drafter` category (weights, working buffers and snapshots) and any separately
+managed prediction experts. It excludes host copies and conversation pages in
+the shared pool. While off, it reports known reloadable weights and prediction
+experts; if these sizes are unknown (Qwen's MTP), the label says the size is
+known once it is on. Retained snapshots alone do not establish that size.
+Without a drafter, `drafter_label` says none is loaded and
+the panel shows it as an option that cannot be chosen. Older engines omit
 these fields, so readers must allow missing discovery and cost information.
+
+Paged engines report the draft acceptance rule as `MEMORY_DETAIL draft_rule <rule>`, a text rather than a
+number in `SETTINGS`: `exact`, `speculative`, `typical`, `lower-temperature` or `top-<N>` (N from 1 to 99).
+`CHANGE_SETTINGS draft_rule=<rule>` takes the same text and applies from the next step; saved defaults use
+`--draft-rule`. It decides which drafted tokens a sampled request keeps (docs/DETAILS.md). `strata-q38` starts
+with `exact`, `strata-ds41` with `speculative`.
 
 Paged engines report `has_drafter`, `suffix_draft` and `lookup_chain` alongside
 `drafter`. The latter two settings accept the corresponding numeric startup

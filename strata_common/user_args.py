@@ -34,6 +34,17 @@ USER_KEPT_FLAGS = frozenset({"--control-vector", "--control-vector-scaled", "--c
 #: entries, never as one ``4,44``, and removed with all of their values (#3504)
 MULTI_VALUE_FLAGS = {"--control-vector-layer-range": 2}
 
+#: the engine options that name the model's GGUF file (shard 1): ``--model``, and its old name ``--native``, which setup,
+#: the Terminal and the app still write because older installed engines know only that one
+MODEL_FLAGS = ("--model", "--native")
+
+
+def find_model_file(args: Any) -> str | None:
+    """Gets the GGUF path an engine started with ``args`` runs: the value of the last of ``MODEL_FLAGS``, as the engine
+    reads them."""
+    args = [str(a) for a in args or []]
+    return ([v for k, v in zip(args, args[1:]) if k in MODEL_FLAGS] or [None])[-1]
+
 
 def value_tokens(flag: str, value: Any) -> list[str]:
     """The argv entries that follow ``flag`` for ``value``: one, or the several a multi-value option takes (``4 44``, ``4,44``,
@@ -46,7 +57,7 @@ def value_tokens(flag: str, value: Any) -> list[str]:
 
 
 def groups(args: Any) -> list[list[str]]:
-    """Split an argument list into groups: an option and the values after it (up to the next ``--option``)."""
+    """Splits options from their values; keeps the last model path under the spelling older engines accept."""
     out: list[list[str]] = []
     for a in args if isinstance(args, list) else []:
         a = str(a)
@@ -54,7 +65,9 @@ def groups(args: Any) -> list[list[str]]:
             out.append([a])
         else:
             out[-1].append(a)
-    return out
+    last_model = next((i for i in range(len(out) - 1, -1, -1) if out[i][0] in MODEL_FLAGS), -1)
+    return [["--native", *g[1:]] if i == last_model else g
+            for i, g in enumerate(out) if g[0] not in MODEL_FLAGS or i == last_model]
 
 
 def flat(gs: list[list[str]]) -> list[str]:
@@ -128,6 +141,7 @@ def dropped_by_setup(old_args: Any, new_args: Any, setup_flags: set[str] | froze
 
 def set_flag(user: list[str], flag: str, value: Any) -> list[str]:
     """``user`` with ``flag`` set to ``value`` (None: the person's option removed)."""
+    flag = "--native" if flag in MODEL_FLAGS else flag
     rest = [g for g in groups(user) if flag_of(g) != flag]
     if value is not None:
         rest.append([flag, *value_tokens(flag, value)])

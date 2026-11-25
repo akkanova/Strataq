@@ -156,6 +156,12 @@ Some engine settings depend on the PC more than on the model:
 | `--pool-workers` | How many CPU threads compute experts. On CPUs with efficiency cores, fewer can be faster. |
 | `--adapt-every`, `--adapt-swaps`, `--adapt-decay` | How busily the VRAM expert cache follows the conversation. A CPU that reads missed experts slowly (DDR3 or DDR4 in few channels) gains from more swaps. `--adapt-decay` fades the experts' use counts once per 4 decode steps. |
 | `--expert-popularity-decay` | The page-pool engines (strata-q38, strata-ds41) only: how much the experts' use counts fade at each decode step. By default `--adapt-decay` to the power 0.25 (0.7 gives 0.915), the same fading spread over the 4 steps. |
+| `--expert-half-life` | The page-pool engines only: the same fading as `--expert-popularity-decay`, given as the decode steps after which a use counts half (0: it never fades). The Memory panel changes it while the engine runs ("Expert popularity half-life steps"). |
+| `--route-tail-skip` | strata-q38 only: `STRATA_ROUTE_TAIL_SKIP`'s rank (0: off), which wins over the variable and its default. The Memory panel changes it while the engine runs. |
+| `--route-prior-pct` | strata-q38 only: `STRATA_ROUTE_PRIOR` as the percent by which picking experts overrates those already on the GPU (the bonus is ln(1 + pct/100): 348 gives about 1.5; 0: off, the default), which wins over the variable. It can make answers worse (see `STRATA_ROUTE_PRIOR` below). The Memory panel changes it while the engine runs and asks before switching it on. |
+| `--draft-confidence-pct`, `--draft-cumulative-pct` | The page-pool engines only: the least confidence, in percent, of each drafted token (`--spec-min-p`, `--dspark-conf`) and of the drafted tokens together, for a step to check them. The Memory panel changes them while the engine runs; a change applies from the next request. |
+| `--step-profile` | The page-pool engines only: `on` (or `1`) writes a `step-profile` line to the log after each decode step, with host elapsed milliseconds for drafting, verifying, committing and moving experts. These are not GPU kernel timings. The Memory panel switches it while the engine runs ("Log each step's timing"). |
+| `--copy-back` | The page-pool engines only: whether an expert a GPU's pool evicts is copied back to RAM (`on`), dropped (`off`) or copied when that measured faster than reading the SSD (`auto`, the default). The Memory panel changes it while the engine runs. |
 | `--prefill-pipe` | On two or more cards (layer split), the prompt chunks that keep the cards reading at once. See [MULTI_GPU.md](MULTI_GPU.md). |
 
 The defaults were measured on a Ryzen 5 7600 with an RTX 5070. From a source checkout, `START-HERE.bat --calibrate` (Linux: `./setup.sh --calibrate`)
@@ -499,9 +505,10 @@ trained with, not a hard token limit.
 
 All are optional. Setup rewrites the config when run again and keeps keys it does not manage. The About tab's Model settings
 card edits some of them (the sampling defaults, `reasoning_budget_tokens`, `fit_max_tokens`, `anthropic_thinking`,
-`effort_position`, `aliases`, `idle_unload_s`, `lazy_load`, `engine_silence_s`, `api_monitor`, `open_browser` and
-`--vram-reserve-mib`). An empty field removes the key, the earlier file is kept as `strata-<model>.json.bak`, and the change
-applies at the next start. Network, key, MCP and program keys are not editable there.
+`effort_position`, `aliases`, `idle_unload_s`, `lazy_load`, `engine_silence_s`, `api_monitor` and `open_browser`).
+An empty field removes the key, the earlier file is kept as `strata-<model>.json.bak`, and the change applies at the
+next start. Network, key, MCP and program keys are not editable there. `--vram-reserve-mib` is set in `"args"`, or
+in the Memory panel of the page-pool engines ([below](#the-memory-panel)).
 
 | Key | Default | Effect |
 | --- | --- | --- |
@@ -529,6 +536,28 @@ applies at the next start. Network, key, MCP and program keys are not editable t
 | `host`, `api_key`, `cors_origins`, `trusted_origins`, `allowed_hosts` | local only | See [Network access](#network-access). |
 | `codex_thread_titles`, `codex_compaction_cache` | off | See [Codex CLI](#the-responses-api-and-codex-cli). |
 | `mcp_servers`, `mcp` | none | See [Tools from MCP servers](#tools-from-mcp-servers). |
+
+### Engine options with an older name
+
+Engines built from `src/` accept both names below wherever they support the setting. Use the first name;
+the older name is deprecated. Aliases do not add settings to engines that lack them. Installed older engines
+and the separate SYCL engine may accept only their original names. Launchers keep those spellings for compatibility.
+
+| Option | Older name, still taken |
+| --- | --- |
+| `--model GGUF` (the model's file, shard 1) | `--native` (the Qwen engines) |
+| `--vram-reserve-mib N` | `--reserve-mib` (the DeepSeek engines) |
+| `--eos-ids LIST` | `--eos` (the DeepSeek engines) |
+| `--batch N` | `--slots` |
+| `--max-new N` | `--n` (strata-dsv41, strata-q36) |
+| `--max-context N` | `--ctx` (strata-q36) |
+| `--prefill N` | `--chunk` (strata-q36) |
+
+Some options look alike but are different settings. Qwen's `--gpu` hides the other cards from the engine; DeepSeek's
+`--gpus` picks cards among all of them. Qwen's `--pool-workers` counts the threads beside the engine's own; DeepSeek's
+`--cpu-threads` counts that one too. Qwen3.8's `--prefill` takes `auto` and `auto:N`; Qwen3.6 takes `auto` or a number.
+EOS lists use comma-separated token IDs. DeepSeek's `--prefill-chunk 0` means
+windows of 16 tokens. strata-dsv41 takes its conversations at once as `--parallel`.
 
 ### Streaming and tool calls
 
@@ -1029,9 +1058,13 @@ the GPU keeps the size the runtime reports.
 
 `GET /v1/memory` returns `{"available", "loaded", "machine": {"ram_total", "ram_free", "gpus"}, "busy", "error", "at",
 "memories": [{"id", "name", "total", "free", "unified", "uses": {<use>: bytes}, "paused_count", "paused_budget",
-"other"}], "settings": {<key>: number}}`. `machine` is the server's own reading of the RAM and of the GPUs (the
-hardware sampler of `GET /metrics`). The engine's `ram` gets the machine's size and free RAM; `other` is what is in use
-in a memory beyond the uses the engine names (other programs, buffers the engine does not count). A value the engine
+"other"}], "settings": {<key>: number}}`; the page-pool engines' GPUs also have `kept_free` (the reserve) and
+`dedicated_room` (the space left below the measured dedicated-memory limit after all programs' current use) in bytes,
+from their `MEMORY` lines' `kept_free=<B>` and `dedicated_room=<B>` (`null` when the line has none).
+`dedicated_room` is absent until a growth finds the limit; zero means no room remains.
+`machine` is the server's own reading of the RAM and of the GPUs
+(the hardware sampler of `GET /metrics`). The engine's `ram` gets the machine's size and free RAM; `other` is what is in
+use in a memory beyond the uses the engine names (other programs, buffers the engine does not count). A value the engine
 does not know is `null` or left out of `uses`. `busy` and `available` mean what they mean for `GET /api/context`.
 For a GPU whose memory is the system RAM, where the division can be read: `total` and `free` are the BIOS share's,
 `runtime_total` and `runtime_free` are what the runtime reported, `in_share` is what the engine holds in the share
@@ -1042,6 +1075,67 @@ page-locks for the GPU to read (strata-q38's RAM pool, the RAM's `mapped`) is co
 and by Linux in the GTT; it is drawn once, as the engine's RAM, and taken off `borrowed`. On the Strix Halo (a 63.8 GiB
 share, Windows 11) strata-q38 at start held 58.3 GiB in the share and Windows counted 22.1 GiB of shared use, of which
 20.9 GiB was its page-locked RAM pool.
+
+How much of the BIOS share a program can really use is not a figure Windows reports. It depends on the size of the
+pieces it takes and on the other programs. The owner's test program on the Strix Halo (Windows 11, a 63.83 GiB share,
+2026-11-21, two rounds each) mapped pieces into one HIP virtual range and stopped at the first spill. It held
+54.50 GiB in dedicated memory in pieces of 256 MiB, in 2.8-2.9 s. It held 58.06-58.08 GiB
+(3.56 more) in pieces of 256 MiB and then of 16 MiB once one landed in shared memory, in 3.1 s; in pieces of 16 MiB
+only it held the same but took 4.7-9.9 s. Using 256 then 8 MiB pieces held 0.23 GiB more, but 8 MiB pieces as a
+program's first allocation looked shared when they were not. So the new engines (strata-q38, strata-ds41) find out
+each time a GPU pool grows, at start too: they take its 256 MiB chunks one at a time, each first as one piece. When Windows puts that piece in shared
+memory, which is slower (with the pool's top there, strata-ds41 read 4K to 32K prompts 21-24% slower), it goes back
+and the chunk is made of 16 MiB pieces instead. The growth stops at the first chunk with a piece in shared memory,
+and that chunk goes back. After every growth that stays in dedicated memory, whether it stopped at the end or reached
+its size just before it, the pool gives back chunks of that growth until the room the model leaves free
+(`--vram-reserve-mib`) is free in dedicated memory. The Memory panel says how much fits in dedicated memory and asks
+whether to take the rest as shared memory; yes sends the same size with `shared_memory=on`. That growth first fills
+the reserve with temporary 16 MiB placeholders (rounded up, or as much as fits), so that its chunks leave that
+room alone, and gives the placeholders back when it ends. A size past what the GPU has room for is not refused: the
+pool grows as far as it can, and the change says so ("the GPU has room for 58.45 GiB of pool"). A GPU pool's size
+does not weigh Windows' commit charge, though on the Strix Halo GPU allocations are charged to it (strata-q38 on
+the Strix Halo, 2026-11-22: free commit fell from 71.9 to 1.0 GiB while the engine took 43.8 GiB of dedicated memory,
+4.1 GiB of shared memory and a 4 GiB RAM pool); only the RAM pool is capped by free commit.
+A GPU's `largest` estimates the pool size that fits in dedicated memory, using the last measured edge (before that,
+the share's size), current use and the reserve. The panel shows a larger size in red but still sends it.
+`pool_shared` is the part of the pool in shared memory. Prompt buffers are lent below the first shared chunk.
+A shrink frees the top chunks first. If another program frees memory between growths, dedicated chunks can follow
+shared ones; the pool does not reorder them. `dedicated_full` says
+that the last growth stopped where the dedicated memory ended. Linux and discrete GPUs have no such check: their pools
+grow until the runtime has no more.
+
+The new engines leave `--vram-reserve-mib` free on each GPU for other programs. The default is 256 MiB, one pool
+chunk, less than the old engines' 700 (strata-dsv41's 600, which it calls `--reserve-mib`; the new engines take both
+names). The old engines allocated prompt buffers after the expert cache; the new engines lend them from their pools.
+The old engine's Windows paging at 323 MiB free on a 20 GB card (#1376) does not establish a safe reserve for the new
+engines, and a discrete card under Windows is not measured yet.
+
+Measured on the Strix Halo (strata-q38, IQ3_S, Windows, the GPU also drawing the desktop, the pool grown to the end of
+dedicated memory, three greedy 256-token answers per run, 2026-11-22): with reserves of 700, 512, 256 and 128 MiB
+(2-3 alternating runs each), decode was 37.8-38.7 tok/s at every reserve, and none of the engine's memory moved to
+shared memory (its shared use stayed at 4.11 GiB). Each 256 MiB less reserve gave the pool one more chunk (56,031 MiB
+at 700 and 512, 56,286 at 256, 56,541 at 128). During the first answer the engine's own dedicated use grew by about
+95 MiB outside the pools, at every reserve, so at 128 MiB the free dedicated memory fell to 102 MiB. The desktop's
+responsiveness at so little free memory was not measured, which is why the default is 256 and not 128.
+
+For strata-q38, the desktop app's Performance profile keeps at least 512 MiB on a display card, or 2,048 when its
+picture reader runs on the GPU. A headless card keeps 256 MiB, or 2,048 with the GPU reader. Work also keeps a fifth
+of a dedicated display card, capped at 1,536 MiB on cards up to 16 GB. Explicit reserves still take precedence.
+The old engines' display floors stay at 1,024 above 16 GB and 1,536 at 16 GB or less. DeepSeek loads bypass the app's
+resource profiles, so strata-ds41 uses its engine default unless a reserve is set in its config or arguments.
+
+At start, strata-q38's pools also leave room for what it allocates after them: 256 MiB
+a card (352 on a later card of a layer split), what the old engine measured after its expert cache (#4474), and the
+drafter's head. The Memory panel changes the reserve while the engine runs ("Reserve free VRAM",
+`vram_reserve_mib`). A change counts from the next growth: in the largest size the panel offers, and in what a growth
+gives back or holds to keep it free in dedicated memory. Saved as the default, it counts from the next start. It does
+not resize a pool by itself. The GPU's bar shows the reserve as "Kept free for other programs", at the start of the free
+memory (no more than is free and usable). After a growth found where the dedicated memory ends, the free memory past
+that end shows as "Not usable as dedicated memory", at the end of the free memory. The engine finds the end with D3DKMT
+statistics and the bar's free memory comes from the performance counters, which count other programs about 0.58 GiB
+higher on the Strix Halo (2026-11-22, strata-q38), so the engine says how much dedicated memory is still usable
+(`dedicated_room`) and the panel draws the rest of the free memory as unusable: 0.58 GiB there, where 63.23 of the
+63.83 GiB share was the most ever in use.
 
 The engine's command (include/strata/common/serve/memory_report.hpp; the engine's `READY` line says `memory`):
 
@@ -1353,7 +1447,7 @@ bits of the answer: a switch that changes rounding can change a greedy answer at
 | Setting | Applies to | Off switch | What it does |
 | --- | --- | --- | --- |
 | `STRATA_PREFILL_CPU_SHARE` (`auto`, cap `STRATA_PREFILL_CPU_SHARE_MAX=1024`) | CUDA, one GPU, no `--batch`, prompt chunks under 1,024 tokens | `STRATA_PREFILL_CPU_SHARE=0` | The CPU pool computes the experts few of the chunk's tokens route to, while the GPU works on the rest. `auto` measures per layer how long each side takes and checks that sharing pays. Skipped with one log line when RAM or commit is short. Output changes in the last bits. Layer split, batch slots and HIP keep it off unless you set it. |
-| `STRATA_ROUTE_TAIL_SKIP` (7) | CUDA, and HIP gfx1200/gfx1201; one GPU or a layer split | `STRATA_ROUTE_TAIL_SKIP=0` | A missed expert that every token of a verify window routes at rank 7 or lower is neither copied nor computed. Not applied when every expert is in VRAM, with `--batch` slots, with a peer tier or helper GPU, on other HIP and SYCL, or when 90% or more of the experts are cached (`STRATA_TAIL_SKIP_MAX_CACHED=<percent>` moves that line; it is 60% on an AMD layer split). Answers differ slightly from a run without it. |
+| `STRATA_ROUTE_TAIL_SKIP` (7) | CUDA, and HIP gfx1200/gfx1201; one GPU or a layer split | `STRATA_ROUTE_TAIL_SKIP=0` | A missed expert that every token of a verify window routes at rank 7 or lower is neither copied nor computed. Not applied when every expert is in VRAM, with the old engine's `--batch` slots, with a peer tier or helper GPU, on other HIP and SYCL, or when 90% or more of the experts are cached (`STRATA_TAIL_SKIP_MAX_CACHED=<percent>` moves that line; it is 60% on an AMD layer split). Answers differ slightly from a run without it. The paged engine (`strata-q38`) decides it for each conversation by that conversation's own tokens, so an answer gets the skips it would get alone, whatever else is being answered at the same time. On a layer split, where groups of conversations run through the cards side by side, no group uses it while one of them mixes conversations. |
 | PCIe share from the CPU's speed | CUDA, one GPU or a layer split, no `--pcie-frac` | `--pcie-frac N` always wins; `STRATA_PCIE_FRAC_DEFAULT=old` keeps the probe-only rule; `STRATA_PCIE_AUTO_SPLIT=0` keeps the fixed probe share on a CUDA layer split; `STRATA_PCIE_K_RULE=0` and `STRATA_PCIE_SHARE_MAX=0.60` keep the 0.2.10 rule | The share starts at the probe's value and is refined in the first decode windows from the CPU pool's time per missed expert: `L / (L + k R)`, rounded to 0.05 and kept between 0.10 and 0.95, changed at most three times. k is 1.85 from a pool rate R of 30 GB/s of expert bytes and falls linearly to 0.8 at 12 GB/s (a weak pool is compute-bound), so a strong pool gets exactly the 0.2.10 shares (below 0.60) and a weak one up to 0.95. A CUDA layer split refines each stage by its own probed link. Integrated GPUs (Strix Halo and the other APUs) and `STRATA_DEFAULTS=026` keep k 1.85 and 0.60; on HIP the layer-split refinement stays opt-in (`STRATA_PCIE_AUTO_SPLIT=1`). Each change prints a `PCIe share:` line. On HIP it is the default for gfx1200/gfx1201; `STRATA_PCIE_FRAC_DEFAULT=auto` turns it on for other HIP parts. Measured on an RTX PRO 6000 (12 GB free): 2 x 12 GB layer split +12% decode; one card with 4 pool workers 56 -> 79 tok/s, 2 workers 31 -> 63, 32 workers unchanged. Output changes in the last bits (first-window KL 0.03 on the decode-window yardstick, the same as the single-card rule). |
 | Chunk follows the host's memory | Linux file tier | `STRATA_PREFILL_HOST_PLAN=0` | See [Linux file tier](#linux-file-tier). |
 | Fused int8 prompt experts | gfx12 (R9700): IQ3_S and IQ3_XXS packs. 12.0 NVIDIA cards with 80 or more SMs: IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS gate/up | `STRATA_PF_FUSED=0` | Replaces the MMQ prompt kernels. `STRATA_PF_FUSED=1` opts in every covered format on other cards (on HIP gfx11 and gfx1200/gfx1201 too; see [AMD_HIP.md](AMD_HIP.md)). |
@@ -1386,6 +1480,7 @@ them on your own card.
 | `STRATA_FS_SLOTS=N` | CUDA | Foresight swap space: N VRAM slots per layer refilled with missed and predicted experts. | The smaller cache cost more than the slots returned in every box measured. Left off. |
 | `STRATA_MMQ_DIRECT=1` | CUDA, native packs; needs a build with `-DSTRATA_MMQ_TAB=ON` (off by default because it costs 36-38 MiB of VRAM per GPU) | The prompt's MMQ reads resident experts in their cache slots instead of copying them. Same bits. | Faster "read in" time with every expert resident. |
 | `STRATA_IQ4_W4A8=1` | CUDA sm_80..sm_88 (Ampere) and sm_120 (Blackwell, only where the prompt experts run on MMQ: the fused int8 kernels are its default and are faster), IQ4_XS / IQ4_NL experts (`=2`: the IQ4_NL down products only) | The prompt's IQ4 expert products run on a pipelined int8 tensor-core kernel instead of MMQ: the weights stay 4-bit in registers, a cp.async pipeline feeds the K steps. Same bits as MMQ (`prefill_iq4_w4a8_test`); a product it does not cover (another type or GPU, a launch MMQ would split along K) stays on MMQ. | Faster prompts on IQ4 packs; measurements in the pull request. |
+| `--prompt-order auto\|layer\|chunk` | The page-pool engines (strata-q38, strata-ds41) | The order in which a prompt of several chunks is read. `layer` reads one layer across several chunks before the next layer, reducing repeated expert reads; `chunk` reads each chunk through every layer. `auto` (the default) keeps each model's own rule and sets no variables. `layer` and `chunk` set `STRATA_PREFILL_LAYER_MAJOR` (Qwen3.8), `STRATA_LM_HIP` (Qwen3.8 on AMD) and `DS4_LAYER_MAJOR` (DeepSeek) to `1` or `0`; a variable you set yourself wins. Each engine still declines `layer` where it cannot run it (Qwen3.8: an image prompt, a peer GPU, no VRAM for the walk; DeepSeek: more than one GPU, or no RAM for the layer cache). Another summation order, so answers can differ at a near tie. With `layer`, strata-q38 reads a prompt that no other conversation waits on in one run, so a stop goes back to the conversation's latest restore point instead of keeping every chunk read (as a stop in a strata-ds41 prompt does). | Not measured as a setting; the rules behind `auto` are. |
 | `--prefill-head-alias` | `--serve`, one GPU | The output head's VRAM holds the prompt buffers while a prompt is read ([PREFILL_HEAD_ALIAS.md](PREFILL_HEAD_ALIAS.md)). | For 8 GB cards. |
 | `STRATA_EMB_REUSE_ACCOUNT=1` | CUDA | The planner counts the VRAM saved because the half-output buffer `bo` reuses the embedding buffer `emb`, so the auto chunk can grow. Changes prompt rounding. | Prompt about +3.9% on an RTX 3060, no KL measurement yet. |
 | `STRATA_VERIFY_ASYNC_LAUNCH=1` | CUDA, single-request verifier | Runs the CUDA graph launch of a verify window on a separate host thread so the caller keeps serving CPU expert doorbells. A diagnostic for Compute Sanitizer runs. | |
@@ -1399,7 +1494,7 @@ them on your own card.
 | `STRATA_PW_WITH_BATCH=1` | CUDA/HIP layer split with `--pipeline-windows 2` and `--batch` slots | A request that is alone keeps the pipelined windows beside the batch slots; batch windows run without them. | 2x RTX A6000 IQ3_S: lone request +14% on code, +9% on a file rewrite, +3% on a long decode; two requests at once not slower. The second verifier takes about 270 MiB of the first card. |
 | `STRATA_MTP_ROOM_MIN=TOKENS` | CUDA, `--serve` with `--mtp`, no `--batch` | A request that reads at least TOKENS prompt tokens uses the draft layer's 512 decode-only experts (about 675 MiB) as extra ring slots while it is read, then gets them back. | The author measured +17 to +23% prompt on an 8 GB RTX 2060 SUPER; on a P100 limited to 8 GB (ring 8 to 311 slots) it gave +0.5% (CPU share off) and nothing with defaults. Off by default. |
 | `STRATA_IQ_MT_MIN=1`, `STRATA_IQ3S_MT1=1` | CPU | See [Draft layer](#draft-layer) (reproducible output; the second gives IQ3_S the multi-token kernel for one token on Alder Lake and later without AVX-512). | |
-| `STRATA_ROUTE_PRIOR`, `STRATA_ROUTE_RESIDENT`, `STRATA_ROUTE_RESIDENT_MTP` | CUDA | Routing changes that add speed and also add KL. | Off by default. `STRATA_ROUTE_PRIOR=1.5` makes the router prefer experts that are already on the card; it is the one worth trying, on a discrete NVIDIA card of 13 GiB or less (an RTX 3060 12 GB, IQ3_XXS: story +15%, code +37% decode against off). It is an opt-in because it can repeat itself and give weaker results in long agent sessions (#4402; our own check on that card: out of 10 agent tasks 4.5 passed on average over 4 runs at 1.5, against 5.6 over 7 runs with the prior off, where the off runs alone ranged from 4 to 6; a stronger setting, 2.0, showed copy and code defects). Recommended for a 12 GB card used mostly for chat and short answers, not for long agent runs. 0.2.7 turned 1.5 on by itself on those cards and 0.2.8 took that back (owner decision of 2026-10-29): with nothing set, the engine routes exactly as 0.2.6 did (the same as `STRATA_ROUTE_PRIOR=0` and as `STRATA_DEFAULTS=026`). Turn it on: the Expert-settings row "Faster answers on 12 GB NVIDIA cards" (it writes `STRATA_ROUTE_PRIOR=1.5`; shown only for a discrete NVIDIA card of 13 GiB or less), `strata launch --set STRATA_ROUTE_PRIOR=1.5`, or the variable itself. Any value you set wins on every card; it is never on by itself. |
+| `STRATA_ROUTE_PRIOR`, `STRATA_ROUTE_RESIDENT`, `STRATA_ROUTE_RESIDENT_MTP` | CUDA | Routing changes that add speed and also add KL. | Off by default. `STRATA_ROUTE_PRIOR=1.5` makes the router prefer experts that are already on the card: the value is added to their router logits when the experts are picked, so a loaded expert competes as if its router probability were e^1.5 = 4.48 times as high (+348%; 2.0 is +639%, 0.5 is +65%). The Memory panel's "Bias toward loaded experts" and `--route-prior-pct` give it as that percent. It is the one worth trying, on a discrete NVIDIA card of 13 GiB or less (an RTX 3060 12 GB, IQ3_XXS: story +15%, code +37% decode against off). It is an opt-in because it can repeat itself and give weaker results in long agent sessions (#4402; our own check on that card: out of 10 agent tasks 4.5 passed on average over 4 runs at 1.5, against 5.6 over 7 runs with the prior off, where the off runs alone ranged from 4 to 6; a stronger setting, 2.0, showed copy and code defects). Recommended for a 12 GB card used mostly for chat and short answers, not for long agent runs. 0.2.7 turned 1.5 on by itself on those cards and 0.2.8 took that back (owner decision of 2026-10-29): with nothing set, the engine routes exactly as 0.2.6 did (the same as `STRATA_ROUTE_PRIOR=0` and as `STRATA_DEFAULTS=026`). Turn it on: the Expert-settings row "Faster answers on 12 GB NVIDIA cards" (it writes `STRATA_ROUTE_PRIOR=1.5`; shown only for a discrete NVIDIA card of 13 GiB or less), `strata launch --set STRATA_ROUTE_PRIOR=1.5`, or the variable itself. Any value you set wins on every card; it is never on by itself. |
 | `STRATA_HOST_CORE=last\|sibling` (or `--host-core`) | Windows | `last` puts the host thread on the last physical core, away from the core that gets the GPU's interrupts. `sibling` keeps it on the first core's other hardware thread, so the workers keep every core. The default `first` leaves a hybrid CPU as it is. | One layer-split box went from a ±6% swing to steady and 8% faster. |
 | `--pool-affinity measure` | Hybrid CPUs, native packs | Times the `all` and `p-cores` layouts at start (about a second) and takes the faster. The measurement is taken once; where the E-cores' speed changes while the engine runs, `--pool-affinity p-cores` is the steady choice. | |
 | `STRATA_KEEP_EMPTY_TURNS=1`, `STRATA_TOPK_STREAM=0` | | See [TROUBLESHOOTING.md](TROUBLESHOOTING.md). | |
@@ -1633,7 +1728,7 @@ capability 8.0 or up (an A6000 that streams half of UD-Q4_K_XL's experts: 20K pr
 expert: flat). The expert cache still lends the prompt only what it can spare (the chunk shrinks on a small card), the RAM guard steps the
 ceiling 32768 -> 16384 -> 8192 when the RAM available does not cover the extra loan, and a layer split keeps 8192. `STRATA_NV_CHUNK=0`
 or `STRATA_DEFAULTS=026` keep 8192 (`STRATA_NV_CHUNK=16` keeps 16384); `--prefill N`, `auto:N` and `STRATA_PREFILL_AUTO_MAX` are
-never changed. `STRATA_ROUTE_PRIOR` raises KL and is an opt-in again in 0.2.8 (0.2.7 set 1.5 by itself on a discrete NVIDIA card of 13 GiB or less, and the owner took that back on 2026-10-29 because of repetition loops and weaker results in long agent sessions, #4402). `STRATA_ROUTE_PRIOR=1.5` on an RTX 3060 12 GB: story +15%, code +37%, 80 tasks with no copy or code errors, but 4.5 of 10 agent tasks against 5.6 with it off.
+never changed. `STRATA_ROUTE_PRIOR` raises KL and is an opt-in again in 0.2.8 (0.2.7 set 1.5 by itself on a discrete NVIDIA card of 13 GiB or less, and the owner took that back on 2026-10-29 because of repetition loops and weaker results in long agent sessions, #4402). `STRATA_ROUTE_PRIOR=1.5` (+348% in the Memory panel) on an RTX 3060 12 GB: story +15%, code +37%, 80 tasks with no copy or code errors, but 4.5 of 10 agent tasks against 5.6 with it off.
 
 ---
 
@@ -2189,6 +2284,23 @@ including with cost mode enabled. It reads the existing `dspark_conf`, `dspark_c
 request keys; a negative floor uses the engine's default. Model adapters run their networks, bind state, and
 return raw proposals and confidences. DeepSeek's plain step after a rejected model proposal is scheduled here too.
 `--lookahead 0` disables all drafting. `--drafter off` switches off only the model drafter.
+The Memory panel's Drafter list combines the model drafter, the suffix drafter (`--suffix-draft 3`: a step takes its
+guesses instead of the model's where the planner expects them to pay) and lookup after the model's guesses
+(`--lookup-chain 1`), six choices in all. It sends only the settings a choice changes, so a `--suffix-draft` or
+`--lookup-chain` the engine started with stays unless the choice needs another value.
+
+**Draft acceptance** (`--draft-rule`, the Memory panel's choice of the same name, `CHANGE_SETTINGS draft_rule=`)
+decides which guesses a sampled request keeps. A greedy request always compares its guesses with the most likely
+token. `exact` keeps a guess only when it is the token the model draws without guesses, so the answers are those of
+decoding without drafts. `speculative` keeps a guess with probability min(1, p/q) and otherwise draws from what is
+left of p (Leviathan et al. 2023, Chen et al. 2023): each token is still distributed as the model's own draw, so the
+answers are as good, though their words can differ from `exact`'s. Three rules keep more guesses and change the
+answers: `typical` (Medusa's typical acceptance, ε = 0.09, δ = 0.3) keeps a guess the model finds likely enough,
+`top-<N>` (N from 1 to 99; the panel offers 75, 90 and 99) one inside the top N% of the model's probability or at
+least as likely as the model's own draw, and `lower-temperature` (top-0) only the latter. A guess they reject is
+replaced by the token decoding without guesses writes there. The defaults are each engine's earlier rule: `exact` in
+`strata-q38`, `speculative` in `strata-ds41`. Both engines decide in one shared function, `pick_verified_token` in
+`include/strata/common/kernels/draft_rule.hpp`. How much each rule changes speed has not been measured yet.
 
 In `strata-ds41`, the Memory panel's Drafter switch (`CHANGE_SETTINGS drafter=off|on`) also releases and
 reloads DSpark's dense tensors. `--drafter off` and `--dspark off` start with those tensors released;

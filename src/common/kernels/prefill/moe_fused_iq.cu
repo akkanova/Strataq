@@ -19,6 +19,7 @@
 // to 8 KB, IQ2_S).  The activations arrive by cp.async, four stages deep, as in moe_fused.cu; the fragments come by
 // ldmatrix.  The products are mma.sync m16n8k32 (m16n8k16 for the formats with a scale per 16 values); the epilogues
 // (SwiGLU, H to int8 per 32 features; down into the per-slot rows) are moe_fused.cu's.
+#include "strata/base/platform/env.hpp"
 #include "strata/common/kernels/prefill/moe_fused_iq.hpp"
 #include "strata/common/kernels/prefill/pf_fused_override.hpp"
 #include "strata/base/gpu/gfx_arch.hpp"
@@ -1766,10 +1767,7 @@ template <int T, bool GU> bool setup_nt(int& occ) {
 // WGPs), 8192 tokens x top 10, IQ3_S / IQ4_NL, one layer: 1 block per WGP 60.7 ms, 2 44.7, 3 49.9, 4 45.2 (the same
 // work items and arithmetic: the results do not change).  STRATA_PF_OCC=N sets the blocks per WGP (an experiment knob).
 static int wgp_blocks(int occ) {
-    static const int env = [] {
-        const char* v = std::getenv("STRATA_PF_OCC");
-        return v != nullptr ? std::atoi(v) : 0;
-    }();
+    static const int env = strata::platform::env_int("STRATA_PF_OCC", 0);
     return env > 0 ? env : 2 * std::max(occ, 1);
 }
 // The occupancy variants' (W, X1) blocks per WGP: as many as are resident at once, so the persistent grid has no second
@@ -1779,10 +1777,7 @@ static int wgp_blocks(int occ) {
 // (measured on gfx1151).  Not from the occupancy API: it counts 64 KB of LDS per multiprocessor (37,120 B -> 1 block).
 // STRATA_PF_OCC_W=N sets it for every occupancy variant (an experiment knob).
 static int occ_blocks(bool w12, int type, bool gu) {
-    static const int env = [] {
-        const char* v = std::getenv("STRATA_PF_OCC_W");
-        return v != nullptr ? std::atoi(v) : 0;
-    }();
+    static const int env = strata::platform::env_int("STRATA_PF_OCC_W", 0);
     if (env > 0) return env;
     // gfx11 too (gfx1151, IQ2_S gate/up: 235 VGPRs and 37,120 B of LDS leave room for 3 blocks of 8 waves per WGP; a grid of 4 per WGP
     // ran a second, lopsided wave: 16K tokens, one layer, IQ2_S / IQ4_NL 81.7 -> 76.5 ms)

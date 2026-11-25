@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -49,6 +50,23 @@ uint64_t clamp_resident_budget(uint64_t requested, uint64_t physical, uint64_t c
     if (requested <= room) return requested;
     const uint64_t margin = 256ull << 20;
     return room > margin ? room - margin : 0;
+}
+
+size_t get_uma_free_bytes(size_t gpu_free, uint64_t host_available) {
+    static const long gib = [] {
+        const char* h = std::getenv("STRATA_UMA_HEADROOM_GIB");
+        if (h == nullptr)
+            return 6L;
+        char* end = nullptr;
+        const long v = std::strtol(h, &end, 10);
+        if (end != h && *end == '\0' && v >= 0 && v <= 1024)
+            return v;
+        std::fprintf(stderr, "strata: STRATA_UMA_HEADROOM_GIB=%s is not a whole number of GiB (0-1024): "
+                             "using 6\n", h);
+        return 6L;
+    }();
+    const uint64_t head = (uint64_t) gib << 30;
+    return host_available > head && host_available - head > gpu_free ? (size_t) (host_available - head) : gpu_free;
 }
 
 bool pin_depends_on_reclaim(uint64_t free_now, uint64_t bytes, uint64_t reserve) {

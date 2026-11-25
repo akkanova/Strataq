@@ -6,8 +6,8 @@
 
 namespace strata::core {
 
-void* gpu_alloc_zeroed(size_t bytes) {
-    void* p = gpu_alloc(bytes);
+void* gpu_alloc_zeroed(size_t bytes, const char* label) {
+    void* p = gpu_alloc(bytes, label);
     if (p == nullptr)
         return nullptr;
     if (cudaMemset(p, 0, bytes) == cudaSuccess) return p;
@@ -15,10 +15,10 @@ void* gpu_alloc_zeroed(size_t bytes) {
     return nullptr;
 }
 
-void* gpu_alloc(size_t bytes) {
+void* gpu_alloc(size_t bytes, const char* label) {
     void* p = nullptr;
     return strata::core::allocate_device(&p, bytes,
-        {"other", "Device allocations", "Engine buffers"}) == cudaSuccess ? p : nullptr;
+        {"other", "Device allocations", label}) == cudaSuccess ? p : nullptr;
 }
 
 void gpu_free(void* p) { (void) strata::core::release_device(p); }

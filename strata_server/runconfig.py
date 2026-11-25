@@ -18,7 +18,7 @@ from strata_common import user_args
 from strata_base import atomic as _atomic_mod
 
 # (key, kind, help).  kind: "bool", "int>=0", "num>=0", ("enum", values), "names", or ("sampling", check) for a key
-# of the "sampling" block, ("arg", flag) for an engine option kept in "args".
+# of the "sampling" block.
 EDITABLE = [
     ("sampling.temperature", ("sampling", "num>=0"),
      "Default temperature for requests that send none (0 = greedy; without it the model card's: 1.0 thinking, 0.7 not)"),
@@ -39,8 +39,6 @@ EDITABLE = [
     ("engine_silence_s", "num>=0", "End a request when the engine says nothing for this long (default 300 s, 0 = wait)"),
     ("api_monitor", "bool", "Keep the last 100 requests' prompts and answers in memory for /api-monitor"),
     ("open_browser", "bool", "Open the chat page in the browser when the model is ready"),
-    ("vram_reserve_mib", ("arg", "--vram-reserve-mib"),
-     "VRAM in MiB the engine leaves free for other programs (engine default 700)"),
 ]
 SPEC = {k: kind for k, kind, _ in EDITABLE}
 
@@ -55,19 +53,38 @@ LIVE_FLAGS = {"memory_mib.gpu0": "--gpu-mib", "memory_mib.ram": "--ram-mib", "to
               "tokens_max": "--tokens-max", "ssd_pause_mib": "--ssd-pause-mib", "rows": "--rows",
               "suffix_draft": "--suffix-draft", "lookup_chain": "--lookup-chain",
               "lookahead": "--lookahead", "concurrent": "--concurrent", "drafter": "--drafter",
-              "save_on_shutdown": "--save-on-shutdown"}
+              "save_on_shutdown": "--save-on-shutdown", "vram_reserve_mib": "--vram-reserve-mib",
+              "batch_groups": "--batch-groups", "route_tail_skip": "--route-tail-skip",
+              "route_prior_pct": "--route-prior-pct",
+              "draft_confidence_pct": "--draft-confidence-pct", "draft_cumulative_pct": "--draft-cumulative-pct",
+              "expert_half_life": "--expert-half-life", "copy_back": "--copy-back",
+              "step_profile": "--step-profile", "draft_rule": "--draft-rule"}
 # The live settings that are switches: CHANGE_SETTINGS and the run config spell them "on" or "off".
-_LIVE_SWITCHES = ("drafter", "save_on_shutdown")
+_LIVE_SWITCHES = ("drafter", "save_on_shutdown", "shared_memory", "step_profile")
+# The live settings that take one of a few words, with those words.
+_LIVE_WORDS = {"copy_back": ("auto", "on", "off")}
+# The texts the live draft_rule setting takes (include/strata/common/kernels/draft_rule.hpp, parse_draft_rule).
+_DRAFT_RULE = re.compile(r"exact|speculative|typical|lower-temperature|top-[1-9][0-9]?")
+# The switches that hold for the one change they come with, so have no default: shared_memory=on lets that change's
+# GPU pools grow past the dedicated memory into shared memory.
+_ONE_CHANGE = ("shared_memory",)
 # The numeric live settings whose range is not "at least 0": (least, most); the engine checks the rest (concurrent
 # against its batch slots, lookahead against rows, rows against its verify windows: 8, or 16 in a wide build).
-_LIVE_RANGE = {"rows": (1, 16), "concurrent": (1, None), "context": (1, None), "vram_conversations": (1, None)}
+_LIVE_RANGE = {"rows": (1, 16), "concurrent": (1, None), "context": (1, None), "vram_conversations": (1, None),
+               "route_tail_skip": (0, 9), "route_prior_pct": (0, 10000),
+               "draft_confidence_pct": (0, 100), "draft_cumulative_pct": (0, 100),
+               "expert_half_life": (0, 2147483647)}
+# Alternate spellings accepted by the page-pool engines, removed when their canonical flag is saved.
+_LIVE_ALIASES = {"--vram-reserve-mib": ("--reserve-mib",)}
 
 
 def _arg(cfg: dict, flag: str):
-    a = cfg.get("args") if isinstance(cfg.get("args"), list) else []
-    if flag in a[:-1]:
-        v = str(a[a.index(flag) + 1])
-        return int(v) if v.isdigit() else v
+    """Gets the last value of a live flag, including its alternate spellings, as the engine reads it."""
+    flags = (flag, *_LIVE_ALIASES.get(flag, ()))
+    for group in reversed(user_args.groups(cfg.get("args"))):
+        if group[0] in flags and len(group) > 1:
+            v = group[1]
+            return int(v) if v.isdigit() else v
     return None
 
 
@@ -76,8 +93,6 @@ def value_of(cfg: dict, key: str):
     if isinstance(kind, tuple) and kind[0] == "sampling":
         s = cfg.get("sampling")
         return s.get(key.split(".", 1)[1]) if isinstance(s, dict) else None
-    if isinstance(kind, tuple) and kind[0] == "arg":
-        return _arg(cfg, kind[1])
     return cfg.get(key)
 
 
@@ -87,7 +102,7 @@ def view(cfg: dict, path: str | Path) -> dict:
     for key, kind, help_ in EDITABLE:
         k = kind[0] if isinstance(kind, tuple) else kind
         out.append({"key": key, "value": value_of(cfg, key), "help": help_,
-                    "kind": "number" if k in ("sampling", "arg", "int>=0", "num>=0") else k,
+                    "kind": "number" if k in ("sampling", "int>=0", "num>=0") else k,
                     **({"choices": kind[1]} if k == "enum" else {})})
     return {"file": Path(path).name, "keys": out,
             "note": "Saved to the run config; used from the next start of the model."}
@@ -95,22 +110,32 @@ def view(cfg: dict, path: str | Path) -> dict:
 
 def check_live(changes, to_default: bool, cards: list[str] | None = None) -> dict:
     """Checks POST /v1/memory's "set" ({setting: value}): gets the values as CHANGE_SETTINGS spells them (whole
-    numbers; _LIVE_SWITCHES "on" or "off"), or raises a ValueError naming the first bad setting or value.  `to_default`:
-    the values are to be saved to the run config too, so only settings with a flag there are accepted; `cards`: the
-    engine's GPU pool settings (get_card_settings), which --gpu-mib holds (one size per card)."""
+    numbers; _LIVE_SWITCHES "on" or "off"; _LIVE_WORDS one of their words; draft_rule its text), or raises a
+    ValueError naming the first bad setting or value.  `to_default`: the values are to be saved to the run config
+    too, so only settings with a flag there are accepted; `cards`: the engine's GPU pool settings
+    (get_card_settings), which --gpu-mib holds (one size per card)."""
     if not isinstance(changes, dict) or not changes:
         raise ValueError('send {"set": {"<setting>": <value>, ...}}')
     out = {}
     for key, v in changes.items():
-        if key not in LIVE_FLAGS and not _is_card_setting(key):
+        if key not in LIVE_FLAGS and key not in _ONE_CHANGE and not _is_card_setting(key):
             raise ValueError(f"{key!r} is not a memory setting (expected memory_mib.gpu<N>, "
-                             f"memory_mib.gpu<N>.<card> or one of {', '.join(LIVE_FLAGS)})")
-        if to_default and key not in LIVE_FLAGS and key not in (cards or []):
+                             f"memory_mib.gpu<N>.<card> or one of {', '.join((*LIVE_FLAGS, *_ONE_CHANGE))})")
+        if to_default and key not in LIVE_FLAGS and key not in _ONE_CHANGE and key not in (cards or []):
             raise ValueError(f"{key} has no default in the run config; change it for this session only")
         if key in _LIVE_SWITCHES:
             if not isinstance(v, bool) and v not in ("on", "off"):
                 raise ValueError(f'{key}: expected true, false, "on" or "off", not {v!r}')
             out[key] = "on" if v in (True, "on") else "off"
+        elif key in _LIVE_WORDS:
+            if v not in _LIVE_WORDS[key]:
+                raise ValueError(f"{key}: expected one of {', '.join(_LIVE_WORDS[key])}, not {v!r}")
+            out[key] = v
+        elif key == "draft_rule":
+            if not isinstance(v, str) or not _DRAFT_RULE.fullmatch(v):
+                raise ValueError(f"draft_rule: expected exact, speculative, typical, lower-temperature or top-1 to "
+                                 f"top-99, not {v!r}")
+            out[key] = v
         else:
             out[key] = _number(key, v, True, *_LIVE_RANGE.get(key, (0, None)))
     return out
@@ -139,7 +164,7 @@ def apply_live(cfg: dict, values: dict, settings: dict | None = None) -> tuple[d
             _set_arg(new, "--gpu-mib", sizes)
             changed = list(cards)
     for key, v in values.items():
-        if key not in cards and _arg(new, LIVE_FLAGS[key]) != v:
+        if key not in cards and key not in _ONE_CHANGE and _arg(new, LIVE_FLAGS[key]) != v:
             _set_arg(new, LIVE_FLAGS[key], v)
             changed.append(key)
     return new, changed
@@ -190,8 +215,6 @@ def check(key: str, v, cfg: dict):
         return _number(key, v, whole=True)
     if k == "num>=0":
         return _number(key, v)
-    if k == "arg":
-        return _number(key, v, whole=True)
     rule = kind[1]                                     # a sampling key: the server's own rules
     if rule == "num>=0":
         return float(_number(key, v))
@@ -225,8 +248,6 @@ def apply(cfg: dict, changes: dict) -> tuple[dict, list[str]]:
                 new["sampling"] = s
             else:
                 new.pop("sampling", None)
-        elif isinstance(kind, tuple) and kind[0] == "arg":
-            _set_arg(new, kind[1], v)
         elif v is None:
             new.pop(key, None)
         else:
@@ -238,6 +259,8 @@ def apply(cfg: dict, changes: dict) -> tuple[dict, list[str]]:
 def _set_arg(cfg: dict, flag: str, v) -> None:
     """Sets engine option `flag` to `v` (None: removes it) in cfg's "args", in place, as the person's own (user_args),
     so that it survives setup and the app writing "args" again."""
+    for alias in _LIVE_ALIASES.get(flag, ()):
+        _set_arg(cfg, alias, None)
     a = list(cfg.get("args") or [])
     if flag in a[:-1]:
         i = a.index(flag)

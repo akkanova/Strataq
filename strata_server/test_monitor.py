@@ -422,11 +422,13 @@ class Monitor(unittest.TestCase):
             {"id": "gpu0", "name": "GPU", "total": 1000, "free": 100, "unified": False, "paused_count": None,
              "paused_budget": None, "uses": {"experts": 600, "conversations": 200}},
             {"id": "ram", "name": None, "total": None, "free": None, "unified": False, "paused_count": 1,
-             "paused_budget": 50, "uses": {"paused": 20}}], "settings": {"context": 4096}}
+             "paused_budget": 50, "uses": {"paused": 20}}], "settings": {"context": 4096},
+            "expert_traffic": {"gpu0": {"hits": 7, "misses": 5}, "ram": {"ssd_bytes": 4096}}}
         self.enterContext(mock.patch("strata_base.memory.read_ram", return_value=mock.Mock(total=5000, available=3000)))
         code, body = self.request("/v1/memory")
         self.assertEqual((code, body["available"], body["busy"], body["settings"]),
                          (200, True, False, {"context": 4096}))
+        self.assertEqual(body["expert_traffic"], self.engine.memory()["expert_traffic"])
         self.assertEqual(body["machine"]["ram_total"], 5000)
         gpu, ram = body["memories"]
         self.assertEqual(gpu["other_apps"], 100)        # in use there, not named by the engine
@@ -435,6 +437,7 @@ class Monitor(unittest.TestCase):
         with self.svc.fifo:                              # a request is running: the last answer, marked busy
             again = self.request("/v1/memory")[1]
         self.assertEqual((again["busy"], again["at"], again["memories"]), (True, body["at"], body["memories"]))
+        self.assertEqual(again["expert_traffic"], body["expert_traffic"])
         web = Path(__file__).parent / "web"            # the Memory panel draws it
         html, js = (web / "index.html").read_text(encoding="utf-8"), (web / "app.js").read_text(encoding="utf-8")
         for el in ("mem-card", "mem-panel"):
@@ -725,7 +728,8 @@ class EngineConversations(unittest.TestCase):
         got = engine.memory()
         self.assertEqual(engine.proc.stdin.getvalue(), "GET_MEMORY_USE\n")
         none = {"allocated_pct": None, "fragmented_pct": None,   # no page pool: the old engines
-                "setting": None, "smallest": None, "largest": None, "mapped": None, "pool_offset": None}
+                "setting": None, "smallest": None, "largest": None, "mapped": None, "pool_offset": None,
+                "pool_shared": None, "kept_free": None, "dedicated_room": None, "dedicated_full": False}
         self.assertEqual(got, {"memories": [
             {"id": "gpu0", "name": "Radeon 8060S", "total": 1000, "free": 300, "unified": True, "paused_count": None,
              "paused_budget": None, **none, "uses": {"weights": 100, "experts": 450}},
@@ -736,9 +740,14 @@ class EngineConversations(unittest.TestCase):
         draft = self.bare(["MEMORY gpu0 experts=9 drafter_experts=7", "END_MEMORY"]).memory()
         self.assertEqual(draft["memories"][0]["uses"], {"experts": 9, "drafter_experts": 7})
         pool = self.bare(["MEMORY gpu0 experts=9 pool_pages=800 allocated_pages=780 fragmented_pages=3 setting=500 "
-                          "smallest=200 largest=900 name=card", "SETTINGS", "END_MEMORY"]).memory()["memories"][0]
+                          "smallest=200 largest=900 pool_shared=64 dedicated_full=1 kept_free=32 dedicated_room=16 "
+                          "name=card", "SETTINGS", "END_MEMORY"]).memory()["memories"][0]
         self.assertEqual((pool["allocated_pct"], pool["fragmented_pct"], pool["uses"]), (97.5, 0.38, {"experts": 9}))
-        self.assertEqual((pool["setting"], pool["smallest"], pool["largest"]), (500, 200, 900))
+        self.assertEqual((pool["setting"], pool["smallest"], pool["largest"], pool["pool_shared"],
+                          pool["dedicated_full"], pool["kept_free"], pool["dedicated_room"]),
+                         (500, 200, 900, 64, True, 32, 16))
+        full = self.bare(["MEMORY gpu0 experts=9 dedicated_room=0", "END_MEMORY"]).memory()["memories"][0]
+        self.assertEqual((full["dedicated_room"], full["uses"]), (0, {"experts": 9}))
         self.assertEqual(self.bare(["SETTINGS", "END_MEMORY"]).memory(), {"memories": [], "settings": {}})
         got = self.bare(["CONVERSATION slot0 vram decoding 3 4096 1000 900", "SETTINGS rows=8", "END_MEMORY"]).memory()
         self.assertEqual(got["conversations"], [{"id": "slot0", "place": "vram", "state": "decoding", "count": 3,

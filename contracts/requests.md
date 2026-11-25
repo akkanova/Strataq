@@ -83,6 +83,51 @@ their admission and completion statistics into one DONE. Their `GEN`, `BGEN`,
 still finish an operation before servicing another command; this protocol does
 not make an old model implementation concurrent or add live settings support.
 
+## Live statistics
+
+The paged engine writes one untagged `STATS` line a second, unasked, from its
+own thread, so the lines keep coming during a long prompt chunk. The rest of
+the line is one JSON object:
+
+```text
+STATS {"seconds":12.004,"gpus":[{"id":"gpu0","to_gpu":81920,"from_gpu":4096,"experts":12}],"decode":{"steps":310,"rows":806,"conversations":620,"routed_rows":806,"routings":425568,"experts":382900,"cpu_experts":0,"guesses":496,"kept":278,"guess_room":1240},"prefill":{"tokens":40960,"ms":38211.500}}
+```
+
+`seconds` is the time since the engine became ready. Each of `gpus` is one card
+(`id` as in `GET_MEMORY_USE`). `to_gpu` and `from_gpu` are the bytes that moved
+from host memory to the card and back since the engine started: copies, and the card's reads
+and writes of host memory in place. `experts` is how many experts were among the
+bytes sent to the card; an expert sent again counts again, and one split over
+several cards counts once, on the card that gets its first part. Older engines
+leave it out. They are totals, so the difference between
+two lines over the difference of their `seconds` is the rate, even when a line
+is late.
+
+`decode` and `prefill` are totals too. `decode.steps` counts the decode steps
+(one pass through the model each) and `rows` the rows they ran: a row is one
+token of a conversation, or one guessed token checked. `conversations` counts the
+conversations each completed step ran rows for, counting each conversation once
+per step. `conversations / steps` is the average number writing together.
+Paused or cancelled conversations and those with no room for a token do not count.
+Steps that fail before finishing are excluded from these totals. `routings` counts each
+row's trip to each routed expert (the shared expert is not counted), and
+`experts` the experts those trips reached, each counted once per layer and
+step, so rows that share an expert count it once. Both are counted only in steps
+whose routings the model counts on the host (not while every expert is in VRAM);
+`routed_rows` is the rows of those steps. `cpu_experts` is the experts the CPU
+computed in the steps, counted the same way. `guesses` is the guessed tokens
+checked (from the drafter and suffix lookup) and `kept` those the model kept.
+`guess_room` sums the guess row allowance for the conversation-steps counted in
+`conversations`: each one's share of spare rows, capped by the lookahead and its
+remaining output tokens after its own next token, or zero when drafting is off. This is an upper bound
+before draft source limits, confidence cuts, cooling and memory constraints.
+Dividing by `conversations` gives the average allowance per conversation per step,
+not a maximum for every conversation or the current settings.
+`prefill.tokens` is the prompt
+tokens read and `prefill.ms` the time spent reading them, without the turns the
+prompt gives to conversations that decode meanwhile. Readers ignore keys they do not know, so that more statistics can be
+added.
+
 Python retains its old protocol client for installed engines that do not
 advertise `requests`. It never chooses that client for an updated engine.
 
