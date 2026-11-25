@@ -2451,6 +2451,8 @@ strata::serve::MemoryReport PagedEngine::describe_memory() const {
     ram.traffic = ram_.pages().traffic().get_counts();
     ram.smallest = get_smallest_ram();
     ram.largest = get_largest_ram();
+    if (const uint64_t commit = get_commit_room(); commit != UINT64_MAX)
+        ram.commit_room = commit;
     strata::serve::Memory& ssd = report.at("ssd");
     for (int64_t l = 0; l < facts_.n_layers; ++l) {
         uint64_t on_ssd = 0;
@@ -2670,8 +2672,8 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
                    card.id + " would keep " + gib(asked);
     }
     if (ram_bytes && (*ram_bytes < get_smallest_ram() || *ram_bytes > get_largest_ram()))
-        return "the RAM's pool may be " + gib(get_smallest_ram()) + " to " + gib(get_largest_ram()) + ", not " +
-               gib(*ram_bytes);
+        return "the resizable RAM pool may be " + gib(get_smallest_ram()) + " to " + gib(get_largest_ram()) +
+               "; cannot allocate " + gib(*ram_bytes);
     // then the changes: those that free memory first, so that those taking memory find it; a higher token minimum
     // waits for the GPU's pool to grow, as the pool may not hold it before
     const int64_t min_first = std::min(s.tokens_min, settings_.tokens_min);

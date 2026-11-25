@@ -478,6 +478,55 @@ test('a pool interval crossing a category keeps the divider and legend totals co
   assert.equal((legend.match(/Other 2.00 GiB/g) || []).length, 1);
 });
 
+test("a RAM pool capped by Windows' commit limit explains it in the Free tooltip and on release",
+  async () => {
+  const ram = {id: 'ram', total: 8 * GIB, setting: 2 * GIB, pool_offset: 0, smallest: GIB, largest: 3 * GIB,
+    uses: {experts: 2 * GIB}, free: 6 * GIB};
+  const mountRam = (commit_room, free = ram.free) => mount({available: true, can_change: true, settings: {},
+    memories: [{...ram, commit_room, free}]}, async () =>
+    ({ok: false, error: 'the resizable RAM pool may be 1 to 3 GiB; cannot allocate 6 GiB'}));
+  const freeTip = (commit_room, free) =>
+    mountRam(commit_room, free).element.innerHTML.match(/data-use="free" title="([^"]*)"/)?.[1] ?? "";
+  assert.match(freeTip(4 * GIB),
+    /At most 3[.,]00 GiB in all is available[^"]*Windows can promise programs only 4[.,]00 GiB/);
+  assert.match(freeTip(0), /Windows can promise programs only 0 MiB more/);
+  assert.match(freeTip(GIB / 2), /leaves up to 1 GiB of this room free/);
+  for (const [commit_room, free] of [[6 * GIB], [7 * GIB], [null], [4 * GIB, null]])
+    assert.doesNotMatch(freeTip(commit_room, free), /Windows/);
+  const readOnly = mount({available: true, settings: {}, memories: [{...ram, commit_room: 4 * GIB}]}).element;
+  assert.match(readOnly.querySelector('[data-use="free"]').title, /Windows can promise programs only/);
+  const {element, fire} = mountRam(4 * GIB);
+  fire('pointerdown', {target: onDivider('ram'), clientX: 250});
+  fire('pointermove', {clientX: 750});
+  const preview = element.querySelector('.mem-preview').textContent;
+  assert.match(preview,
+    /at most 3[.,]00 GiB in all is available to Strata here: 0 MiB fixed and up to 3[.,]00 GiB of resizable/);
+  assert.doesNotMatch(preview, /Windows/);
+  fire('pointerup', {});
+  assert.match(element.querySelector('.mem-notice.mem-error').textContent,
+    /Changing[^]*Requested size: At most 3[.,]00 GiB[^]*Windows/);
+  await settle();
+  assert.match(element.querySelector('.mem-notice.mem-error').textContent,
+    /^the resizable RAM pool may be 1 to 3 GiB; cannot allocate 6 GiB\. Requested size: At most 3[.,]00 GiB/);
+});
+
+test('a release warning stays separate from the engine result and clears if accepted', async () => {
+  const view = {available: true, can_change: true, settings: {}, memories: [{id: 'gpu0', total: 8 * GIB,
+    setting: 2 * GIB, largest: 3 * GIB, uses: {experts: 2 * GIB}, free: 6 * GIB}]};
+  for (const ok of [false, true]) {
+    const {element, fire} = mount(view, async () => ({ok, error: 'Connection lost.'}));
+    fire('pointerdown', {target: onDivider('gpu0'), clientX: 250});
+    fire('pointermove', {clientX: 750});
+    fire('pointerup', {});
+    assert.match(element.querySelector('.mem-notice.mem-error').textContent, /Requested size: About[^]*shared/);
+    await settle();
+    if (ok)
+      assert.equal(element.querySelector('.mem-notice.mem-error'), null);
+    else
+      assert.match(element.querySelector('.mem-notice.mem-error').textContent,
+        /^Connection lost\. Requested size: About[^]*shared memory/);
+  }
+});
 
 test('paused conversations show last-token ages and the SSD pause folder', () => {
   const now = Math.floor(Date.now() / 1000);

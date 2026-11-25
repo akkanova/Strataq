@@ -1062,6 +1062,12 @@ the GPU keeps the size the runtime reports.
 `dedicated_room` (the space left below the measured dedicated-memory limit after all programs' current use) in bytes,
 from their `MEMORY` lines' `kept_free=<B>` and `dedicated_room=<B>` (`null` when the line has none).
 `dedicated_room` is absent until a growth finds the limit; zero means no room remains.
+On Windows, the `ram` memory also has `commit_room`: what Windows can still promise programs (its commit limit, the RAM
+plus the page file, less what all programs have committed). Programs often commit memory they have not used yet, so
+this can be far below the free RAM. The RAM pool can grow by the smaller of these two values, less up to 1 GiB kept
+free and rounded down to whole pool chunks. The Memory panel explains when commit room is the smaller limit.
+To get more, close programs or set a larger page file. A page file that Windows manages grows by itself, but only
+while its drive has free space, so freeing disk space sometimes helps too.
 `machine` is the server's own reading of the RAM and of the GPUs
 (the hardware sampler of `GET /metrics`). The engine's `ram` gets the machine's size and free RAM; `other` is what is in
 use in a memory beyond the uses the engine names (other programs, buffers the engine does not count). A value the engine
