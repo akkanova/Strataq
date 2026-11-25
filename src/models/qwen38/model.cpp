@@ -5577,9 +5577,8 @@ void set_tail_skip_default(const Model& m, int64_t gpu_experts, const char* who)
     // Nothing to do, so no default and no line, when every expert is in VRAM; off with --batch slots (a window then
     // mixes requests, and one request's skip would depend on another's tokens) and, as in the dispatch, with a peer
     // or helper GPU.  A layer split is fine: each stage skips by itself.  The paged engine's windows mix its
-    // conversations too, but there the dispatch decides for each conversation by its own tokens
-    // (ExpertDispatch::token_owner), and a pipelined group that mixes them skips nothing (PagedQwen::prepare_group),
-    // so the default stays.
+    // conversations too, but there the owner chose to keep the skip: a high rank in any row keeps the expert for
+    // every row, which keeps each answer nearer the full model.
     const char* tse = std::getenv("STRATA_ROUTE_TAIL_SKIP");
     // #1884: with nearly every expert in the GPU cache (V100 32 GB, Coder IQ1_M: 94.8% of the experts, 99.9% decode
     // hits) the few misses are cheap and the skip costs more draft acceptance (70.1% -> 68.2%) than it saves:

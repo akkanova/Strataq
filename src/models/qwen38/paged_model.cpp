@@ -249,24 +249,14 @@ public:
     }
     bool run_rows(const std::vector<strata::spec::StepRow>& rows, std::vector<int32_t>& picks,
                   std::string& err) override {
-        owners_.clear();
-        for (const auto& row : rows)
-            owners_.push_back(row.session);
-        m_.drive.d.token_owner = is_one_conversation(rows) ? nullptr : owners_.data();
-        strata::core::set_tail_skip_rank(tail_rank_);
-        const bool ok = run_rows(rows, histories_, picks, err);
-        m_.drive.d.token_owner = nullptr;
-        if (!ok)
+        if (!run_rows(rows, histories_, picks, err))
             return false;
         refine_pcie_shares();
         return true;
     }
     int get_pipeline_stages() const override { return (int) cards_.size(); }
-    int get_route_tail_skip() const override { return tail_rank_; }
-    void set_route_tail_skip(int rank) override {
-        tail_rank_ = rank;
-        strata::core::set_tail_skip_rank(rank);
-    }
+    int get_route_tail_skip() const override { return strata::core::tail_skip_rank(); }
+    void set_route_tail_skip(int rank) override { strata::core::set_tail_skip_rank(rank); }
     float get_route_prior() const override { return strata::core::get_route_prior(); }
     void set_route_prior(float lambda) override { strata::core::set_route_prior(lambda); }
     bool prepare_group(int group, const std::vector<strata::spec::StepRow>& rows, std::string& err) override;
@@ -346,15 +336,7 @@ private:
     std::vector<int32_t> picks_;       ///< the last step's token after each row, for the drafter
     std::vector<const std::vector<int32_t>*> histories_; ///< consumed tokens for the current step
     std::vector<int> history_lengths_; ///< each session's penalty window
-    /// The route tail skip's rank for the verify windows (set_tail_skip_default's, then --route-tail-skip's or the
-    /// Memory panel's); each window sets the global rank from it, since a mixed pipelined group turns that off.
-    int tail_rank_ = 0;
-    std::vector<int32_t> owners_;   ///< each serial-window token's conversation (ExpertDispatch::token_owner)
     strata::qwen38::PcieAuto pcie_auto_;   ///< refines the cards' PCIe shares in the first decode windows
-    /// Tells whether every row of a verify window is one conversation's.  A pipelined group that mixes them runs
-    /// without the route tail skip, since its windows share the dispatch with the other groups in flight and cannot
-    /// say whose each token is (ExpertDispatch::token_owner).
-    static bool is_one_conversation(const std::vector<strata::spec::StepRow>& rows);
     /// Feeds a finished decode window to pcie_auto_ and, when it picks a new share, gives every card its own share
     /// for its link against the CPU pool's measured rate (as the older engine's layer split does).
     void refine_pcie_shares();
@@ -570,7 +552,6 @@ PagedQwen::PagedQwen(Model& m, Conversation& conv, const PagedCards& cards, Mode
     facts.adapt_decay = o.adapt_decay;
     facts.row_bytes = (uint64_t) strata::kernels::cpu::H * sizeof(float);
     facts.cpu_expert_ms = kCpuExpertMs;
-    tail_rank_ = strata::core::tail_skip_rank();
     const bool cards_refined = model_cards.size() == 1 || pcie_auto_split_ok();
     if (o.pcie_frac_auto && o.pcie_probe_gbps > 0.0 && o.peer_device < 0 && cards_refined) {
         pcie_auto_.on = true;
@@ -580,10 +561,6 @@ PagedQwen::PagedQwen(Model& m, Conversation& conv, const PagedCards& cards, Mode
             sum += (double) b;
         pcie_auto_.blob_bytes = sum / (double) facts.expert_bytes.size();
     }
-}
-
-bool PagedQwen::is_one_conversation(const std::vector<strata::spec::StepRow>& rows) {
-    return std::all_of(rows.begin(), rows.end(), [&](const auto& r) { return r.session == rows[0].session; });
 }
 
 void PagedQwen::refine_pcie_shares() {
@@ -1270,10 +1247,6 @@ bool PagedQwen::run_rows(const std::vector<strata::spec::StepRow>& rows,
 }
 
 bool PagedQwen::prepare_group(int group, const std::vector<strata::spec::StepRow>& rows, std::string& err) {
-    // the rank is global and run_stage_groups prepares every group of a wave before it launches one, so a mixed
-    // group turns the skip off for the whole wave (finish_group turns it back on)
-    if (!is_one_conversation(rows))
-        strata::core::set_tail_skip_rank(0);
     if (groups_.size() <= (size_t) group)
         groups_.resize((size_t) group + 1);
     if (!groups_[(size_t) group])
@@ -1342,7 +1315,6 @@ bool PagedQwen::finish_group(int group, std::vector<int32_t>& picks, std::string
         return false;
     g.picks = picks;
     note_row_logprobs(verifier, g, picks);
-    strata::core::set_tail_skip_rank(tail_rank_);
     refine_pcie_shares();
     return true;
 }

@@ -4303,31 +4303,22 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         // STRATA_ROUTE_TAIL_SKIP=R (default 7 on CUDA serve, =0 off; changes the output): a missed expert that EVERY token of the window routes
         // only at rank >= R (the smallest weights of the top-10) is neither copied nor computed; its contribution is
         // zero, without renormalisation (the others keep the weight the router gave them).  Less PCIe and CPU work.
-        // With d.token_owner, "every token" is every token of the entry's own conversation: an entry is skipped
-        // (skip_e) when its conversation routes the expert that low, and the expert is skipped (skip_d) when every
-        // entry is, so each conversation gets the skips it would get alone.
         const int tail_rank = tail_skip_rank();
-        bool skip_d[kMaxWindowEntries], skip_e[kMaxWindowEntries];
+        bool skip_d[kMaxWindowEntries];
         for (int q = 0; q < nd; ++q) skip_d[q] = false;
-        for (int64_t i = 0; i < n; ++i) skip_e[i] = false;
         if (tail_rank > 0 && d.peer == nullptr && d.remote_count == 0) {
-            const auto owner = [&](int64_t i) { return d.token_owner != nullptr ? d.token_owner[i / k] : 0; };
+            int minr[kMaxWindowEntries];
+            for (int q = 0; q < nd; ++q) minr[q] = 99;
             for (int64_t i = 0; i < n; ++i) {
-                const int32_t e = ids[i];
-                if (e < 0 || e >= d.n_expert || d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0)
-                    continue;   // resident
-                int minr = 99;   // the best rank the entry's conversation routes the expert at
-                for (int64_t j = first_of[i]; j < n; ++j)
-                    if (first_of[j] == first_of[i] && owner(j) == owner(i))
-                        minr = std::min(minr, (int) (j % k));
-                skip_e[i] = minr >= tail_rank;
+                int q = 0;
+                while (q < nd && distinct[q] != first_of[i]) ++q;
+                if (q < nd) minr[q] = std::min(minr[q], (int) (i % k));
             }
             for (int q = 0; q < nd; ++q) {
+                const int32_t e = ids[distinct[q]];
+                if (e < 0 || e >= d.n_expert || minr[q] < tail_rank) continue;
+                if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;   // resident
                 skip_d[q] = true;
-                for (int64_t i = distinct[q]; i < n && skip_d[q]; ++i)
-                    skip_d[q] = first_of[i] != distinct[q] || skip_e[i];
-                if (!skip_d[q])
-                    continue;
                 --nmiss;
                 ++d.tail_experts;
             }
@@ -4414,12 +4405,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 }
             }
             for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) kind[i] = skip_e[i] ? -2 : kd;
+                if (first_of[i] == i0) kind[i] = kd;
             if (kd != 0) continue;                 // the VRAM groups first; the PCIe groups below
             P.ptr[groups] = ptr;
             P.start[groups] = entries;
             for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0 && !skip_e[i]) {
+                if (first_of[i] == i0) {
                     P.dst[entries] = (int32_t) i;
                     P.tok[entries] = (int32_t) (i / k);
                     ++entries;
@@ -4434,7 +4425,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                                  : P.staging + (unsigned long long) q * (unsigned long long) bb;
             P.start2[q] = entries;
             for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0 && !skip_e[i]) {
+                if (first_of[i] == i0) {
                     P.dst[entries] = (int32_t) i;
                     P.tok[entries] = (int32_t) (i / k);
                     ++entries;
