@@ -1118,6 +1118,18 @@ struct PinnedUpload {
             ev = nullptr;
         }
     }
+    /// Enlarges an existing pinned uploader without losing it if allocation fails.
+    bool try_grow(size_t count) {
+        if (!p || count <= n)
+            return true;
+        PinnedUpload grown;
+        grown.init(count);
+        if (!grown.p)
+            return false;
+        release();
+        *this = grown;
+        return true;
+    }
     bool upload(void* dst, const int32_t* src, size_t count, cudaStream_t s) {
         const size_t bytes = count * sizeof(int32_t);
         if (!p || count > n) return cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, s) == cudaSuccess;
@@ -1987,19 +1999,10 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         if (!ok) { err = "prefill: the layer split's hand-off events (STRATA_HANDOFF_PIPE)"; return false; }
         m.hand_pieces = handoff_pipe_pieces();
     }
-    if (m.tok_dev == nullptr) {
-        if (const cudaError_t e = strata::core::allocate_device((void**) &m.tok_dev, (size_t) chunk * sizeof(int32_t),
-            {"other", "Device allocations", "Prompt processing"}); e != cudaSuccess) {
-            err = std::string("prefill: the token id buffer (") + cudaGetErrorString(e) + ")";
-            return false;
-        }
-        m.owned.push_back(m.tok_dev);
-        m.tok_host.resize((size_t) chunk);
-        m.tok_up.init((size_t) chunk);
-    }
     if (cudaStreamCreateWithFlags(&m.copy, cudaStreamNonBlocking) != cudaSuccess) { err = "prefill: copy stream"; return false; }
     const size_t T = (size_t) chunk;
-    m.T_max = chunk;
+    if (!reserve_chunk(T, err))
+        return false;
     m.borrowed = borrow != nullptr;
     m.borrow_spill = m.borrowed && borrow_spill;
     bool ok = true;
@@ -2052,38 +2055,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                                  "layer's file-tier experts\n");
         }
     }
-    m.steps_host.resize(T * strata::kernels::kStepCount);
-    m.steps_up.init(T * strata::kernels::kStepCount);
-    m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
-    {
-        // the routing tables, the MMQ group bounds (bounds_ints: with STRATA_PF_GROUP_SCRATCH, the sub-ranges' tables too);
-        // STRATA_MMQ_WS: the in-place offsets (n_expert int64) and the weight-stationary layers' chunks (4 int32 each,
-        // 16-byte aligned)
-        const size_t need = 3 * T * K + bounds_ints(m.g->n_expert) +
-                            (ws::mode() != 0 ? 2 * (size_t) m.g->n_expert + 4 * ws::max_chunks((int64_t) T * K, m.g->n_expert) + 3 : 0);
-        const char* gc = std::getenv("STRATA_GROUP_COPY");
-        if (m.grp_n < need && !(gc && gc[0] == '1')) {
-            if (m.grp_host)
-                strata::core::release_host(m.grp_host);
-            m.grp_host = m.grp_dev = nullptr;
-            m.grp_n = m.grp_tk = 0;
-            void *h = nullptr, *d = nullptr;
-            if (!force_pageable() &&
-                strata::core::allocate_host(&h, need * 4, cudaHostAllocMapped | (core::peer_portable() ?
-                    cudaHostAllocPortable : 0),
-                    {"other", "Device allocations", "Prompt processing"}) == cudaSuccess &&
-                cudaHostGetDevicePointer(&d, h, 0) == cudaSuccess) {
-                m.grp_host = (int32_t*) h;
-                m.grp_dev = (int32_t*) d;
-                m.grp_n = need;
-                m.grp_tk = T * K;
-            } else {                              // the copies, as before
-                if (h)
-                    strata::core::release_host(h);
-                cudaGetLastError();
-            }
-        }
-    }
+    m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
     pf_mark("init: routing tables (pinned, mapped)", tr_last);
     for (int b = 0; b < 2; ++b) {
         if (!host_borrowed_ && !m.ple_emb_host[b] &&
@@ -2098,14 +2070,6 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         }
         if (!m.ple_copied[b] && cudaEventCreateWithFlags(&m.ple_copied[b], cudaEventDisableTiming) != cudaSuccess)
             ok = false;
-        m.ple_rows[b].resize(T * strata::kernels::PLE_N_HEADS);
-        if (ple_compact_on() && m.ple_raw_dev == nullptr &&
-            strata::core::allocate_device((void**) &m.ple_raw_dev,
-                (size_t) T * strata::kernels::PLE_N_HEADS * strata::kernels::PLE_ROW_BYTES,
-                {"other", "Device allocations", "Prompt processing"}) != cudaSuccess) {
-            m.ple_raw_dev = nullptr;
-            (void) cudaGetLastError();
-        }
     }
     // STRATA_PLE_COPY_STREAM: a stream of its own, not the expert copy stream - that one may hold a ring of blobs and
     // waits on their slots' release, so a wait on it could idle the compute stream for longer than the DMA itself
@@ -2382,6 +2346,90 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
             return false;
         }
     }
+    return true;
+}
+
+bool Prefill::raise_chunk_limit(int64_t chunk, std::string& err) {
+    if (!impl_->borrowed || impl_->borrow_spill || !host_borrowed_) {
+        err = "prefill: larger chunks need both device and host buffers lent for each prompt";
+        return false;
+    }
+    try {
+        return idle(err) && reserve_chunk((size_t) chunk, err);
+    } catch (const std::exception& e) {
+        err = std::string("prefill: the chunk's host buffers could not grow: ") + e.what();
+        return false;
+    }
+}
+
+bool Prefill::reserve_chunk(size_t T, std::string& err) {
+    Impl& m = *impl_;
+    if ((int64_t) T <= m.T_max)
+        return true;
+    // Each successful growth still holds the old limit if a later allocation fails.
+    m.owned.reserve(m.owned.size() + 1);
+    m.tok_host.resize(T);
+    m.steps_host.resize(T * strata::kernels::kStepCount);
+    m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K);
+    for (std::vector<uint32_t>& rows : m.ple_rows)
+        rows.resize(T * strata::kernels::PLE_N_HEADS);
+    if (!m.tok_up.try_grow(T) || !m.steps_up.try_grow(T * strata::kernels::kStepCount)) {
+        err = "prefill: the chunk's pinned upload buffers could not grow";
+        return false;
+    }
+    int32_t* tok = nullptr;
+    if (const cudaError_t e = strata::core::allocate_device((void**) &tok, T * sizeof(int32_t),
+            {"other", "Device allocations", "Prompt processing"}); e != cudaSuccess) {
+        err = std::string("prefill: the token id buffer (") + cudaGetErrorString(e) + ")";
+        return false;
+    }
+    if (m.tok_dev) {
+        m.owned.erase(std::find(m.owned.begin(), m.owned.end(), (void*) m.tok_dev));
+        strata::core::release_device(m.tok_dev);
+    }
+    m.owned.push_back(m.tok_dev = tok);
+    m.tok_up.init(T);
+    m.steps_up.init(T * strata::kernels::kStepCount);
+    {
+        // the routing tables, the MMQ group bounds (bounds_ints: with STRATA_PF_GROUP_SCRATCH, the sub-ranges' tables too);
+        // STRATA_MMQ_WS: the in-place offsets (n_expert int64) and the weight-stationary layers' chunks (4 int32 each,
+        // 16-byte aligned)
+        const size_t need = 3 * T * K + bounds_ints(m.g->n_expert) +
+                            (ws::mode() != 0 ? 2 * (size_t) m.g->n_expert + 4 * ws::max_chunks((int64_t) T * K, m.g->n_expert) + 3 : 0);
+        const char* gc = std::getenv("STRATA_GROUP_COPY");
+        if (m.grp_n < need && !(gc && gc[0] == '1')) {
+            if (m.grp_host)
+                strata::core::release_host(m.grp_host);
+            m.grp_host = m.grp_dev = nullptr;
+            m.grp_n = m.grp_tk = 0;
+            void *h = nullptr, *d = nullptr;
+            if (!force_pageable() &&
+                strata::core::allocate_host(&h, need * 4, cudaHostAllocMapped | (core::peer_portable() ?
+                    cudaHostAllocPortable : 0),
+                    {"other", "Device allocations", "Prompt processing"}) == cudaSuccess &&
+                cudaHostGetDevicePointer(&d, h, 0) == cudaSuccess) {
+                m.grp_host = (int32_t*) h;
+                m.grp_dev = (int32_t*) d;
+                m.grp_n = need;
+                m.grp_tk = T * K;
+            } else {                              // the copies, as before
+                if (h)
+                    strata::core::release_host(h);
+                cudaGetLastError();
+            }
+        }
+    }
+    if (ple_compact_on()) {   // (optional: without it the PLE rows go up dequantized)
+        if (m.ple_raw_dev)
+            (void) strata::core::release_device(m.ple_raw_dev);
+        if (strata::core::allocate_device((void**) &m.ple_raw_dev,
+                T * strata::kernels::PLE_N_HEADS * strata::kernels::PLE_ROW_BYTES,
+                {"other", "Device allocations", "Prompt processing"}) != cudaSuccess) {
+            m.ple_raw_dev = nullptr;
+            (void) cudaGetLastError();
+        }
+    }
+    m.T_max = (int64_t) T;
     return true;
 }
 

@@ -8,6 +8,7 @@
 #include "strata/base/gpu/runtime.hpp"
 #include "strata/base/gpu/traffic.hpp"
 #include "strata/common/experts/card_rules.hpp"
+#include "strata/common/kernels/routing_stats.hpp"
 #include "strata/common/experts/expert_swaps.hpp"
 #include "strata/common/experts/ram_tier.hpp"
 #include "strata/common/kernels/window_limits.hpp"
@@ -56,6 +57,10 @@ using Clock = std::chrono::steady_clock;
 /// The free bytes beyond the pages kept for --tokens-min above which a card's pool makes the adaptive tier run a round
 /// every decode step instead of every --adapt-every steps: experts the conversations use then come in sooner.
 constexpr uint64_t kEveryStepFreeBytes = 1ull << 30;
+/// The RAM (and Windows commit room) that the RAM's pool leaves free when it grows, for the engine's later
+/// allocations and for other programs.  A guess, not a measurement: a start that left 0.8 GiB of the commit limit
+/// served, and one that left 0.1 GiB failed on its next allocation.
+constexpr uint64_t kRamReserveBytes = 1ull << 30;
 
 template <class F>
 auto time_step_if(bool enabled, double& elapsed, F&& operation) -> decltype(operation());
@@ -195,11 +200,15 @@ private:
     /// Takes or gives back chunks of the RAM's pool so that it (and the staging ring) hold `bytes`: the conversations
     /// paused in the chunks it gives back move to the SSD.  Gets why not, or an empty string.
     std::string resize_ram(uint64_t bytes);
+    /// Grows the RAM's pool from the one chunk it opened with (RamExperts::open) towards RamExperts::get_asked_bytes,
+    /// as far as get_largest_ram allows, and warns when it gets less.  It comes last in the start because the model's
+    /// own memory, even a GPU's on an integrated GPU under Windows, counts against the same commit limit.
+    void grow_ram();
     void report_resize(const char* name, const strata::core::PagePoolReport& before,
                        const strata::core::PagePoolReport& after, Clock::time_point t0) const;
     /// Runs the layer split's planner on the cards' pool sizes (their memory settings), for the conversations that
-    /// decode and the token minimum; gets the cut it chose (get_cut's form), or today's when no other can run (a card
-    /// would lack a layer's dense weights, or the model cannot run its layers: PagedModel::can_run_layers).
+    /// decode and the token minimum; gets the cut it chose (get_cut's form), or today's when no other can run (the
+    /// model cannot run a card's layers: PagedModel::can_run_layers).
     std::vector<int64_t> plan_cut() const;
     /// Moves the layer cut to `cut` between two steps: every conversation is paused into the RAM's pool, each card
     /// takes its new layers (the pool's layout for them, the conversations' state and the model's side of the card)
@@ -207,8 +216,11 @@ private:
     /// then brings the experts the conversations use into the freed pages.  False (and `err`) when a conversation
     /// did not fit in the RAM's pool, or a pool cannot have the new layout: the cut stays.
     bool move_cut(const std::vector<int64_t>& cut, std::string& err);
-    /// Updates model ownership while conversations have no GPU pages.
-    bool set_layers(const std::vector<int64_t>& cut, std::string& err);
+    /// Gives each card the layers of `cut` while conversations have no GPU pages.  A card's memory setting pays for
+    /// the dense weights of its layers too: a card that gains layers first gives their weights' bytes from its pool
+    /// (whole chunks, at least as many), one that loses layers then takes as many back into it (at most as many).
+    /// `pools`, when given, are the sizes each pool ends at instead (move_cut's rollback).
+    bool set_layers(const std::vector<int64_t>& cut, std::string& err, const std::vector<uint64_t>& pools = {});
     /// Gives each card's pool the experts it is to hold (ExpertPages::set_ranking): its layers' share of the profile's
     /// first --expert-cache (PagedModel::get_card_ranking), or with `lend`, while the cards lend pages (holder_),
     /// those that place_experts puts on it, which may be of another card's layers that their card has no room for,
@@ -236,7 +248,8 @@ private:
     /// Gets what `card`'s pool leaves free on its GPU: `reserve_mib` (PagedSettings::vram_reserve_mib) and what the
     /// model keeps there (PagedModel::get_gpu_keep).
     uint64_t get_gpu_keep(const PagedCard& card, int64_t reserve_mib) const;
-    /// Gets the least and the most the RAM's pool and its staging ring may hold now.
+    /// Gets the least and the most the RAM's pool and its staging ring may hold now; the most leaves
+    /// kRamReserveBytes free.
     uint64_t get_smallest_ram() const;
     uint64_t get_largest_ram() const;
     /// Validates RUN, then queues it or admits a queued request at a model boundary.
@@ -555,9 +568,6 @@ private:
     struct LiveTotals {
         /// Completed decode steps and their rows (tokens, guesses too); conversations count once per step.
         std::atomic<int64_t> steps{0}, rows{0}, conversations{0};
-        /// Of the steps whose routings the model counted (get_usage; not when every expert is on the GPU): their
-        /// rows, their (row, expert) routings, and the experts those routed to, each counted once a step
-        std::atomic<int64_t> routed_rows{0}, routings{0}, experts{0};
         std::atomic<int64_t> cpu_experts{0};      ///< of get_cpu_experts, the decode steps' part
         /// All guesses the steps verified (drafter and suffix lookup), those accepted, and their row allowance
         /// (Decoding::guess_room).
@@ -658,6 +668,7 @@ PagedEngine::PagedEngine(PagedModel& model, PagedCards& cards, strata::core::Ram
     }
     if (!settings_.draft_rule)
         settings_.draft_rule = facts_.draft_rule;
+    settings_.prompt_chunk = model_.get_prompt_ceiling();
     apply_settings();
     if (settings_.conversation_context < 0)
         settings_.conversation_context = std::min(facts_.context, settings_.tokens_max);
@@ -678,10 +689,11 @@ PagedEngine::PagedEngine(PagedModel& model, PagedCards& cards, strata::core::Ram
         hooks.load = [this, &c = card](const strata::core::ExpertKey* keys, const int32_t* slots, size_t n,
                                        std::string& err) { return load_experts(c, keys, slots, n, err); };
         // an expert of another card's layers goes to the card's `lent`, not to the residency table its layer's card
-        // reads; an evicted one leaves whichever holds it
+        // reads; an evicted one leaves whichever holds it.  A drafter's expert (a layer from n_layers on) is its card's.
         hooks.moved = [this, &c = card](strata::core::ExpertKey key, int32_t slot) {
             const size_t i = (size_t) key.layer * (size_t) facts_.n_expert + (size_t) key.expert;
-            const bool own = c.lent.empty() || (slot >= 0 ? key.layer >= c.lb && key.layer < c.le : c.lent[i] < 0);
+            const bool own = c.lent.empty() || key.layer >= facts_.n_layers ||
+                             (slot >= 0 ? key.layer >= c.lb && key.layer < c.le : c.lent[i] < 0);
             (own ? model_.get_residency()[i] : c.lent[i]) = slot;
             residency_changed_ = residency_changed_ || own;
         };
@@ -716,6 +728,7 @@ bool PagedEngine::init() {
         say("%s\n", why.c_str());
         return false;
     }
+    grow_ram();
     if (cards_.size() < 2 || settings_.remote_experts == "off")
         return true;
     std::vector<int> devices;
@@ -1233,9 +1246,10 @@ bool PagedEngine::serve_request(const std::string& line, bool admit) {
         h.dec.max_new = std::min<int64_t>(req.max_new, settings_.conversation_context - n);
         // Mixed sampled windows need per-row proposal distributions before lookup can be enabled.
         const bool lookup = smp.temperature <= 0.0f;
-        if (h.dec.draft_enabled && (facts_.has_drafter ||
-            (lookup && (settings_.suffix_draft > 0 || settings_.lookup_chain > 0))) &&
-            settings_.step.lookahead > 0) {
+        // Eligibility is fixed for this request; enabling a source later takes effect on its next request.
+        h.dec.draft_enabled = h.dec.draft_enabled && settings_.step.lookahead > 0 && (is_model_drafting() ||
+            (lookup && (settings_.suffix_draft > 0 || settings_.lookup_chain > 0)));
+        if (h.dec.draft_enabled) {
             // One conversation's window stays within kVerifyNarrowT rows, what the MTP drafter and its saved rows
             // hold (DraftPolicy::kMaxT is wider, for the old engine's --lookup-max-t); only a step of several
             // conversations uses the rest of max_rows.
@@ -1483,11 +1497,13 @@ bool PagedEngine::decode_step() {
     std::string err;
     exit_if_gpu_fatal("");   // (the test hook counts steps here)
     step_rows_ = step_conversations_ = 0;
-    if (!step_.run(active, err)) {
+    strata::kernels::set_routing_counting(true);   // (a step's routing is done when it returns: its picks are known)
+    const bool ran = step_.run(active, err);
+    strata::kernels::set_routing_counting(false);
+    if (!ran) {
         print_error_or_exit(err);
         return false;
     }
-    // The usage table merges pipeline groups; shared experts across groups count once for the whole wave.
     const std::vector<int32_t>& residency = model_.get_residency();
     int64_t routed = 0;
     for (size_t i = 0; i < usage.size(); ++i) {
@@ -1503,10 +1519,6 @@ bool PagedEngine::decode_step() {
         routed_experts_ += routed;
         routed_rows_ += step_rows_;
         ++routed_steps_;
-        totals_.experts += routed;
-        totals_.routed_rows += step_rows_;
-        totals_.routings += std::inner_product(usage.begin(), usage.end(), routed_before_.begin(), (int64_t) 0,
-            std::plus<>(), [](float now, float before) { return (int64_t) std::lround(now - before); });
     }
     if (step_rows_ > 0) {
         ++totals_.steps;
@@ -1789,7 +1801,7 @@ bool PagedEngine::make_room(Held& h, int64_t tokens, std::string& err, std::opti
 }
 
 bool PagedEngine::lend_prompt_buffers(int64_t tokens, std::string& err) {
-    const int64_t ceiling = model_.get_prompt_ceiling();
+    const int64_t ceiling = settings_.prompt_chunk;
     if (ceiling <= 0)
         return true;
     if (!model_.wait_state(err))   // (a lend copies pages that the model's writes in flight may still change)
@@ -2382,13 +2394,14 @@ void PagedEngine::send_live_stats(std::stop_token stop) const {
             first = false;
         }
         const LiveTotals& t = totals_;
+        const strata::kernels::RoutingCounts r = strata::kernels::get_routing_counts();
         print_response("],\"decode\":{\"steps\":%lld,\"rows\":%lld,\"conversations\":%lld,\"routed_rows\":%lld,"
                        "\"routings\":%lld,\"experts\":%lld,\"cpu_experts\":%lld,\"guesses\":%lld,\"kept\":%lld,"
                        "\"guess_room\":%lld},"
                        "\"prefill\":{\"tokens\":%lld,\"ms\":%.3f}}\n",
                        (long long) t.steps.load(), (long long) t.rows.load(), (long long) t.conversations.load(),
-                       (long long) t.routed_rows.load(),
-                       (long long) t.routings.load(), (long long) t.experts.load(), (long long) t.cpu_experts.load(),
+                       (long long) t.rows.load(),   // routed_rows: for Monitors that know older engines
+                       (long long) r.routings, (long long) r.experts, (long long) t.cpu_experts.load(),
                        (long long) t.guesses.load(), (long long) t.kept.load(), (long long) t.guess_room.load(),
                        (long long) t.prompt_tokens.load(),
                        (double) t.prompt_us.load() / 1000.0);
@@ -2442,6 +2455,8 @@ strata::serve::MemoryReport PagedEngine::describe_memory() const {
     ram.traffic = ram_.pages().traffic().get_counts();
     ram.smallest = get_smallest_ram();
     ram.largest = get_largest_ram();
+    if (const uint64_t commit = get_commit_room(); commit != UINT64_MAX)
+        ram.commit_room = commit;
     strata::serve::Memory& ssd = report.at("ssd");
     for (int64_t l = 0; l < facts_.n_layers; ++l) {
         uint64_t on_ssd = 0;
@@ -2492,6 +2507,9 @@ strata::serve::MemoryReport PagedEngine::describe_memory() const {
     report.settings.emplace_back("step_profile", settings_.step_profile ? 1 : 0);
     report.settings.emplace_back("suffix_draft", settings_.suffix_draft);
     report.settings.emplace_back("lookup_chain", settings_.lookup_chain);
+    if (const int64_t ceiling = model_.get_prompt_ceiling(); ceiling > 0)
+        report.settings.insert(report.settings.end(),
+                               {{"prefill_chunk", settings_.prompt_chunk}, {"prefill_chunk_capacity", ceiling}});
     if (const int rank = model_.get_route_tail_skip(); rank >= 0)
         report.settings.emplace_back("route_tail_skip", rank);
     if (const float prior = model_.get_route_prior(); prior >= 0)
@@ -2590,6 +2608,8 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
             s.decode_share_percent = v;
         else if (name == "prompt_turn_ms")
             s.prompt_turn_ms = v;
+        else if (name == "prefill_chunk" && settings_.prompt_chunk > 0)
+            s.prompt_chunk = v;
         else if (name == "rows")
             s.step.rows = (int) v;
         else if (name == "lookahead")
@@ -2631,6 +2651,10 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
         return "route_prior_pct takes 0 (off) to 10000";
     if (std::max(s.draft_confidence_pct, s.draft_cumulative_pct) > 100)
         return "the drafts' confidence cuts take 0 to 100 percent";
+    const int64_t prompt_ceiling = model_.get_prompt_ceiling();
+    const int64_t prompt_minimum = std::min(kPromptChunkStep, prompt_ceiling);
+    if (s.prompt_chunk < prompt_minimum)
+        return "prefill_chunk takes " + std::to_string(prompt_minimum) + " tokens or more";
     if (const std::string why = strata::serve::get_token_limits_error(s.conversation_context, facts_.context,
             s.tokens_min, s.tokens_max); !why.empty())
         return why;
@@ -2652,8 +2676,8 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
                    card.id + " would keep " + gib(asked);
     }
     if (ram_bytes && (*ram_bytes < get_smallest_ram() || *ram_bytes > get_largest_ram()))
-        return "the RAM's pool may be " + gib(get_smallest_ram()) + " to " + gib(get_largest_ram()) + ", not " +
-               gib(*ram_bytes);
+        return "the resizable RAM pool may be " + gib(get_smallest_ram()) + " to " + gib(get_largest_ram()) +
+               "; cannot allocate " + gib(*ram_bytes);
     // then the changes: those that free memory first, so that those taking memory find it; a higher token minimum
     // waits for the GPU's pool to grow, as the pool may not hold it before
     const int64_t min_first = std::min(s.tokens_min, settings_.tokens_min);
@@ -2674,6 +2698,10 @@ std::string PagedEngine::change_settings(const SettingValues& values, std::strin
     settings_.conversation_idle_seconds = s.conversation_idle_seconds;
     settings_.decode_share_percent = s.decode_share_percent;
     settings_.prompt_turn_ms = s.prompt_turn_ms;
+    if (std::string why; s.prompt_chunk > prompt_ceiling &&
+                         (!model_.wait_state(why) || !model_.raise_prompt_ceiling(s.prompt_chunk, why)))
+        note("the prompt chunk: ", "it stays at most " + std::to_string(prompt_ceiling) + " tokens (" + why + ")");
+    settings_.prompt_chunk = std::min(s.prompt_chunk, model_.get_prompt_ceiling());
     settings_.save_on_shutdown = s.save_on_shutdown;
     settings_.step_profile = s.step_profile;
     settings_.vram_reserve_mib = s.vram_reserve_mib;
@@ -2799,6 +2827,20 @@ std::string PagedEngine::resize_ram(uint64_t bytes) {
     return {};
 }
 
+void PagedEngine::grow_ram() {
+    const uint64_t asked = ram_.get_asked_bytes(), largest = get_largest_ram();
+    std::string why = resize_ram(std::min(asked, largest));
+    const uint64_t got = ram_.pages().pool().report().total.bytes + ram_.ring_bytes();
+    if (got + ram_.pages().pool().chunk_bytes() > asked)   // (a size in MiB is seldom whole chunks)
+        return;
+    if (why.empty())
+        why = "it leaves " + std::to_string(kRamReserveBytes >> 20) + " MiB of the RAM and of Windows' commit limit "
+              "free";
+    say("WARNING: the RAM's page pool got %.2f GiB of the %.2f GiB asked for (%s). The experts it cannot hold are "
+        "read from the SSD, which is slower. Close other programs, or ask for less RAM (--ram-mib)\n",
+        (double) got / 1073741824.0, (double) asked / 1073741824.0, why.c_str());
+}
+
 /// Says on stderr how the pool of memory `name` changed, from `before` to `after`, in the time since `t0`.
 void PagedEngine::report_resize(const char* name, const strata::core::PagePoolReport& before,
                                 const strata::core::PagePoolReport& after, Clock::time_point t0) const {
@@ -2818,10 +2860,11 @@ std::vector<int64_t> PagedEngine::plan_cut() const {
             ++decoding;
             tokens = std::max(tokens, h->dec.pos + h->dec.max_new - h->dec.produced + settings_.step.lookahead + 1);
         }
-    std::vector<uint64_t> pools;
+    std::vector<uint64_t> pools;   // each card's memory setting: its pool and its layers' dense weights
     std::vector<double> layer_ms, links;
     for (const PagedCard& card : cards_) {
-        pools.push_back(card.experts.pool().report().total.bytes);
+        pools.push_back(std::accumulate(sizes.dense.begin() + card.lb, sizes.dense.begin() + card.le,
+                                        card.experts.pool().report().total.bytes));
         layer_ms.push_back(card.layer_ms);
         links.push_back(card.link.to_gbps);
     }
@@ -2832,7 +2875,7 @@ std::vector<int64_t> PagedEngine::plan_cut() const {
     problem.can_start = [&](const std::vector<SplitFill>& fills) {
         for (size_t k = 0; k < fills.size(); ++k) {
             const int64_t lb = fills[k].lb, le = fills[k].le;
-            if (lb < cards_[k].weights_lb || le > cards_[k].weights_le || !model_.can_run_layers(lb, le))
+            if (!model_.can_run_layers(lb, le))
                 return false;
         }
         return true;
@@ -2898,12 +2941,15 @@ bool PagedEngine::move_cut(const std::vector<int64_t>& cut, std::string& err) {
     // holder's own windows do not look
     if (!holder_.empty())
         place_card_experts(false);
+    std::vector<uint64_t> old_pools;
+    for (const PagedCard& card : cards_)
+        old_pools.push_back(card.experts.pool().report().total.bytes);
     if (!set_layers(cut, err)) {
         const std::string failure = err;
         for (size_t k = 0; k < cards_.size(); ++k)
             (void) cards_[k].experts.pool().set_layout(old_layouts[k]);
         std::string rollback_error;
-        if (!set_layers(before, rollback_error)) {
+        if (!set_layers(before, rollback_error, old_pools)) {
             err = failure + "; restoring the old layer owners failed: " + rollback_error;
             fatal_error_ = err;
             for (auto& [h, p] : out)
@@ -2938,14 +2984,52 @@ bool PagedEngine::move_cut(const std::vector<int64_t>& cut, std::string& err) {
     return true;
 }
 
-bool PagedEngine::set_layers(const std::vector<int64_t>& cut, std::string& err) {
+bool PagedEngine::set_layers(const std::vector<int64_t>& cut, std::string& err, const std::vector<uint64_t>& pools) {
+    const std::vector<uint64_t> dense = model_.get_layer_sizes(cards_[0].experts.pool().page_bytes()).dense;
     for (size_t k = 0; k < cards_.size(); ++k) {
         PagedCard& card = cards_[k];
-        std::tie(card.lb, card.le) = get_card_layers(cut, k, facts_.n_layers);
-        if (!model_.set_card_layers(card, err))
+        const auto [lb, le] = get_card_layers(cut, k, facts_.n_layers);
+        uint64_t gained = 0, lost = 0;
+        for (int64_t l = std::min(lb, card.lb); l < std::max(le, card.le); ++l) {
+            const bool runs = l >= card.lb && l < card.le, will_run = l >= lb && l < le;
+            if (will_run && !runs)
+                gained += dense[(size_t) l];
+            else if (runs && !will_run)
+                lost += dense[(size_t) l];
+        }
+        const uint64_t chunk = card.experts.pool().chunk_bytes(), now = card.experts.pool().report().total.bytes;
+        const uint64_t given = (gained + chunk - 1) / chunk * chunk;
+        if (given > now) {
+            err = card.id + "'s pool has " + std::to_string(now >> 20) + " MiB, not the " +
+                  std::to_string(given >> 20) + " MiB its new layers' dense weights need";
             return false;
+        }
+        if (given != 0 && !(err = resize_gpu(card, now - given)).empty()) {
+            err = card.id + "'s pool cannot make room for its new layers' dense weights: " + err;
+            return false;
+        }
+        const int64_t old_lb = card.lb, old_le = card.le;
+        card.lb = lb;
+        card.le = le;
+        if (!model_.set_card_layers(card, err)) {
+            card.lb = old_lb;
+            card.le = old_le;
+            if (given != 0)
+                (void) resize_gpu(card, now);
+            return false;
+        }
         for (const std::unique_ptr<Held>& h : held_)
             h->parts[k]->set_layers(card.lb, card.le);
+        // Pool chunks are indivisible; rounding the final budget once limits each move's slack to one chunk.
+        const uint64_t after = pools.empty() ? (now - gained + lost) / chunk * chunk : pools[k];
+        if (after != card.experts.pool().report().total.bytes)
+            if (const std::string why = resize_gpu(card, after); !why.empty()) {
+                if (!pools.empty()) {
+                    err = card.id + "'s pool could not be restored: " + why;
+                    return false;
+                }
+                say("the pool of %s after the layer cut moved: %s\n", card.id.c_str(), why.c_str());
+            }
     }
     return true;
 }
@@ -2976,15 +3060,17 @@ void PagedEngine::place_card_experts(bool lend) {
     for (PagedCard& card : cards_) {
         int64_t max_experts = facts_.gpu_experts;
         std::vector<ExpertKey> ranking = model_.get_card_ranking(card.lb, card.le, max_experts);
-        if (!placed.card.empty()) {   // those placed on it, hottest first, then the rest of its layers'
+        if (!placed.card.empty()) {   // a drafter's experts, those placed on it, hottest first, then the rest of its layers'
             const auto is_on_card = [&](const ExpertKey& k) {
-                return placed.card[(size_t) (k.layer * n_expert + k.expert)] == (int32_t) card.index;
+                return k.layer >= n_layers || placed.card[(size_t) (k.layer * n_expert + k.expert)] == (int32_t) card.index;
             };
             std::vector<ExpertKey> held;
+            std::copy_if(ranking.begin(), ranking.end(), std::back_inserter(held),
+                         [&](const ExpertKey& k) { return k.layer >= n_layers; });
             std::copy_if(first.begin(), first.end(), std::back_inserter(held), is_on_card);
             max_experts = (int64_t) held.size();
             const int64_t others = std::count_if(held.begin(), held.end(), [&](const ExpertKey& k) {
-                return k.layer < card.lb || k.layer >= card.le;
+                return k.layer < card.lb || (k.layer >= card.le && k.layer < n_layers);
             });
             std::remove_copy_if(ranking.begin(), ranking.end(), std::back_inserter(held), is_on_card);
             ranking = std::move(held);
@@ -3085,6 +3171,8 @@ bool PagedEngine::switch_drafter(bool on, std::string& err) {
     }
     for (const std::unique_ptr<Held>& h : held_)
         model_.forget_drafts(h->session);
+    if (!filling_since_ && is_fill_wanted())   // the drafter's experts, which the model ranked again, come in between steps
+        filling_since_ = Clock::now();
     settings_.drafter = true;
     say("the drafter is on\n");
     return true;
@@ -3145,7 +3233,8 @@ uint64_t PagedEngine::get_smallest_ram() const {
 uint64_t PagedEngine::get_largest_ram() const {
     const strata::core::PagePool& pool = ram_.pages().pool();
     const uint64_t chunk = pool.chunk_bytes();
-    return (pool.report().total.bytes + get_ram_room(0)) / chunk * chunk + ram_.ring_bytes();
+    const uint64_t room = get_ram_room(0);   // (its headroom would leave the commit room whole)
+    return (pool.report().total.bytes + room - std::min(room, kRamReserveBytes)) / chunk * chunk + ram_.ring_bytes();
 }
 
 strata::spec::StepModel PagedEngine::get_step_model() {

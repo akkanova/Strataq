@@ -31,13 +31,13 @@ def translate_args(cfg: dict, args: list[str]) -> list[str]:
     model = set(("""vision gpus cpu-threads dspark dspark-conf experts dspark-block prefill-chunk threads"""
                  if deepseek else """native native-dense-gguf embd-gguf ple-gguf kv prefill mtp spec-min-p
                  gpu pcie-frac pool-cores aux-cpus pool-affinity vram-reserve-later-mib""").split())
-    switches = {"serve", "trim-stage-weights"} | ({"no-expert-cache"} if deepseek else
+    switches = {"serve"} | ({"no-expert-cache"} if deepseek else
                  {"vision", "no-ple", "no-prefill-borrow", "no-host-worker", "no-ple-prefetch", "stop-eos"})
     # Installed engines may predate shared option names, so emit each family's original spelling.
     aliases = {"--slots": "--batch"}
     aliases.update({"--gpu": "--gpus", "--vram-reserve-mib": "--reserve-mib", "--eos-ids": "--eos"} if deepseek else
                    {"--gpus": "--gpu", "--resident-budget-gib": "--ram-mib", "--model": "--native",
-                    "--reserve-mib": "--vram-reserve-mib", "--eos": "--eos-ids"})
+                    "--reserve-mib": "--vram-reserve-mib", "--eos": "--eos-ids", "--prefill-chunk": "--prefill"})
     supported = common | model | switches
     out, omitted = [], []
     i = 0

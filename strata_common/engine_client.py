@@ -596,7 +596,8 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
 
     say("weights", "[strata] starting the engine: reading the model's weights ...")
     pos = offset
-    while not done.wait(0.5):
+    while True:
+        finished = done.wait(0.5)
         try:
             with open(log_path, "rb") as f:
                 f.seek(pos)
@@ -623,9 +624,32 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
                     say("cache", f"[strata] filling the GPU's expert cache ({n}) ...")
                 elif "session is up" in line:
                     say("up", "[strata] almost ready ...")
+                elif ": WARNING: " in line:                     # e.g. a smaller RAM pool, or the drafter left off
+                    say(line, paint_warning("[strata] WARNING: " + line.split(": WARNING: ", 1)[1]))
+        if finished:
+            return
         if time.time() - last > heartbeat:
             last = time.time()
             print(f"[strata] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
+
+
+def paint_warning(text: str) -> str:
+    """Formats startup warnings in bright yellow for consoles, leaving piped output plain."""
+    if not sys.stdout.isatty() or "NO_COLOR" in os.environ:
+        return text
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.windll.kernel32
+        k32.GetStdHandle.argtypes = [wintypes.DWORD]
+        k32.GetStdHandle.restype = wintypes.HANDLE
+        k32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        k32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        handle, mode = k32.GetStdHandle(-11), wintypes.DWORD()             # STD_OUTPUT_HANDLE
+        if not (k32.GetConsoleMode(handle, ctypes.byref(mode)) and
+                k32.SetConsoleMode(handle, mode.value | 4)):                  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            return text
+    return f"\033[93m{text}\033[0m"
 
 
 _BTRACE = bool(os.environ.get("STRATA_BATCH_TRACE"))
@@ -1503,9 +1527,9 @@ class StrataEngine:
         allocated, and that are free in runs too short for any expert (strata-q38's pool).  setting: the pool's size
         in bytes now (what CHANGE_SETTINGS' memory_mib.<id> sets); smallest and largest: the range of sizes it
         accepts now.  mapped: the bytes of it the GPUs map (page-locked), which Windows counts in a GPU's shared use
-        too.  pool_shared, dedicated_full, kept_free (the memory the pools leave free for other programs) and
-        dedicated_room: as include/strata/common/serve/memory_report.hpp says.  "expert_traffic" (the paged
-        engines): {memory id: {counter: count}}, each expert pool's EXPERT_TRAFFIC counters since the engine started
+        too.  pool_shared, dedicated_full, kept_free (the memory the pools leave free for other programs),
+        dedicated_room and commit_room: as include/strata/common/serve/memory_report.hpp says.  "expert_traffic"
+        (the paged engines): {memory id: {counter: count}}, each expert pool's EXPERT_TRAFFIC counters since it started
         (memory_report.hpp).  A value the engine did not say is None (uses: absent).  The same turn rules as
         list_conversations."""
         return self._ask_memory_report("GET_MEMORY_USE")
@@ -1575,7 +1599,7 @@ class StrataEngine:
                              "allocated_pct": share["allocated"], "fragmented_pct": share["fragmented"],
                              **{k: keys.pop(k, None) for k in
                                 ("setting", "smallest", "largest", "mapped", "pool_offset", "pool_shared",
-                                 "kept_free", "dedicated_room")},
+                                 "kept_free", "dedicated_room", "commit_room")},
                              "dedicated_full": bool(keys.pop("dedicated_full", 0)),
                              "uses": keys})
         for key in ("concurrent", "tokens_max", "vram_conversations", "conversation_idle_seconds",

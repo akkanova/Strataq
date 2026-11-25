@@ -109,12 +109,14 @@ token of a conversation, or one guessed token checked. `conversations` counts th
 conversations each completed step ran rows for, counting each conversation once
 per step. `conversations / steps` is the average number writing together.
 Paused or cancelled conversations and those with no room for a token do not count.
-Steps that fail before finishing are excluded from these totals. `routings` counts each
-row's trip to each routed expert (the shared expert is not counted), and
-`experts` the experts those trips reached, each counted once per layer and
-step, so rows that share an expert count it once. Both are counted only in steps
-whose routings the model counts on the host (not while every expert is in VRAM);
-`routed_rows` is the rows of those steps. `cpu_experts` is the experts the CPU
+Steps that fail before finishing are excluded from these totals, except that
+`routings` and `experts` may hold part of one. The GPU counts those two: `routings`
+counts each row's trip to each expert, including each layer's shared expert (stored
+with the dense weights), and `experts` the experts those trips reached, each once
+per layer and pass of a pipeline group, so rows of a group that share an expert
+count it once. Prompt reads and drafter layers are not counted. `routed_rows`
+equals `rows`; older engines counted routing only while some experts were outside
+VRAM, and only those steps' rows. `cpu_experts` is the experts the CPU
 computed in the steps, counted the same way. `guesses` is the guessed tokens
 checked (from the drafter and suffix lookup) and `kept` those the model kept.
 `guess_room` sums the guess row allowance for the conversation-steps counted in

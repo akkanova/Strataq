@@ -24,12 +24,6 @@
 
 namespace strata::core {
 namespace {
-int g_layer_lb = -1, g_layer_le = -1;   // set_layer_range; -1: every layer
-bool in_range(const std::string& name) {
-    if (g_layer_lb < 0 || name.rfind("blk.", 0) != 0) return true;
-    const int l = std::atoi(name.c_str() + 4);
-    return l >= g_layer_lb && l < g_layer_le;
-}
 // S23 experiment (STRATA_HC_Q8=1): the hyper-connection projections' Q8_0 bytes for the verify read
 bool hc_q8_env() {
     static const bool on = [] { const char* v = std::getenv("STRATA_HC_Q8"); return v != nullptr && v[0] == '1'; }();
@@ -200,7 +194,6 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
     }
 }
 
-void NativeDense::set_layer_range(int lb, int le) { g_layer_lb = lb; g_layer_le = le; }
 bool NativeDense::keep_unquantized_ple_key(const std::string& pack_dir, std::set<std::string>& skip,
                                            std::string& err) {
     const std::string key = "blk.1.ple_key.weight";
@@ -212,9 +205,10 @@ bool NativeDense::keep_unquantized_ple_key(const std::string& pack_dir, std::set
 }
 
 NativeDense::~NativeDense() {
-    for (const void* p : packed_keys_) strata::kernels::native_q8_0_packed_unregister(p);
+    // this engine loads once per card, so everything it holds is under key -1
+    for (const void* p : held_[-1].packed_keys) strata::kernels::native_q8_0_packed_unregister(p);
     if (scratch_) sycl::free(scratch_, dpct::get_in_order_queue());
-    for (void *p : weights_)
+    for (void *p : held_[-1].allocations)
         if (!dense_slab_owns(p)) DPCT_CHECK_ERROR(sycl::free(p, dpct::get_in_order_queue()));
     dense_slab_free_blocks();
 }
@@ -223,12 +217,13 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                        WeightTable &table, std::string &err,
                        bool include_ple_key, int64_t layer_lo,
                        int64_t layer_hi) try {
-    auto outside = [&](const std::string& name) {   // a blk.<l>. tensor of another stage's layers
-        if (layer_hi < 0 || name.rfind("blk.", 0) != 0) return false;
+    // a blk.<l>. tensor of another stage's layers (the PLE's are on every stage)
+    auto outside = [&](const std::string& name) {
+        if (layer_hi < 0 || name.rfind("blk.", 0) != 0 || name.find("ple") != std::string::npos) return false;
         const long l = std::strtol(name.c_str() + 4, nullptr, 10);
         return l < layer_lo || l >= layer_hi;
     };
-    if (scratch_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
+    if (scratch_ || !held_.empty()) { err = "native dense: already loaded"; return false; }
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
     try {
         std::vector<Pending> pending;
@@ -301,7 +296,6 @@ bool NativeDense::load(const std::vector<std::string> &shards,
             }
             for (const auto& tensor : gguf.tensors()) {
                 if (!eligible(tensor, include_ple_key) || outside(tensor.name)) continue;
-                if (!in_range(tensor.name) && tensor.name.find("ple") == std::string::npos) continue;
                 if (!seen.insert(tensor.name).second) {
                     err = "native dense: duplicate tensor " + tensor.name; return false;
                 }
@@ -425,7 +419,7 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                         err = "native dense (STRATA_HC_Q8) upload " + tensor.name; return false;
                     }
                     ref.hc_q8 = p;
-                    weights_.push_back(p);
+                    held_[-1].allocations.push_back(p);
                     hc_q8_bytes += bytes;
                 }
         }
@@ -455,7 +449,7 @@ bool NativeDense::load(const std::vector<std::string> &shards,
         }
         // All checks and allocations finish before publishing any reference.
         dense_slab_trim(pending);
-        weights_.reserve(pending.size());
+        held_[-1].allocations.reserve(pending.size());
         uint64_t packed_bytes = 0;
         size_t packed_count = 0;
         for (auto& item : pending) {
@@ -465,12 +459,12 @@ bool NativeDense::load(const std::vector<std::string> &shards,
             if (item.packed) {
                 strata::kernels::native_q8_0_packed_register(item.data.get(), item.packed.get(), (int) item.ref->ne0,
                                                              (int) item.ref->ne1);
-                packed_keys_.push_back(item.data.get());
+                held_[-1].packed_keys.push_back(item.data.get());
                 packed_bytes += item.bytes;
                 ++packed_count;
-                weights_.push_back(item.packed.release());
+                held_[-1].allocations.push_back(item.packed.release());
             }
-            weights_.push_back(item.data.release());
+            held_[-1].allocations.push_back(item.data.release());
         }
         if (packed_count)
             std::fprintf(stderr, "native dense: STRATA_Q8_PACKED=1 packed %zu Q8_0 matrices for decode (+%.1f MiB)\n",

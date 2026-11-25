@@ -39,6 +39,13 @@ allocations. `other_apps` is memory outside the engine's accounted use, and is
 drawn after free memory at the right of the bar. Where Windows provides the
 engine's dedicated usage, unclassified runtime bytes remain under Strata's Other.
 
+With a layer split, `memory_mib.<card>` is the size of that card's pool, and the card's
+memory also holds the dense weights of its layers. When a pool change moves the layer
+cut, the moved layers' weights take their bytes from the pool of the card that gains
+them (whole chunks, at least as many) and give them back to the pool of the card that
+loses them (at most as many). So a pool can change size after a move, but its end on
+the bar stays within one chunk (256 MiB) of where it was set.
+
 Pool growth is limited by actual allocation capacity and configured pool limits.
 There is no automatic Windows commit reserve. The operating system and allocator
 can still refuse an allocation, which is reported through the existing refusal
@@ -125,6 +132,15 @@ each at least `prompt_turn_ms` long (0: one chunk); after each turn but the last
 steps for `decode_share_percent` of the turn's time. 0 percent makes them wait for the whole prompt. It is the old
 engine's `STRATA_BATCH_DECODE_SHARE` in percent. A STOP, a pending CHANGE_SETTINGS and the progress line are still
 handled after every chunk.
+
+A paged engine whose prompt path borrows its buffers from the pools reports the largest prompt chunk as
+`prefill_chunk` (`--prefill-chunk`, which every engine also takes as `--prefill`), and the largest chunk the prompt
+path's own buffers hold now as `prefill_chunk_capacity`. Each prompt is read in the largest chunk up to the setting
+whose buffers the pools can lend then. CHANGE_SETTINGS takes 256 or more (or the capacity when it is smaller) and
+applies from the next prompt. A value above the capacity grows those buffers (page-locked RAM and GPU memory outside
+the pools; DeepSeek takes at most 32,768 tokens); when they cannot grow, the setting becomes the capacity and the
+answer says why as a shortfall. A lower value frees nothing. A saved default writes over a `--prefill` the run config
+has, as setup's tools read that name.
 
 `save_on_shutdown` (`--save-on-shutdown on|off`, default off; `INFO save_on_shutdown=0|1` at start) makes the
 engine, when its command loop ends (QUIT or the end of stdin), pause its conversations in VRAM and move those

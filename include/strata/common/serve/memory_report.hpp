@@ -5,8 +5,8 @@
 //   GET_MEMORY_USE
 //     MEMORY <id> [total=<B>] [free=<B>] [unified=1] [<use>=<B> ...] [paused_count=<n>] [paused_budget=<B>]
 //            [pool_pages=<n> allocated_pages=<n> fragmented_pages=<n>] [setting=<B> smallest=<B> largest=<B>]
-//            [pool_shared=<B>] [dedicated_full=1] [kept_free=<B>] [dedicated_room=<B>] [mapped=<B>]
-//            [name=<text>]                                                               one line per memory, then
+//            [pool_shared=<B>] [dedicated_full=1] [kept_free=<B>] [dedicated_room=<B>] [commit_room=<B>]
+//            [mapped=<B>] [name=<text>]                                                  one line per memory, then
 //     [MEMORY_BLOCK <memory-id> <bytes> <category> <pool> <label> [<identity-group> <ids>]] labelled allocations
 //     [PAUSE_DIRECTORY <path>]                                                  folder for automatic SSD pauses
 //     [CONVERSATION <id> <place> <state> <tokens> <capacity> <bytes> <used>]     with per_conversation: one per
@@ -39,6 +39,8 @@
 // dedicated_room: the bytes still available below an integrated GPU's measured dedicated-memory limit, after all
 // programs' current use (Windows' D3DKMT statistics). Absent until a pool's growth finds that limit; 0 means full.
 // Readers using another counter for free memory clamp this to their free bytes and draw the rest as unusable.
+// commit_room (the RAM, on Windows): what Windows can still promise programs, its commit limit (the RAM plus the page
+// file) less what all programs have committed; it limits the RAM's `largest` as much as free RAM does.
 // mapped: the bytes of it that are page-locked for the GPUs to read (strata-q38's RAM pool); Windows counts them in a
 // GPU's shared use too, so a reader takes them off that. name: the device's name, to the end of the line.
 // settings: the context in tokens, the conversations decoded at once, the rows one step computes,
@@ -99,6 +101,8 @@ struct Memory {
     uint64_t kept_free = 0;          ///< the bytes the pools leave unallocated on the GPU for other programs
     /// Bytes below the measured dedicated-memory limit minus all programs' use; absent until that limit is found.
     std::optional<uint64_t> dedicated_room;
+    /// Bytes Windows can still commit (RAM plus page file, less all programs' commit); absent elsewhere.
+    std::optional<uint64_t> commit_room;
     /// The expert pool's counters here (ExpertTraffic::get_counts), for an EXPERT_TRAFFIC line; empty: no line.
     std::vector<std::pair<std::string, uint64_t>> traffic;
 
@@ -220,6 +224,8 @@ inline std::string format_memory_report(MemoryReport report, const std::vector<c
             put("kept_free", m.kept_free);
         if (m.dedicated_room)
             put("dedicated_room", *m.dedicated_room);
+        if (m.commit_room)
+            put("commit_room", *m.commit_room);
         if (m.mapped > 0) put("mapped", m.mapped);
         if (!m.name.empty()) s += " name=" + m.name;
         s += '\n';

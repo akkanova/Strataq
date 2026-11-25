@@ -84,11 +84,16 @@ public:
     /// context).  strata-q38 reads each conversation's prompt into the conversation's own session.  Not on Metal.
     void set_session(core::SessionState& ss);
 
-    /// With borrowed buffers: lay them out again for chunks of `chunk` tokens (at most `init`'s) in `borrow` - a
-    /// request lends only the slots its prompt needs - and, with set_host_borrowed, the host buffers in `host`
-    /// (host_bytes_needed's bytes).  The stream must be idle (between prompts).
+    /// With borrowed buffers: lay them out again for chunks of `chunk` tokens (at most `init`'s, or
+    /// raise_chunk_limit's) in `borrow` - a request lends only the slots its prompt needs - and, with
+    /// set_host_borrowed, the host buffers in `host` (host_bytes_needed's bytes).  The stream must be idle (between
+    /// prompts).
     bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err, void* host = nullptr,
                   uint64_t host_bytes = 0);
+    /// With device and host buffers borrowed, between prompts: lets `relayout` take chunks of up to `chunk` tokens,
+    /// growing the buffers of this path's own that `init` sized for its chunk.  False (and `err`, the old limit
+    /// kept) when they cannot grow.  strata-q38 calls it when the live prompt chunk is raised.
+    bool raise_chunk_limit(int64_t chunk, std::string& err);
     /// Before `init`: the host buffers that grow with the chunk (the PLE rows' uploads, a layer split's hand-offs)
     /// and the stager's ring come from `relayout`'s host region instead of page-locked allocations of their own, so
     /// that they exist only while a prompt is read.  strata-q38 lends them from the RAM's page pool.
@@ -386,6 +391,10 @@ private:
     int hand_buf_ = 0;
 
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
+    /// Makes the buffers of this path's own that hold one chunk's tokens (outside carve's: the token ids, the step
+    /// records, the routing tables, the PLE rows) hold chunks of `T` tokens, the largest `relayout` then takes;
+    /// leaves them alone when they hold that already.  `init` and raise_chunk_limit use it.
+    bool reserve_chunk(std::size_t T, std::string& err);
     void release();                          // the destructor's cleanup (also `reset`'s)
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -36,10 +36,14 @@
 #include "strata/models/qwen38/kernels/shared_expert.hpp"
 #include "strata/models/qwen38/kernels/verify_kernels.hpp"
 #include "strata/models/qwen38/kernels/ngram.hpp"
+#include "strata/models/qwen38/kernels/route_prior.hpp"
+#include "strata/models/qwen38/verify.hpp"
+#include "strata/core/expert_source.hpp"
 #include "strata/base/gpu/gfx_arch.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -198,7 +202,7 @@ MtpDrafter::~MtpDrafter() {
         strata::core::release_device(dvocab_);
     if (ev_chain_) cudaEventDestroy(ev_chain_);
     for (cudaEvent_t e : ev_step_) if (e) cudaEventDestroy(e);
-    void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, h_force_, h_floor_};
+    void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, h_force_, h_floor_, h_pool_};
     for (void* h : hosts) if (h)
         strata::core::release_host(h);
 }
@@ -360,22 +364,32 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
             FILE* f;
             ~Closer() { if (f != nullptr) std::fclose(f); }
         } closer{f};
-        if (strata::core::allocate_device((void**) &experts_, bytes,
-            {"drafter", "Drafter", "Expert weights"}) != cudaSuccess) {
-            err = "mtp: the 512 experts do not fit in VRAM";
-            return false;
-        }
+        if (pool_ != nullptr) {
+            // The pool reads these later; reject missing or short packs while the drafter is still optional.
+            const bool readable = STRATA_FILE_SEEK64(f, (long long) bytes - 1, SEEK_SET) == 0 &&
+                                  std::fgetc(f) != EOF;
+            if (!readable) {
+                err = "mtp: experts.bin is truncated or unreadable";
+                return false;
+            }
+        } else {
+            if (strata::core::allocate_device((void**) &experts_, bytes,
+                {"drafter", "Drafter", "Expert weights"}) != cudaSuccess) {
+                err = "mtp: the 512 experts do not fit in VRAM";
+                return false;
+            }
 #if !defined(_WIN32)
-        strata::platform::advise_willneed(fileno(f), 0, bytes);
+            strata::platform::advise_willneed(fileno(f), 0, bytes);
 #endif
-        std::vector<uint8_t> chunk(64u << 20);
-        for (uint64_t off = 0; off < bytes;) {
-            const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);
-            if (std::fread(chunk.data(), 1, (size_t) n, f) != (size_t) n) { err = "mtp: experts.bin is truncated"; return false; }
-            cudaMemcpy(experts_ + off, chunk.data(), n, cudaMemcpyHostToDevice);
-            off += n;
+            std::vector<uint8_t> chunk(64u << 20);
+            for (uint64_t off = 0; off < bytes;) {
+                const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);
+                if (std::fread(chunk.data(), 1, (size_t) n, f) != (size_t) n) { err = "mtp: experts.bin is truncated"; return false; }
+                cudaMemcpy(experts_ + off, chunk.data(), n, cudaMemcpyHostToDevice);
+                off += n;
+            }
+            vram_ += bytes;
         }
-        vram_ += bytes;
     }
     const char* required[] = {"fc_embedding.weight", "fc_hidden.weight", "self_attn.q_proj.weight", "self_attn.k_proj.weight",
                               "self_attn.v_proj.weight", "self_attn.o_proj.weight", "mlp.shared_expert.gate_proj.weight",
@@ -467,7 +481,8 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
               mapped(64, (void**) &h_row_, (void**) &m_row_) &&
               mapped(T * 4 + 64, (void**) &h_out_, (void**) &m_out_) &&
               mapped(T * 4 + 64, (void**) &h_prob_, (void**) &m_prob_) &&
-              (!force_on_ || mapped(64, (void**) &h_force_, (void**) &m_force_));
+              (!force_on_ || mapped(64, (void**) &h_force_, (void**) &m_force_)) &&
+              (pool_ == nullptr || mapped((kPoolRoutedAt + T * K) * 4, (void**) &h_pool_, (void**) &m_pool_));
     if (!ok) { err = "mtp: mapped staging failed"; return false; }
     if (h_force_ != nullptr) for (int j = 0; j < 16; ++j) h_force_[j] = -1;
     auto carve = [&](Bump& b) {
@@ -582,11 +597,12 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         std::fprintf(stderr, "strata mtp: shared draft weights, %.0f MiB of private state and buffers\n",
                      (double) vram_ / 1048576.0);
     } else {
-        std::fprintf(stderr, "strata mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f, dense %.0f), files read in %.2f s (%.0f MiB/s)\n",
-                     (double) vram_ / 1048576.0, (double) g.n_expert * strata::kernels::cpu::BLOB / 1048576.0,
+        const double experts_b = pool_ != nullptr ? 0.0 : (double) g.n_expert * strata::kernels::cpu::BLOB;
+        std::fprintf(stderr, "strata mtp: draft layer loaded, %.0f MiB of VRAM (experts %s, dense %.0f), files read in %.2f s (%.0f MiB/s)\n",
+                     (double) vram_ / 1048576.0,
+                     pool_ != nullptr ? "in the page pool" : std::to_string((int64_t) (experts_b / 1048576.0)).c_str(),
                      (double) tensors_.back().off / 1048576.0, files_s,
-                     files_s > 0 ? ((double) g.n_expert * strata::kernels::cpu::BLOB + (double) tensors_.back().off) /
-                                       1048576.0 / files_s : 0.0);
+                     files_s > 0 ? (experts_b + (double) tensors_.back().off) / 1048576.0 / files_s : 0.0);
     }
     return true;
 }
@@ -1323,7 +1339,10 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         } else {
         for (int t = 0; t < T; ++t) {
             bf16_gemv_fp32_mmvf(mixed_ + t * N, bf16("mlp.gate.weight"), logits_ + t * g.n_expert, (int) N, (int) g.n_expert, cs);
-            if (native_router_enabled() && g.n_expert == 512 && K == 10) native_router_top10(logits_ + t * g.n_expert, ids_ + t * K, w_ + t * K, cs);
+            if (pool_ != nullptr)
+                route_prior_top10(logits_ + t * g.n_expert, pool_->res, (const float*) (m_pool_ + 4), ids_ + t * K,
+                                  w_ + t * K, 1, cs);
+            else if (native_router_enabled() && g.n_expert == 512 && K == 10) native_router_top10(logits_ + t * g.n_expert, ids_ + t * K, w_ + t * K, cs);
             else router_top10(logits_ + t * g.n_expert, 1, (int) g.n_expert, (int) K, ids_ + t * K, w_ + t * K, cs);
         }
         }
@@ -1333,8 +1352,11 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
             } catch (const std::exception& e) { err = std::string("mtp route-resident: ") + e.what(); return false; }
         }
         g_mp.stamp(9, cs);
-        moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) strata::kernels::cpu::BLOB, grp_ptr_,
-                           grp_start_, grp_counts_, hit_dst_, hit_slot_, cs);
+        const PoolGroupArgs pooled{pool_ != nullptr ? pool_->res : nullptr, m_pool_,
+                                   m_pool_ != nullptr ? m_pool_ + kPoolRoutedAt : nullptr, w_, parts_, N};
+        moe_group_resident(ids_, (int) (T * K), (int) K, pool_ != nullptr ? pool_->base : experts_,
+                           pool_ != nullptr ? pool_->page_bytes : (int64_t) strata::kernels::cpu::BLOB, grp_ptr_,
+                           grp_start_, grp_counts_, hit_dst_, hit_slot_, cs, pool_ != nullptr ? &pooled : nullptr);
         quantize_q8_0_scaled(mixed_, hit_xq_, hit_xs_, (int64_t) T * N, cs);
         moe_grouped_s2(grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K, (int64_t) T * K, hit_xq_,
                        hit_xs_, hit_scratch_, parts_, cs);
@@ -1793,6 +1815,15 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     for (int j = 1; j < max_steps; ++j)
         put_cell(max_t_ + j - 1, coupled_draft_cell(p, a, j));
     for (int j = 0; j < max_steps; ++j) ((volatile int32_t*) h_out_)[j] = -1;
+    if (pool_ != nullptr) {   // PoolGroupArgs::chain, then the route prior's bonus
+        h_pool_[0] = tail_skip_rank();
+        h_pool_[1] = 0;
+        h_pool_[2] = INT32_MAX;
+        h_pool_[3] = max_t_;
+        h_pool_[4] = std::bit_cast<int32_t>(get_route_prior());
+    }
+    // Gets whether draft step j, or one before it, routed to an absent expert it could not leave out (set_pool_experts)
+    const auto lacks = [&](int j) { return pool_ != nullptr && ((volatile int32_t*) h_pool_)[2] <= j; };
     h_row_[0] = a;
     h_row_[1] = 0;
     if (h_force_ != nullptr) for (int j = 0; j < 16; ++j) h_force_[j] = -1;   // the forcing kernels: no-ops here
@@ -1832,7 +1863,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         return pj;
     };
     int n = 0;
-    if (min_p <= 0.0f && !chain_rule_ && max_steps > 0) {
+    if (min_p <= 0.0f && !chain_rule_ && max_steps > 0) {   // (pool experts: `n` is cut below at a lacking step)
         if (cudaGraphLaunch(graph(cp ? kRoundCoupledGraph : kRoundGraph, T), cs_) != cudaSuccess)
             return report_cuda_error(err, "mtp draft: ");
         for (int j = 1; j < max_steps; ++j) {
@@ -1871,7 +1902,8 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         float pj = take(0);
         n = 1;
         strata::spec::ConfidenceCut cut{min_p};
-        for (int j = 1; j < max_steps && (chain_rule_ ? chain_rule_(j - 1, pj) : cut.keep(pj)); ++j) {
+        for (int j = 1; j < max_steps && !lacks(j - 1) && (chain_rule_ ? chain_rule_(j - 1, pj) : cut.keep(pj));
+             ++j) {
             if (dt) cudaEventRecord(g_dt.eb[j], cs_);
             tl = Clock::now();
             if (cudaGraphLaunch(graph(cp ? kStepCoupledGraph : kStepGraph, j), cs_) != cudaSuccess)
@@ -1910,12 +1942,20 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             if (g_mp.n[0] % 300 == 0) g_mp.report();
         }
     }
+    if (pool_ != nullptr)
+        n = std::min(n, h_pool_[2]);
     for (int j = n; j < max_t_ - 1; ++j) { drafts[j] = 0; if (probs) probs[j] = 0.0f; }
     if (n_drafts) *n_drafts = n;
     if (result) *result = {n, max_steps};
     ms_draft += ms_since(t0);
     ++rounds;
     return true;
+}
+
+std::span<const int32_t> MtpDrafter::get_routed() const {
+    if (pool_ == nullptr || h_pool_ == nullptr || g_ == nullptr)
+        return {};
+    return {h_pool_ + kPoolRoutedAt, (size_t) std::min(h_pool_[1], h_pool_[3]) * (size_t) g_->n_expert_used};
 }
 
 void MtpDrafter::put_rows(const int32_t* tokens, int T, int64_t cell0) {

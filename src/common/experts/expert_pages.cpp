@@ -73,6 +73,20 @@ void ExpertPages::set_ranking(const std::vector<ExpertKey>& ranking, int64_t max
     want_missing();
 }
 
+int64_t ExpertPages::count_fitting(const std::vector<ExpertKey>& ranking) const {
+    const auto report = pool_->report();
+    uint64_t room = report.experts.pages + report.free.pages;
+    int64_t fit = 0;
+    for (const ExpertKey& key : ranking) {
+        const uint32_t pages = pages_.at((size_t) key.layer);
+        if (pages > room)
+            break;
+        room -= pages;
+        ++fit;
+    }
+    return fit;
+}
+
 /// Marks the experts of the first max_experts_ ranks that the pool does not hold for `refill` to bring in.
 void ExpertPages::want_missing() {
     for (int32_t rank = 0; rank < (int32_t) ranked_.size() && rank < max_experts_; ++rank)

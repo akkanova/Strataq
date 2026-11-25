@@ -729,7 +729,8 @@ class EngineConversations(unittest.TestCase):
         self.assertEqual(engine.proc.stdin.getvalue(), "GET_MEMORY_USE\n")
         none = {"allocated_pct": None, "fragmented_pct": None,   # no page pool: the old engines
                 "setting": None, "smallest": None, "largest": None, "mapped": None, "pool_offset": None,
-                "pool_shared": None, "kept_free": None, "dedicated_room": None, "dedicated_full": False}
+                "pool_shared": None, "kept_free": None, "dedicated_room": None, "commit_room": None,
+                "dedicated_full": False}
         self.assertEqual(got, {"memories": [
             {"id": "gpu0", "name": "Radeon 8060S", "total": 1000, "free": 300, "unified": True, "paused_count": None,
              "paused_budget": None, **none, "uses": {"weights": 100, "experts": 450}},
@@ -741,11 +742,11 @@ class EngineConversations(unittest.TestCase):
         self.assertEqual(draft["memories"][0]["uses"], {"experts": 9, "drafter_experts": 7})
         pool = self.bare(["MEMORY gpu0 experts=9 pool_pages=800 allocated_pages=780 fragmented_pages=3 setting=500 "
                           "smallest=200 largest=900 pool_shared=64 dedicated_full=1 kept_free=32 dedicated_room=16 "
-                          "name=card", "SETTINGS", "END_MEMORY"]).memory()["memories"][0]
+                          "commit_room=8 name=card", "SETTINGS", "END_MEMORY"]).memory()["memories"][0]
         self.assertEqual((pool["allocated_pct"], pool["fragmented_pct"], pool["uses"]), (97.5, 0.38, {"experts": 9}))
         self.assertEqual((pool["setting"], pool["smallest"], pool["largest"], pool["pool_shared"],
-                          pool["dedicated_full"], pool["kept_free"], pool["dedicated_room"]),
-                         (500, 200, 900, 64, True, 32, 16))
+                          pool["dedicated_full"], pool["kept_free"], pool["dedicated_room"], pool["commit_room"]),
+                         (500, 200, 900, 64, True, 32, 16, 8))
         full = self.bare(["MEMORY gpu0 experts=9 dedicated_room=0", "END_MEMORY"]).memory()["memories"][0]
         self.assertEqual((full["dedicated_room"], full["uses"]), (0, {"experts": 9}))
         self.assertEqual(self.bare(["SETTINGS", "END_MEMORY"]).memory(), {"memories": [], "settings": {}})

@@ -120,6 +120,38 @@ class MonitorTab(unittest.TestCase):
                          "1000 tokens in the 500 ms spent reading, not in the second")
         self.assertIn("50% of time reading", prefill[4])
 
+    def test_one_row_a_step_shares_nothing_even_when_routings_are_not_counted(self):
+        def poll(seconds, steps, rows):
+            """Makes a poll from an engine that leaves routing counts at zero."""
+            stats = self.stats(seconds, steps, rows, 0, 0, 0, 0, 0, 0, 0)
+            stats["decode"]["routed_rows"] = 0
+            return {"state": "generating", "tok_s": 20.0, "engine_stats": stats}
+        for rows, expected in ((110, "0%"), (114, "0%"), (115, "–"), (210, "–")):
+            with self.subTest(rows_per_step=(rows - 10) / 100):
+                cards = self.polls([poll(1, 10, 10), poll(2, 110, rows)], wait_ms=1000)[1]
+                self.assertEqual(cards["gen"][4][2], f"0 on CPU, {expected} PRES")
+
+    def test_shared_expert_counts_give_sharing_even_with_disjoint_routed_picks(self):
+        for rows, experts, routings, expected in ((1, 11, 11, "0%"), (2, 21, 22, "5%")):
+            with self.subTest(rows=rows):
+                # Each row picks ten distinct routed experts and uses the same shared expert.
+                stats = [self.stats(1, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+                         self.stats(2, 1, rows, experts, routings, 0, 0, 0, 0, 0)]
+                cards = self.polls([{"state": "generating", "tok_s": 20.0, "engine_stats": s}
+                                    for s in stats], wait_ms=1000)[1]
+                self.assertEqual(cards["gen"][4][2], f"0 on CPU, {expected} PRES")
+
+    def test_sharing_turns_unknown_once_the_engine_stops_counting_routings(self):
+        def poll(seconds, steps, rows, routed_rows, experts, routings):
+            stats = self.stats(seconds, steps, rows, experts, routings, 0, 0, 0, 0, 0)
+            stats["decode"]["routed_rows"] = routed_rows
+            return {"state": "generating", "tok_s": 20.0, "engine_stats": stats}
+        counted = [poll(1, 0, 0, 0, 0, 0), poll(2, 10, 20, 20, 9000, 9600)]
+        stopped = [poll(3 + i, 20 + 10 * i, 40 + 20 * i, 20, 9000, 9600) for i in range(10)]
+        cards = self.polls(counted + stopped, wait_ms=1000)
+        self.assertEqual(cards[1]["gen"][4][2], "0 on CPU, 6% PRES", "450 of 480 per row")
+        self.assertEqual(cards[-1]["gen"][4][2], "0 on CPU, – PRES", "ten seconds with no routings counted")
+
     def test_conversations_per_step_follow_the_live_and_recent_weights(self):
         def poll(seconds, steps, conversations, state="generating"):
             return {"state": state, "tok_s": 20 if state == "generating" else None,
@@ -133,6 +165,29 @@ class MonitorTab(unittest.TestCase):
         older = self.polls([{"state": "generating", "tok_s": 20, "engine_stats": self.stats(*args)}
                             for args in ((10, 0, 0, 0, 0, 0, 0, 0, 0, 0), (11, 10, 20, 0, 0, 0, 0, 0, 0, 0))])
         self.assertNotIn("conversations:", older[1]["gen"][5][0], "an older engine sends no count")
+
+    def test_acceptance_fades_without_guesses_but_freezes_when_decode_stops(self):
+        def poll(second, state="generating"):
+            steps = 10 * second
+            return {"state": state, "tok_s": 20 if state == "generating" else None,
+                    "engine_stats": self.stats(second, steps, steps, 0, 0, 0, min(steps, 10),
+                                               min(steps, 10) // 2, 0, 0, conversations=steps, guess_room=steps)}
+        polls = self.polls([poll(second) for second in range(15)], wait_ms=1000)
+        self.assertEqual(polls[1]["gen"][4][-1], "50% MTP acceptance")
+        self.assertEqual(polls[-1]["gen"][4][-1], "– MTP acceptance")
+        self.assertIn("0.00 draft tokens", polls[-1]["gen"][5][-1])
+        idle = self.polls([poll(0), poll(1), poll(1, "idle")], wait_ms=1000)
+        self.assertEqual(idle[-1]["gen"][4][-1], "50% MTP acceptance")
+
+    def test_draft_room_uses_decimals_only_when_visible_after_rounding(self):
+        for room, expected in ((4.999999999, "5"), (5.000000001, "5"), (5.14, "5.1")):
+            polls = self.polls([
+                {"state": "generating", "tok_s": 20,
+                 "engine_stats": self.stats(second, 10 * second, 20 * second, 0, 0, 0,
+                                            10 * second, 5 * second, 0, 0,
+                                            conversations=10 * second, guess_room=10 * second * room)}
+                for second in (0, 1)], wait_ms=1000)
+            self.assertIn(f"at most {expected} tokens can be submitted", polls[-1]["gen"][5][-1])
 
     def test_an_engine_restart_is_not_a_negative_interval(self):
         polls = self.polls([{"state": "generating", "tok_s": 5.0,

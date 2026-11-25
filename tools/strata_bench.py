@@ -55,6 +55,7 @@ import serve_load                                   # noqa: E402  the burst clie
 from strata_base.memory import read_ram             # noqa: E402
 from strata_cli.bench_facts import SECRET_KEY, base_if_path, redact_object, redactor, run_cmd, usable_key  # noqa: E402
 from strata_common.expert_fill import wait_for_http_experts  # noqa: E402
+from strata_common import cfg_paths  # noqa: E402
 
 SCHEMA = 1
 CHAT_MAX_TOKENS = 100
@@ -685,7 +686,7 @@ def without_profile_save(cfg: dict) -> tuple[dict, bool]:
 
 def start_server(cfg_path: Path, port: int, gpu: str | None, log_path: Path):
     try:
-        cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+        cfg = cfg_paths.read_config(cfg_path)
     except (OSError, ValueError):
         cfg = None
     if isinstance(cfg, dict):
@@ -974,7 +975,7 @@ def main(argv=None) -> int:
             print("No Strata model is set up in this folder: run START-HERE.bat (Windows) or ./setup.sh (Linux) first, "
                   "or give --url of a running server.", file=sys.stderr)
             return 2
-        cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+        cfg = cfg_paths.read_config(cfg_path)
     key = usable_key(a.api_key) or usable_key((cfg or {}).get("api_key"))
     if a.url:
         base = a.url.rstrip("/")

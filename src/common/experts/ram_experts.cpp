@@ -56,12 +56,12 @@ bool RamExperts::open(ExpertSource& files, uint64_t bytes, int ring, const State
         std::memcpy(to, from, (size_t) n);
         return true;
     };
-    // every expert may come in (the pool's room decides how many)
+    asked_bytes_ = bytes;
     if (ring_ == nullptr || pool == 0 ||
-        !pages_.open(std::move(memory), pool, layout, config, blob_bytes, n_expert, (int64_t) first_page_.size(),
-                     ranking, {}, err)) {
-        err = "the RAM's page pool: no room for " + std::to_string(bytes >> 20) + " MiB" +
-              (err.empty() ? "" : " (" + err + ")");
+        !pages_.open(std::move(memory), config.chunk_bytes, layout, config, blob_bytes, n_expert,
+                     (int64_t) first_page_.size(), ranking, {}, err)) {
+        err = "the RAM's page pool: no room for even " + std::to_string((ring_bytes() + config.chunk_bytes) >> 20) +
+              " MiB" + (err.empty() ? "" : " (" + err + ")");
         return false;
     }
     ExpertPages::Hooks hooks;

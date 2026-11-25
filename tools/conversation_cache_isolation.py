@@ -19,6 +19,7 @@ from strata_common.gguf_reader import GGUFFile
 from strata_common.user_args import find_model_file
 from gguf_writer import GGUFWriter
 from strata_common.engine_client import StrataEngine, child_env
+from strata_common import cfg_paths  # noqa: E402
 from strata_server.frontend import ChatTemplate
 import numpy as np
 
@@ -82,7 +83,7 @@ def main():
     if not args.run:
         print(f'Dry run: {args.scenario} isolation; no model loaded or files created.')
         return
-    cfg = json.loads(args.config.read_text(encoding='utf-8'))
+    cfg = cfg_paths.read_config(args.config)
     native = find_model_file(cfg['args'])
     geometry = GGUFFile(native).metadata
     width = geometry['qwen4exp.embedding_length']

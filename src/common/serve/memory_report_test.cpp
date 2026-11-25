@@ -100,6 +100,12 @@ int main() {
     card.dedicated_room = 0;
     check(format_memory_report(pool, {}).find("dedicated_room=0 name=card\n") != std::string::npos,
           "no dedicated room is distinct from an unknown limit");
+    card.commit_room = 32;
+    check(format_memory_report(pool, {}).find("dedicated_room=0 commit_room=32 name=card\n") != std::string::npos,
+          "Windows' commit room, before the name");
+    card.commit_room = 0;
+    check(format_memory_report(pool, {}).find("commit_room=0 name=card\n") != std::string::npos,
+          "no commit room is distinct from an unknown limit");
     budget.at("ram").mapped = 7;
     budget.shortfall = "the GPU's pool: out of memory";
     check(format_memory_report(budget, {}) == "MEMORY ram paused_count=0 paused_budget=5 mapped=7\nSETTINGS\n"

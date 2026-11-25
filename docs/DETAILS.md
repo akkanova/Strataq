@@ -1062,6 +1062,12 @@ the GPU keeps the size the runtime reports.
 `dedicated_room` (the space left below the measured dedicated-memory limit after all programs' current use) in bytes,
 from their `MEMORY` lines' `kept_free=<B>` and `dedicated_room=<B>` (`null` when the line has none).
 `dedicated_room` is absent until a growth finds the limit; zero means no room remains.
+On Windows, the `ram` memory also has `commit_room`: what Windows can still promise programs (its commit limit, the RAM
+plus the page file, less what all programs have committed). Programs often commit memory they have not used yet, so
+this can be far below the free RAM. The RAM pool can grow by the smaller of these two values, less up to 1 GiB kept
+free and rounded down to whole pool chunks. The Memory panel explains when commit room is the smaller limit.
+To get more, close programs or set a larger page file. A page file that Windows manages grows by itself, but only
+while its drive has free space, so freeing disk space sometimes helps too.
 `machine` is the server's own reading of the RAM and of the GPUs
 (the hardware sampler of `GET /metrics`). The engine's `ram` gets the machine's size and free RAM; `other` is what is in
 use in a memory beyond the uses the engine names (other programs, buffers the engine does not count). A value the engine
@@ -2002,7 +2008,7 @@ not establish that the replacement engine matches or beats the original engine a
 
 The saved source-setup config inspected on 3 November 2026, `strata-iq3_s.json`, selects Windows HIP,
 native IQ3_S from `Strata-data`, `--expert-cache auto --resident-experts --prefill auto --spec 4
---spec-min-p 0.5 --mtp C:/AI-models/Strata-data/mtp/rt --max-context 204800 --kv int8 --vision
+--spec-min-p 0.5 --mtp ../Strata-data/mtp/rt --max-context 204800 --kv int8 --vision
 --vram-reserve-mib 700`, with server `parallel: 2`. Its existing `strata-iq3_s.log` records 24,576 GPU
 expert slots using 46.84 GiB, 2.69 GiB of resident RAM experts and no file blob reads in the reported requests.
 These are historical configuration and residency records, not a new throughput measurement or proof of stable
@@ -2311,6 +2317,18 @@ Recent trunk taps stay in each conversation's fixed pool region, beside the DSpa
 pauses and checkpoints, so the engine can rebuild the rings after loading the tensors again. This adds
 7,864,320 bytes per conversation for the tested pack, plus the checkpoint copies in RAM.
 
+In `strata-q38`, the MTP draft layer's 512 experts (1.32 MiB each, 675 MiB in all) live in the last card's page
+pool, ranked before the card's own experts, and the Memory panel lists them as "Drafter / Layer 48". Only the draft
+layer's dense weights (about 130 MiB) are an allocation of their own, traded against pool chunks like DeepSeek's.
+Switching the drafter on pushes the card's least ranked experts out to make room, and its experts load between
+steps; switching it off gives their pages back. A guess whose step routes to a draft expert that is not in VRAM
+leaves it out when `--route-tail-skip` would leave out such an expert of the model itself; otherwise the guesses end
+before that step. `--route-prior-pct` also makes the draft layer prefer its experts in VRAM. Neither changes the
+answers: every guess is still checked. A draft layer that does not load at start is switched off with a warning.
+Measured on Strix Halo (Radeon 8060S, Windows, HIP), the IQ3_S pack, one greedy request of 160 tokens, twice each:
+123 of 169 to 170 guesses accepted with the experts in the pool, 3.9 to 4.3 s of decode against 6.3 to 6.8 s with
+the drafter off; switching it on again loaded its experts in 2.1 s.
+
 Measured on Windows HIP, Strix Halo (Radeon 8060S), the IQ2_XXS pack copy, context 8192,
 `--gpu-mib 10240 --ram-mib 512 --expert-cache 480 --no-expert-cache --adapt-swaps 0`,
 `--dspark-conf 0.65`, and `DS4_COMMIT_CAP_GB=18`: switching off released 752,205,056 dense bytes;
@@ -2408,7 +2426,7 @@ that an arbitrary model export has the required dense tensors, geometry or metad
 
 Local inventory: `Strata-data/models/IQ3_S`, `Strata-data/packs/iq3_s`, and the IST-DAS 2.00 pack under
 `Strata-data/packs/deepseek-v4.1-flash-ist-das-2.00bpw`. Its original model and DSpark files are in
-`C:/AI-models/DeepSeek-V4.1-Flash`; tests use copied pack manifests and profiles, never modify those files.
+`../DeepSeek-V4.1-Flash`; tests use copied pack manifests and profiles, never modify those files.
 Qwen3.6 UD-Q4_K_XL files are also present; that family is outside this replacement task.
 
 Evidence and limits: Windows HIP on Strix Halo; temporary scripts and logs in `%TEMP%/quant-compat`.
@@ -2437,14 +2455,16 @@ EXL3 inference and its chunked prompt path remain unverified; that path retains 
 ### DeepSeek paged stages: dense weights and expert hops
 
 `strata-ds41` uses the shared paged engine's cut planner, conversation transfer and expert placement.
-Without `--trim-stage-weights`, a cut may cross the initial dense-weight ranges. On separate GPUs,
-DeepSeek reloads each moved layer's dense tensors and verify scratch on its new owner before freeing
-the previous copy. The output head and DSpark stay on the last stage. Reloads print
+A cut may cross the initial dense-weight ranges. On separate GPUs, DeepSeek reloads each moved
+layer's dense tensors and verify scratch on its new owner before freeing the previous copy. The
+output head and DSpark stay on the last stage. Reloads print
 `dense layer L migrated: gpuA -> gpuB (N bytes)`; weights and scratch remain outside the page pools.
 A failed layer reload retains that layer's old copy. Extra temporary room for one layer is needed.
 Two stages on one GPU reuse the same allocations and transfer their accounting.
-Qwen currently moves cuts only within dense weights already loaded on each card; this is not a Qwen
-cross-card reload mechanism.
+`strata-q38` does the same for Qwen: a card loads the dense weights of the layers it gains before it
+frees those of the layers it gives away, and prints
+`gpuN holds the dense weights of layers A-B (N loaded, N freed)`. A failed load leaves the card as it
+was. A move therefore needs free room on the receiving card for the moved layers' dense weights.
 
 The shared expert placement selects at most one holder for each layer's lent experts. DeepSeek's CPU
 lane sends that holder the selected activation rows in one batch, runs its existing expert matrix

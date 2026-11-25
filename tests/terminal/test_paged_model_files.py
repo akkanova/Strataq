@@ -25,6 +25,11 @@ def test_model_file_is_read_under_either_name_and_reaches_qwen_under_its_old_one
     assert find_model_file(["--pack", "p"]) is None
 
 
+def test_prompt_chunk_reaches_qwen_under_its_old_name_and_deepseek_unchanged():
+    assert translate_args({"exe": "strata-q38.exe"}, ["--prefill-chunk", "4096"]) == ["--prefill", "4096"]
+    assert translate_args({"exe": "strata-ds41.exe"}, ["--prefill-chunk", "4096"]) == ["--prefill-chunk", "4096"]
+
+
 def test_prompt_order_reaches_both_paged_engines():
     args = ["--prompt-order", "layer"]
     for exe in ("strata-q38.exe", "strata-ds41.exe"):

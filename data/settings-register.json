@@ -38335,11 +38335,11 @@
    "since": "v0.1.40.1",
    "last_commit": "ee0b367fb7",
    "last_date": "2026-11-03",
-   "status": "research",
+   "status": "retired",
    "owner": "program",
-   "note": "[reviewed] Experimental split-stack flag; no change in report. [_issues_dump/2239.md:67]",
+   "note": "Retired in 0.2.14: every layer split now loads only each card's own layers' dense weights (CUDA, HIP and SYCL), so the setting is no longer read; --trim-stage-weights is accepted and does nothing. Was: [reviewed] Experimental split-stack flag; no change in report. [_issues_dump/2239.md:67]",
    "retire_after": "",
-   "retired_in": ""
+   "retired_in": "0.2.14"
   },
   {
    "name": "STRATA_STALL_STACKS",

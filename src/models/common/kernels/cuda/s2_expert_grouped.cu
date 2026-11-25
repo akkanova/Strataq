@@ -1184,26 +1184,51 @@ __global__ void __launch_bounds__(256) down_grouped_t_kernel(const unsigned long
 }  // namespace
 
 namespace {
-// Plan v0.3 P6: groups built on the device when every expert is resident at `base + id * blob` (the MTP layer):
-// one block of 128 threads, groups in first-appearance order, entries of a group in routing order.
+// Plan v0.3 P6: groups built on the device when every expert is resident at `base + id * blob` (the MTP layer), or,
+// with `pool` (`pooled`), at its page: one block of 128 threads, groups in first-appearance order, entries of a group
+// in routing order.  An entry whose expert is absent joins no group (e = -1).
 __global__ void group_resident_kernel(const int32_t* __restrict__ ids, int n, int k_per_tok, const uint8_t* base,
                                       long long blob, unsigned long long* __restrict__ grp_ptr,
                                       int32_t* __restrict__ grp_start, int32_t* __restrict__ counts,
-                                      int32_t* __restrict__ ent_dst, int32_t* __restrict__ ent_tok) {
+                                      int32_t* __restrict__ ent_dst, int32_t* __restrict__ ent_tok,
+                                      PoolGroupArgs pool, bool pooled) {
     __shared__ int e_s[128], first_s[128], size_s[128], gidx_s[128], gstart_s[129];
+    __shared__ int lacking_s;
     const int i = threadIdx.x;
-    const int e = i < n ? ids[i] : -1;
+    int e = i < n ? ids[i] : -1;
+    if (i == 0)
+        lacking_s = 0;
+    s2_sync_lds();
+    if (pooled && e >= 0) {
+        const int step = pool.chain[1];
+        if (step < pool.chain[3])
+            pool.routed[step * n + i] = e;
+        if (pool.res[e] < 0) {
+            pool.weights[i] = 0.0f;
+            for (int64_t c = 0; c < pool.n_embd; ++c)
+                pool.parts[(int64_t) i * pool.n_embd + c] = 0.0f;
+            if (pool.chain[0] <= 0 || i % k_per_tok < pool.chain[0])
+                atomicExch(&lacking_s, 1);
+            e = -1;
+        }
+    }
     e_s[i] = e;
     s2_sync_lds();
+    if (pooled && i == 0) {
+        const int step = pool.chain[1]++;
+        if (lacking_s && pool.chain[2] > step)
+            pool.chain[2] = step;
+    }
+    const bool live = i < n && e >= 0;
     int first = i, rank = 0, size = 0;
-    if (i < n) {
+    if (live) {
         for (int j = 0; j < i; ++j)
             if (e_s[j] == e) { if (first == i) first = j; ++rank; }
         if (first == i)
             for (int j = i; j < n; ++j) size += e_s[j] == e;
     }
-    first_s[i] = first;
-    size_s[i] = (i < n && first == i) ? size : 0;
+    first_s[i] = live ? first : -1;
+    size_s[i] = (live && first == i) ? size : 0;
     s2_sync_lds();
     if (i == 0) {
         int gi = 0, acc = 0;
@@ -1211,7 +1236,8 @@ __global__ void group_resident_kernel(const int32_t* __restrict__ ids, int n, in
             if (first_s[j] == j) {
                 gidx_s[j] = gi;
                 gstart_s[gi] = acc;
-                grp_ptr[gi] = (unsigned long long) (base + (size_t) e_s[j] * (size_t) blob);
+                const int at = pooled ? pool.res[e_s[j]] : e_s[j];
+                grp_ptr[gi] = (unsigned long long) (base + (size_t) at * (size_t) blob);
                 grp_start[gi] = acc;
                 acc += size_s[j];
                 ++gi;
@@ -1221,7 +1247,7 @@ __global__ void group_resident_kernel(const int32_t* __restrict__ ids, int n, in
         counts[1] = acc;
     }
     s2_sync_lds();
-    if (i < n) {
+    if (live) {
         const int at = gstart_s[gidx_s[first]] + rank;
         ent_dst[at] = i;
         ent_tok[at] = i / k_per_tok;
@@ -1231,10 +1257,12 @@ __global__ void group_resident_kernel(const int32_t* __restrict__ ids, int n, in
 
 void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t* base, int64_t blob,
                         unsigned long long* grp_ptr, int32_t* grp_start, int32_t* counts, int32_t* ent_dst,
-                        int32_t* ent_tok, void* stream) {
+                        int32_t* ent_tok, void* stream, const PoolGroupArgs* pool) {
     if (n < 1 || n > 128) { std::fprintf(stderr, "moe_group_resident: n must be 1..128\n"); std::exit(1); }
     group_resident_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(ids, n, k_per_tok, base, (long long) blob, grp_ptr,
-                                                               grp_start, counts, ent_dst, ent_tok);
+                                                               grp_start, counts, ent_dst, ent_tok,
+                                                               pool != nullptr ? *pool : PoolGroupArgs{},
+                                                               pool != nullptr);
     check("moe_group_resident", stream);
 }
 

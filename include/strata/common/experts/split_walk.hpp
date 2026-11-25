@@ -6,8 +6,8 @@
 // reads the cards and prints the lines.
 //
 // The steps, mildest first, each only when the one before did not leave the card enough:
-//   1. trim: every card loads only the dense weights of ITS layers (--trim-stage-weights).  Without it each card holds the whole 3.5 GiB set (IQ3_S).  Bit-exact in
-//      itself; the cache simply gets the room.  This is the step that matters on 8 GB cards.
+//   1. an even split: a card too short for a copy of the whole 3.5 GiB dense set (IQ3_S, trim_needed()) has the split chosen before anything loads, from what each
+//      card has free, so every layer gets the same cache bytes on every card (every card loads only the dense weights of its own layers in any split).
 //   2. the KV window down (32768 -> 20480 -> 8192 -> 4096 cells a layer; the rest streams from RAM), when no placement can start the prompt path.
 //   3. the drafter dropped on the card that holds it (draft layer or DFlash2's pack and buffers): decode is slower, the start works.
 //   4. the loan keeps 16 slots, and the prompt path's own small buffers (256..1024-token chunks), instead of 128 and 1024..8192.

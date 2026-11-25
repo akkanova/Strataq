@@ -151,8 +151,9 @@ class SubreaperOrphans(unittest.TestCase):
             pass
 
         def proc(pid, name, ppid=1):
-            return mock.Mock(pid=pid, **{"name.return_value": name, "exe.return_value": "/x/engine", "info": {
-                "pid": pid, "ppid": ppid, "cmdline": ["engine", "--serve"], "create_time": 100.0}})
+            return mock.Mock(pid=pid, **{"name.return_value": name, "exe.return_value": "/x/engine",
+                                         "create_time.return_value": 100.0, "ppid.return_value": ppid,
+                                         "info": {"cmdline": ["engine", "--serve"]}})
 
         me = mock.Mock(**{"parents.return_value": [proc(p, n) for p, n in ancestors]})
         engine = proc(7000, "engine", ppid=5000)

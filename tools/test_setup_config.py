@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 import setup  # noqa: E402
+from strata_common import cfg_paths  # noqa: E402
 from test_setup_golden import PROFILES, install  # noqa: E402
 
 
@@ -90,7 +91,7 @@ class CarryOver(unittest.TestCase):
             new = {"exe": "e2", "args": ["--kv", "int8"],
                    "vision": {"exe": "v2", "mmproj": str(Path(d) / "mmproj-BF16.gguf"), "gpu": False, "max_tokens": 300}}
             _, out = quiet(setup.write_setup_config, p, new)
-            got = json.loads(p.read_text(encoding="utf-8"))
+            got = cfg_paths.read_config(p)
             self.assertEqual(got["sampling"], {"temperature": 0.7})
             self.assertEqual(got["env"], {"MY_VAR": "1"})                 # setup's own env entry is setup's to write
             self.assertEqual(got["vision"]["mmproj"], str(mm))            # a Q8_0 mmproj of the user's own (#625)
@@ -105,7 +106,7 @@ class CarryOver(unittest.TestCase):
                                 "max_tokens": 300}}
             quiet(setup.write_setup_config, p, again)
             self.assertFalse((Path(d) / "strata-x.json.bak").exists())
-            self.assertEqual(json.loads(p.read_text(encoding="utf-8")), got)
+            self.assertEqual(cfg_paths.read_config(p), got)
 
     def test_an_unreadable_earlier_config_is_replaced_with_a_copy(self):
         with tempfile.TemporaryDirectory() as d:
