@@ -54,6 +54,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -96,6 +97,9 @@ struct PagedSettings {
     /// --prompt-turn-ms: the least time one turn of a prompt read lasts (it ends after a whole chunk); 0: one chunk
     /// per turn.  Longer turns switch less often between reading and decoding.
     int64_t prompt_turn_ms = 0;
+    /// (live: prefill_chunk) Caps the chunk chosen when borrowing prompt buffers, initially
+    /// PagedModel::get_prompt_ceiling() (--prefill-chunk, also spelled --prefill); 0 disables borrowing.
+    int64_t prompt_chunk = 0;
     /// --gpu-mib, per card of a layer split (one value: every card's); empty: what each GPU has free less what it keeps
     std::vector<int64_t> gpu_mib;
     int64_t ram_mib = -1;                          ///< --ram-mib; -1: get_ram_room
@@ -172,11 +176,11 @@ int take_paged_options(int& argc, char** argv, const std::string& program, Paged
 /// Windows, no resource cache, so that the pools can shrink; when `hops_possible` (stages on separate GPUs) and
 /// `s.remote_experts` is not off, more hardware queues; the models' prompt-order switches for `s.prompt_order`.
 void set_paged_runtime_env(const PagedSettings& s, bool hops_possible);
-/// Adds a stage running [lb, le), named gpu<dev> with .<index> for repeated GPUs. With `trim_weights`, only its
-/// layers' weights stay loaded. Measures the link before pool allocation, reports it after `program`, and sets speed
-/// and refill_batch for `expert_bytes`-sized experts. Successful link measurements are reused per GPU.
-PagedCard& add_paged_card(PagedCards& cards, int dev, int64_t lb, int64_t le, int64_t n_layers, bool trim_weights,
-                          const std::string& program, uint64_t expert_bytes);
+/// Adds a stage running [lb, le), named gpu<dev> with .<index> for repeated GPUs. Measures the link before pool
+/// allocation, reports it after `program`, and sets speed and refill_batch for `expert_bytes`-sized experts.
+/// Successful link measurements are reused per GPU.
+PagedCard& add_paged_card(PagedCards& cards, int dev, int64_t lb, int64_t le, const std::string& program,
+                          uint64_t expert_bytes);
 /// Holds allocation limits and diagnostics for a GPU page pool.
 struct CardPoolPlan {
     strata::core::PagePoolConfig config;   ///< page and chunk sizes, tokens_min; other fields keep their defaults
@@ -189,6 +193,9 @@ struct CardPoolPlan {
 CardPoolPlan plan_card_pool(const PagedCard& card, const PagedSettings& s, const strata::core::StateLayout& layout,
                             int64_t max_context, uint64_t page_bytes, const std::vector<uint64_t>& blob_bytes,
                             const std::vector<strata::core::ExpertKey>& ranking, int64_t max_experts, uint64_t keep);
+/// Gets the memory report's names of a pool's experts (PagePoolConfig::label_expert) for a model of `n_layers` layers,
+/// whose drafter's experts, kept as the layers from `n_layers` on, are named as the drafter's.
+std::function<strata::core::MemoryLabel(strata::core::ExpertKey, uint64_t)> get_expert_labels(int64_t n_layers);
 /// Plans and reports DeepSeek's initial cuts using PagedEngine's planner, one tokens_min conversation, and experts
 /// in hottest-first ranked_layers order. Repeated GPUs share free memory unless --gpu-mib sets each stage's pool.
 /// Returns no cuts if planning fails.
@@ -254,7 +261,8 @@ std::vector<strata::core::ExpertKey> get_ram_ranking(const std::vector<strata::c
 /// here, whatever --copy-back says).  The pool takes --ram-mib, by default
 /// get_ram_room(`headroom`) but no more than every expert and its staging ring of `ring` buffers take; its
 /// conversations are `layout`'s, its pages `card`'s (get_ram_pool_config), its chunks at least the `prompt_bytes`
-/// the model's prompt paths borrow from it at most (PagedModel::get_prompt_buffers).  It opens
+/// the model's prompt paths borrow from it at most (PagedModel::get_prompt_buffers).  It opens with one chunk, and
+/// serve_paged_model grows it to the rest after the model's own memory is taken.  It opens
 /// empty: the engine's start-up fill brings in the experts in get_ram_ranking's order as far as they fit.  Says on
 /// stderr after `program` what it took.
 bool open_ram_pool(const std::string& program, const PagedSettings& s, strata::core::ExpertFiles& files,

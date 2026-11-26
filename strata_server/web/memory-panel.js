@@ -71,6 +71,7 @@ const SETTINGS = {context: "Per-conversation token limit", concurrent: "Conversa
                   conversation_idle_seconds: "Idle conversation eviction age (sec)",
                   decode_share_percent: "Decoding while a prompt is read (%)",
                   prompt_turn_ms: "Prompt reading turn (ms)",
+                  prefill_chunk: "Max prompt chunk (tokens)",
                   lookahead: "Max lookahead", tokens_min: "Min conversation tokens",
                   tokens_max: "Max conversation tokens", ssd_pause_mib: "SSD for paused conversations (MiB)",
                   drafter: "Drafter", save_on_shutdown: "Save conversations on shutdown",
@@ -128,7 +129,8 @@ const CONTEXT_CAPACITY_HELP = "To raise this limit, increase --max-context in th
   "then reload the model.";
 /** Settings the engine reports that the panel shows elsewhere (the bars) or not at all. */
 const UNLISTED = new RegExp("^memory_mib\\.|^(token_bytes|conversation_bytes|context_capacity|" +
-  "has_drafter|suffix_draft|lookup_chain|slots|ssd_pause_mib|batch_groups_now|pipeline_stages)$");
+  "has_drafter|suffix_draft|lookup_chain|slots|ssd_pause_mib|batch_groups_now|pipeline_stages|" +
+  "prefill_chunk_capacity)$");
 /**
  * The number settings the panel's controls change, with the range each accepts given the reading's settings `s`
  * (the engine checks them again).
@@ -140,6 +142,7 @@ const CONTROLS = [["concurrent", () => 1, (s) => Math.min(s.slots ?? 8, s.rows ?
                   ["conversation_idle_seconds", () => 0, () => Infinity],
                   ["decode_share_percent", () => 0, () => Infinity],
                   ["prompt_turn_ms", () => 0, () => Infinity],
+                  ["prefill_chunk", (s) => Math.min(256, s.prefill_chunk_capacity ?? 256), () => Infinity],
                   ["rows", (s) => s.concurrent ?? 1, () => 8],
                   ["lookahead", () => 0, (s) => (s.rows ?? 1) - 1],
                   ["batch_groups", () => 0, () => 2147483647],
@@ -202,7 +205,8 @@ export function drawMemoryPanel(element, view, onChange) {
  * ended.  `kept_free`: what the engine's pools leave free there for other programs; `dedicated_room`: bytes below
  * the measured dedicated-memory limit minus all programs' current use, from Windows' D3DKMT statistics. Absent
  * until a growth finds the limit; zero means full. The bar's free-memory counter can differ, so room is capped
- * at `free` and the rest of `free` is drawn as unusable.  Bytes.
+ * at `free` and the rest of `free` is drawn as unusable.  `commit_room` (the RAM, on Windows): what Windows can still
+ * promise programs (its commit limit, the RAM plus the page file, less all programs' commit).  Bytes.
  * @typedef {{id: string, name: string | null, total: number | null, free: number | null, unified: boolean,
  *   uses: Record<string, number>, paused_count: number | null, paused_budget: number | null,
  *   other?: number, other_apps?: number,
@@ -210,7 +214,7 @@ export function drawMemoryPanel(element, view, onChange) {
  *   in_share?: number, borrowed?: number | null, gpu_borrowed?: number, allocated_pct?: number | null,
  *   fragmented_pct?: number | null, setting?: number | null, pool_offset?: number | null, smallest?: number | null,
  *   largest?: number | null, pool_shared?: number | null, dedicated_full?: boolean, kept_free?: number | null,
- *   dedicated_room?: number | null}} MemoryUse
+ *   dedicated_room?: number | null, commit_room?: number | null}} MemoryUse
  * @typedef {{category: string, pool: string, label: string, bytes: number,
  *   identity_group?: string, ids?: number[]}} MemoryBlock
  * @typedef {{id: string, place: string, state: string, count: number, capacity: number, bytes: number,
@@ -231,9 +235,10 @@ export function drawMemoryPanel(element, view, onChange) {
  * A boundary of a bar that can be dragged.  `key`: the setting it changes; `from`: the size now; `start`: where the
  * segment it ends begins on the bar; `scale`: drawn bytes per byte of the engine's; `total`: the drawn bytes the
  * bar's width stands for; `fixed`: Strata allocations outside the adjustable pool; `shared`: the pool's bytes in
- * shared memory. Bytes.
+ * shared memory; `commit`: Windows' remaining allocation capacity when below the known free RAM (else null).
+ * Bytes.
  * @typedef {{key: string, from: number, smallest: number, largest: number, start: number, scale: number,
- *   total: number, fixed: number, shared: number}} Divider
+ *   total: number, fixed: number, shared: number, commit: number | null}} Divider
  * A divider being moved.  `value`: the size it would set (bytes); `x0`: the pointer's x where the drag started (null
  * for the keyboard); `perPx`: bytes per pixel of the bar.
  * @typedef {{id: string, value: number, x0: number | null, perPx: number}} Drag
@@ -355,7 +360,7 @@ function finishDrag(element, panel) {
   if (mib(value) === mib(d.from))
     render(element, panel);
   else
-    void change(element, panel, {[d.key]: mib(value)}, {[d.key]: mib(d.from)});
+    void change(element, panel, {[d.key]: mib(value)}, {[d.key]: mib(d.from)}, "session", explainLimit(d, value));
 }
 
 /** Retains a control's edit until the reader applies the form.
@@ -439,10 +444,12 @@ async function applyControls(element, panel, save) {
  * @param {Panel} panel
  * @param {SettingsChange} set
  * @param {SettingsChange | null} undo  the change back, offered as Undo; null for an Undo itself.
- * @param {"session" | "default"} save */
-async function change(element, panel, set, undo, save = "session") {
+ * @param {"session" | "default"} save
+ * @param {string} warning  the panel's size prediction, separate from the engine's answer */
+async function change(element, panel, set, undo, save = "session", warning = "") {
   panel.busy = true;
-  panel.notice = {text: "Changing…", error: false, until: Infinity};
+  const predicted = warning ? ` Requested size: ${warning}` : "";
+  panel.notice = {text: `Changing…${predicted}`, error: !!warning, until: Infinity};
   render(element, panel);
   const answer = await /** @type {ChangeSettings} */ (panel.onChange)(set, save)
     .catch((/** @type {Error} */ e) => ({ok: false, error: e.message, view: undefined}));
@@ -464,8 +471,11 @@ async function change(element, panel, set, undo, save = "session") {
     const shortfall = answer.view?.shortfall;
     panel.notice = {text: shortfall ? `${done} But it got less than asked: ${shortfall}.` : done, error: !!shortfall,
                     until: shortfall ? Infinity : Date.now() + UNDO_MS, ...(undo ? {undo: {set: undo, save}} : {})};
-  } else
-    panel.notice = {text: answer.error || "The engine changed nothing.", error: true, until: Infinity};
+  } else {
+    const said = answer.error || "The engine changed nothing.";
+    panel.notice = {text: predicted ? `${said.replace(/\.?$/, ".")}${predicted}` : said, error: true,
+                    until: Infinity};
+  }
   render(element, panel);
 }
 
@@ -629,6 +639,13 @@ function describeControl(key, settings, details) {
   if (key === "prompt_turn_ms")
     return "The least time a prompt is read before the answering conversations get their turn. 0 means one chunk " +
       "of the prompt. Longer turns switch less often between reading and answering.";
+  if (key === "prefill_chunk")
+    return "The most tokens of a prompt read in one pass through the model. Each pass reads every expert the GPU " +
+      "lacks, so larger chunks read a long prompt with fewer expert reads, but borrow more of the pools' memory " +
+      "(experts may leave the GPU while the prompt is read). Strata takes the largest chunk up to this that the " +
+      "pools can lend at the time. A change applies from the next prompt. The prompt reader is sized for up to " +
+      `${fmt(settings.prefill_chunk_capacity)} tokens now; a larger value makes Strata enlarge it, which takes a ` +
+      "little memory outside the pools. If that fails, the size stays and Strata says why.";
   if (key === "batch_groups")
     return "With the model split over several GPUs, the conversations decoding together can split into groups, so " +
       "that one GPU works on one group while the next GPU works on another. 1 turns this off; 0 picks the most " +
@@ -727,8 +744,10 @@ function findDivider(x) {
   const start = !ssd && first < 0 && x.pool_offset != null ? x.pool_offset * scale :
     (first < 0 ? parts : parts.slice(0, first)).reduce((a, p) => a + (p.drawn ?? p.bytes), 0);
   const fixed = ssd ? 0 : Math.max(0, Object.values(x.uses).reduce((a, b) => a + b, 0) - from);
+  const commit = x.id === "ram" && x.commit_room != null && x.free != null && x.commit_room < x.free ?
+    x.commit_room : null;
   return {key: ssd ? "ssd_pause_mib" : `memory_mib.${x.id}`, from, smallest: x.smallest ?? 0,
-          largest: x.largest ?? Infinity, start, scale, total, fixed, shared: x.pool_shared ?? 0};
+          largest: x.largest ?? Infinity, start, scale, total, fixed, shared: x.pool_shared ?? 0, commit};
 }
 
 /** Gets why the engine may not give a divider's size: it refuses less than it needs and more than a RAM pool can
@@ -740,7 +759,22 @@ function findWarning(d, value) {
     `the biggest active conversation and the minimum conversation tokens)` : value <= d.largest ? "" :
     d.key.startsWith("memory_mib.gpu") ? `about ${size(d.fixed + d.largest)} fits in dedicated memory ` +
     `(${size(d.fixed)} fixed); the rest would be shared memory, which may be slower` :
-    `at most ${size(d.fixed + d.largest)} is available to Strata here (${size(d.fixed)} fixed)`;
+    `at most ${size(d.fixed + d.largest)} in all is available to Strata here: ${size(d.fixed)} fixed and up to ` +
+    `${size(d.largest)} of resizable pool`;
+}
+
+/** Explains a predicted size limit for the Free tooltip and release notice, including Windows' commit room.
+ *  The engine may still accept the request if conditions have changed.
+ * @param {Divider} d
+ * @param {number} value  bytes */
+function explainLimit(d, value) {
+  const warning = findWarning(d, value);
+  return warning && `${warning[0].toUpperCase()}${warning.slice(1)}.` + (d.commit == null || value <= d.largest ?
+    "" : ` Windows can promise programs only ${size(d.commit)} more (commit room), even with free RAM. Programs ` +
+    "can claim memory before using it; Windows backs those claims with RAM and its page file on disk. Strata " +
+    "leaves up to 1 GiB of this room free. To get more, close programs or set a larger page file. A page file " +
+    "that Windows manages grows by itself, but only while its drive has free space, so freeing disk space " +
+    "sometimes helps too.");
 }
 
 /** Gets the markup of one memory's row: its name and size, its bar (with its divider, moved by `drag`) and the
@@ -751,6 +785,7 @@ function findWarning(d, value) {
  * @param {MemoryView} view */
 function drawBar(x, divider, drag, view) {
   const {parts, total} = layOut(x);
+  const limit = divider ?? findDivider(x);
   /** @type {Map<string, {use: string, bytes: number}>} */
   const legend = new Map();
   for (const part of parts)
@@ -774,6 +809,7 @@ function drawBar(x, divider, drag, view) {
     `${title(p)}: ${size(p.bytes)}${x.id === "ssd" && p.use === "experts" ?
       ". Experts held in neither VRAM nor RAM. The complete model files remain on disk." :
       Object.hasOwn(USE_HELP, p.use) ? `. ${esc(USE_HELP[p.use])}` : ""}` +
+    (p.use === "free" && limit?.commit != null ? `&#10;${esc(explainLimit(limit, Infinity))}` : "") +
     (p.use === "paused" ? [pauseFolder,
       ...paused.map((c) => `${c.id}: last tokens ${getActivityAge(c.last_tokens_at)}`)]
       .filter(Boolean).map((line) => `&#10;${esc(line)}`).join("") : "") +

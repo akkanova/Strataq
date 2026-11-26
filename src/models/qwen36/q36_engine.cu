@@ -3655,7 +3655,10 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--greedy") {}            // --tokens decodes greedily here anyway
         else if (a == "--serve") serve_mode = true;
         else if (a == "--max-context") ctx = std::atoi(next().c_str());
-        else if (a == "--prefill") { const std::string v = next(); chunk = v == "auto" ? 0 : std::atoi(v.c_str()); }
+        else if (a == "--prefill-chunk") {
+            const std::string v = next();
+            chunk = v == "auto" ? 0 : std::atoi(v.c_str());
+        }
         else if (a == "--tokens") tokens = next();
         else if (a == "--force") force = next();
         else if (a == "--emb") emb_file = next();   // --tokens with pictures: a strata-vision file (the ids carry <|image_pad|> runs)
@@ -3688,7 +3691,8 @@ int strata::qwen35::run(int argc, char** argv) {
             if (val) ++i;
         } else {
             std::fprintf(stderr,
-                         "usage: strata-q36 --model GGUF [--max-context 32768] [--prefill 512] [--no-graph]\n"
+                         "usage: strata-q36 --model GGUF [--max-context 32768] [--prefill-chunk 512] [--no-graph]\n"
+                         "       --prefill and --chunk are aliases for --prefill-chunk\n"
                          "       (--serve | --tokens IDS [--max-new 64] [--force IDS] [--dump-full-logits F] | --bench-pp N "
                          "--bench-tg N)\n");
             return 2;

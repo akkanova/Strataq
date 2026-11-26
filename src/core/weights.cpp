@@ -19,6 +19,7 @@
 #include <cstring>
 #include <memory>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 
 namespace strata::core {
@@ -49,6 +50,19 @@ struct Index {
     uint64_t align = 256;   ///< the alignment of each tensor's start in the arena
     std::vector<IndexRow> rows;
 };
+
+/// Marks the rows `is_skipped` picks skipped and places the others back to back, shrinking `pool` to the compacted
+/// arena (plan v0.3 P1).
+void compact(Index& ix, const std::function<bool(const IndexRow&)>& is_skipped) {
+    ix.pool = 0;
+    for (IndexRow& r : ix.rows) {
+        r.skipped = is_skipped(r);
+        if (r.skipped)
+            continue;
+        r.dst_off = ix.pool;
+        ix.pool += (r.dst_bytes + ix.align - 1) / ix.align * ix.align;
+    }
+}
 
 /// Reads `<pack_dir>/index.txt` into ix.  With `skip`, marks the named rows skipped and places the others back to
 /// back, shrinking `pool` to the compacted arena (plan v0.3 P1).
@@ -97,18 +111,26 @@ bool read_index(const std::string& pack_dir, const std::set<std::string>* skip, 
     }
     if (f.bad()) { err = path + ": read failed"; return false; }
     if (ix.pool == 0 || ix.rows.empty()) { err = "index.txt has no header or no rows"; return false; }
-    if (skip == nullptr)
-        return true;
-    ix.pool = 0;
-    for (IndexRow& r : ix.rows) {
-        r.skipped = skip->count(r.name) != 0;
-        if (r.skipped)
-            continue;
-        r.dst_off = ix.pool;
-        ix.pool += (r.dst_bytes + ix.align - 1) / ix.align * ix.align;
-    }
+    if (skip != nullptr)
+        compact(ix, [&](const IndexRow& r) { return skip->count(r.name) != 0; });
     return true;
 }
+
+/// Reads `<pack_dir>/index.txt` into ix with only the rows of `names` that `table` holds no device bytes for placed
+/// in the arena, for WeightTable::add.
+bool read_index_to_add(const std::string& pack_dir, const std::set<std::string>& names,
+                       const std::map<std::string, WeightRef>& table, Index& ix, std::string& err) {
+    if (!read_index(pack_dir, nullptr, ix, err))
+        return false;
+    compact(ix, [&](const IndexRow& r) {
+        const auto held = table.find(r.name);
+        return names.count(r.name) == 0 || (held != table.end() && held->second.data != nullptr);
+    });
+    return true;
+}
+
+bool upload_rows(const std::string& pack_dir, const Index& ix, void* arena_base, uint64_t arena_bytes,
+                 std::map<std::string, WeightRef>& table, LoadReport& report, std::string& err);
 
 /// How a segment's bytes must be transformed on the way from the pack to the arena.
 enum class Conv : int {
@@ -265,6 +287,53 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
     Index ix;
     if (!read_index(pack_dir, skip, ix, err))
         return false;
+    table_.clear();
+    report_ = LoadReport{};
+    pack_dir_ = pack_dir;
+    return upload_rows(pack_dir, ix, arena_base, arena_bytes, table_, report_, err);
+}
+
+bool WeightTable::get_add_bytes(const std::string& pack_dir, const std::set<std::string>& names, uint64_t& out,
+                                std::string& err) const {
+    Index ix;
+    if (!read_index_to_add(pack_dir, names, table_, ix, err))
+        return false;
+    out = ix.pool;
+    return true;
+}
+
+bool WeightTable::add(const std::string& pack_dir, void* arena_base, uint64_t arena_bytes,
+                      const std::set<std::string>& names, std::string& err) {
+    Index ix;
+    if (!read_index_to_add(pack_dir, names, table_, ix, err))
+        return false;
+    auto added = table_;
+    LoadReport report = report_;
+    if (!upload_rows(pack_dir, ix, arena_base, arena_bytes, added, report, err))
+        return false;
+    // Existing WeightRef addresses can be held by the model's execution structures.
+    for (const auto& [name, ref] : added)
+        table_.insert_or_assign(name, ref);
+    report_ = report;
+    pack_dir_ = pack_dir;
+    return true;
+}
+
+void WeightTable::release(const std::set<std::string>& names) {
+    for (const std::string& name : names)
+        if (const auto it = table_.find(name); it != table_.end()) {
+            it->second.data = nullptr;
+            it->second.resident = false;
+        }
+}
+
+namespace {
+
+/// Uploads ix's rows that are not skipped from the pack in `pack_dir` into `arena_base` and describes every row in
+/// `table`: a new row as the index has it, a row `table` holds already keeps its entry, and gets its new device bytes
+/// unless skipped.  Adds the load's figures to `report`.
+bool upload_rows(const std::string& pack_dir, const Index& ix, void* arena_base, uint64_t arena_bytes,
+                 std::map<std::string, WeightRef>& table, LoadReport& report, std::string& err) {
     if (arena_bytes < ix.pool) {
         err = "arena is " + std::to_string(arena_bytes) + " B but the index needs " + std::to_string(ix.pool);
         return false;
@@ -296,16 +365,17 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
     uint8_t* dst_base = (uint8_t*) arena_base;
     PackFile cur;
     int cur_file = -1;
-    table_.clear();
-    report_ = LoadReport{};
-    pack_dir_ = pack_dir;
 
     const double t_read0 = now_ms();
     double upload_ms = 0;
     for (size_t row_i = 0; row_i < ix.rows.size(); ++row_i) {
         const IndexRow& r = ix.rows[row_i];
-        table_[r.name] = describe(r, dst_base);
-        ++report_.tensors;
+        const auto [held, fresh] = table.try_emplace(r.name, describe(r, dst_base));
+        if (!fresh && !r.skipped) {
+            held->second.data = dst_base + r.dst_off;
+            held->second.resident = true;
+        }
+        ++report.tensors;
         if (r.skipped)
             continue;
         if (r.code_bits != 0 && r.dst_bytes == 0) {
@@ -432,17 +502,19 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
         }
 
         if ((r.kind == WeightKind::Bf16InF32 || r.kind == WeightKind::F16InF32) && !r.raw16) {
-            ++report_.re_rounded;
-            report_.bytes_saved += r.src_bytes - r.dst_bytes;
+            ++report.re_rounded;
+            report.bytes_saved += r.src_bytes - r.dst_bytes;
         }
     }
 
-    report_.arena_bytes = ix.pool;
-    report_.read_ms = now_ms() - t_read0 - upload_ms;
-    report_.upload_ms = upload_ms;
+    report.arena_bytes += ix.pool;
+    report.read_ms += now_ms() - t_read0 - upload_ms;
+    report.upload_ms += upload_ms;
     if (cudaDeviceSynchronize() != cudaSuccess) { err = "cudaDeviceSynchronize after the load failed"; return false; }
     return true;
 }
+
+}  // namespace
 
 const WeightRef* WeightTable::find(const std::string& name) const {
     const auto it = table_.find(name);

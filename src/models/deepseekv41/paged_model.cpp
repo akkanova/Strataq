@@ -1,3 +1,4 @@
+#include "strata/common/kernels/routing_stats.hpp"
 #include "strata/common/serve/request_output.hpp"
 // src/models/deepseekv41/paged_model.cpp - strata-ds41: DeepSeek V4.1 on the shared paged engine (paged_model.hpp):
 // its start and its side of the engine's model interface (strata/common/serve/paged_model.hpp).
@@ -68,7 +69,6 @@ struct ProgramOptions {
     float adapt_min_gain = 1.5f;   ///< --adapt-min-gain: the routings a move must gain (choose_expert_swaps)
     float adapt_decay = 0.7f;      ///< --adapt-decay: the routing counts' factor per 4 decode steps
     std::string layer_split, split_device;  ///< Existing stage bounds and physical devices.
-    bool trim_stage_weights = false;       ///< Keeps the cut within the initial dense-weight ranges.
     bool drafting = true;          ///< --dspark is not off: the drafter starts switched on (--drafter)
 };
 
@@ -322,6 +322,12 @@ public:
     bool lay_out_prompt(const PagedCard& card, int64_t chunk, uint8_t* device, uint8_t* host,
                         std::string& err) override {
         return m_.lay_out_prompt((int) card.index, get_lent_rows(chunk), device, host, err);
+    }
+    bool raise_prompt_ceiling(int64_t chunk, std::string& err) override {
+        if (!m_.raise_prompt_chunk((int) chunk, err))   // (CHANGE_SETTINGS takes at most INT32_MAX)
+            return false;
+        prompt_ceiling_ = chunk;
+        return true;
     }
     bool read_prompt(const PagedParts& parts, const std::vector<int64_t>& ids, int64_t from, int64_t n, bool drafting,
                      const PromptControl& control, int64_t& took, std::string& err) override;
@@ -580,8 +586,7 @@ int run_paged_engine(int argc, char** argv) {
     }
     for (size_t i = 0; i < devices.size(); ++i)
         strata::serve::add_paged_card(cards, devices[i], i == 0 ? 0 : cuts[i - 1], i == cuts.size() ? g.nl : cuts[i],
-                                      g.nl, x.trim_stage_weights, kProgram,
-                                      *std::max_element(blobs.begin(), blobs.end()));
+                                      kProgram, *std::max_element(blobs.begin(), blobs.end()));
     if (has_drafter && !settings.drafter && !m.switch_drafter_weights(false, err)) {
         std::fprintf(stderr, "%s: %s\n", kProgram.c_str(), err.c_str());
         return 1;
@@ -627,6 +632,8 @@ PagedDeepSeek::PagedDeepSeek(Model& m, const Options& o, const ProgramOptions& x
     facts.name = kProgram;
     facts.n_layers = g.nl;
     facts.n_expert = g.n_exp;
+    facts.shared_experts = 1;
+    strata::kernels::init_routing_counts((int) facts.n_layers, (int) facts.n_expert, (int) facts.shared_experts);
     facts.row_bytes = (uint64_t) g.dim * sizeof(float);
     facts.context = o.max_context;
     facts.max_rows = kWindowRows;
@@ -822,7 +829,9 @@ bool PagedDeepSeek::rewind(const PagedParts& parts, int64_t tokens, std::string&
 }
 
 strata::core::LayerSizes PagedDeepSeek::get_layer_sizes(uint64_t page) const {
-    return get_split_sizes(m_.geometry(), m_.get_expert_bytes(), page);
+    strata::core::LayerSizes sizes = get_split_sizes(m_.geometry(), m_.get_expert_bytes(), page);
+    sizes.dense = m_.get_layer_dense_bytes();   // (a cut move trades them against the cards' pools)
+    return sizes;
 }
 
 bool PagedDeepSeek::read_prompt(const PagedParts& parts, const std::vector<int64_t>& ids, int64_t from, int64_t n,
@@ -1153,22 +1162,8 @@ bool PagedDeepSeek::switch_drafter(bool on, std::string& err) {
     drafting_ = on;
     for (PagedCard* card : cards_) {
         const auto ranking = get_pool_ranking(card->lb, card->le);
-        int64_t most = (int64_t) ranking.size();
-        if (on) {
-            const auto report = card->experts.pool().report();
-            uint64_t room = report.experts.bytes + report.free.bytes;
-            int64_t fit = 0;
-            for (const strata::core::ExpertKey& key : ranking) {
-                const uint64_t page = card->experts.pool().page_bytes();
-                const uint64_t bytes = (blobs_[(size_t) key.layer] + page - 1) / page * page;
-                if (bytes > room)
-                    break;
-                room -= bytes;
-                ++fit;
-            }
-            most = std::min(most, fit);
-        }
-        card->experts.set_ranking(ranking, most);
+        const int64_t most = (int64_t) ranking.size();
+        card->experts.set_ranking(ranking, on ? std::min(most, card->experts.count_fitting(ranking)) : most);
         if (!publish_residency(*card, err))
             return false;
     }
@@ -1243,8 +1238,9 @@ int read_model_options(int argc, char** argv, Options& o, ProgramOptions& x, std
             x.layer_split = val("--layer-split");
         else if (a == "--split-device")
             x.split_device = val("--split-device");
-        else if (a == "--trim-stage-weights")
-            x.trim_stage_weights = true;
+        else if (a == "--trim-stage-weights") {
+            // accepted for older run configs: every split now moves its layers' weights with the cut
+        }
         else if (a != "--serve") {
             std::fprintf(stderr, "%s: unknown option %s\n", kProgram.c_str(), a.c_str());
             return 2;
@@ -1304,10 +1300,7 @@ bool open_card_pool(const Model& m, const PagedSettings& s, const strata::core::
         card, s, layout, m.max_context(),
         strata::core::choose_expert_page_bytes({blobs.begin(), blobs.begin() + m.geometry().nl}), blobs, ranking,
         max_experts, keep);
-    plan.config.label_expert = [layers = m.geometry().nl](strata::core::ExpertKey key, uint64_t bytes) {
-        return strata::core::MemoryLabel{"experts", "", (key.layer >= layers ? "Drafter / " : "") +
-            strata::core::get_expert_memory_label(key.layer, bytes)};
-    };
+    plan.config.label_expert = strata::serve::get_expert_labels(m.geometry().nl);
     const strata::core::OnDevice on(card.dev);
     if (!card.experts.open(strata::serve::get_gpu_chunk_memory(card.dev, plan.config.chunk_bytes), plan.bytes,
                            layout, plan.config, blobs, m.geometry().n_exp, max_experts, ranking, {false, keep}, err))

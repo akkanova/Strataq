@@ -37,7 +37,7 @@ def translate_args(cfg: dict, args: list[str]) -> list[str]:
     aliases = {"--slots": "--batch"}
     aliases.update({"--gpu": "--gpus", "--vram-reserve-mib": "--reserve-mib", "--eos-ids": "--eos"} if deepseek else
                    {"--gpus": "--gpu", "--resident-budget-gib": "--ram-mib", "--model": "--native",
-                    "--reserve-mib": "--vram-reserve-mib", "--eos": "--eos-ids"})
+                    "--reserve-mib": "--vram-reserve-mib", "--eos": "--eos-ids", "--prefill-chunk": "--prefill"})
     supported = common | model | switches
     out, omitted = [], []
     i = 0

@@ -98,6 +98,22 @@ int main() {
     PagePoolConfig config;
     config.page_bytes = kPage;
     config.hysteresis = 0;
+    {
+        Ssd staged_ssd;
+        RamExperts staged;
+        PagePoolConfig chunks = config;
+        chunks.chunk_bytes = 4 * kPage;
+        std::string err;
+        const uint64_t asked = 16 * kPage;
+        check(staged.open(staged_ssd, asked, 2, layout, chunks, kBlobs, kExperts, ranking, err), err.c_str());
+        check(staged.get_asked_bytes() == asked && staged.pages().pool().report().total.pages == 4,
+              "opening retains the requested size while allocating only one chunk");
+        check(staged.resize(asked).refusal.empty() && staged.pages().pool().report().total.pages == 12,
+              "deferred growth uses the requested size including the staging ring");
+        uint64_t wait = 0;
+        check(staged.refill(16, wait, err) == 9 && staged.holds(1, 2),
+              "deferred growth admits the full ranking beyond the initial chunk");
+    }
     RamExperts ram;
     std::string err;
     // room for 12 pages: experts 0-2 of every layer (12 pages)

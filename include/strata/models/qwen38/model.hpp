@@ -39,8 +39,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -99,6 +101,7 @@ struct GpuStage {
     double link_gbps = 0.0;   ///< this card's probed host->device bandwidth (PcieAuto's per-stage share)
     strata::core::WeightTable wt;
     strata::core::NativeDense dense;
+    std::map<int64_t, void*> layer_arenas;   ///< the device memory of each of its layers' canonical tensors
     strata::core::NativeHead head;
     strata::core::SessionState ss;
     cudaStream_t stream = nullptr;
@@ -199,6 +202,24 @@ public:
     bool is_paged() const { return (bool) open_expert_pages; }
     /// Gets the bytes of the GDN state that one snapshot of session `s0` copies.
     size_t gdn_snapshot_bytes(const strata::core::SessionState& s0) const;
+    /// Gets the canonical tensors of layers [lb, le) that a card of a layer split loads into its arenas (the PLE's,
+    /// which every card holds, and `card_skip` left out).
+    std::set<std::string> get_layer_names(int64_t lb, int64_t le) const;
+    /// Gets the device memory load_card_layers takes for each layer on a card whose canonical tensors are `held` (an
+    /// empty table: a card that holds none yet), reading the pack's index and the GGUF headers only.
+    bool get_layer_bytes(const strata::core::WeightTable& held, std::vector<uint64_t>& out, std::string& e);
+    /// Loads the dense weights of layers [lb, le) that a card of a layer split lacks: each layer's canonical tensors
+    /// into `card_wt` in a device allocation of its own (kept in `arenas` by layer, so that one layer can be given
+    /// back), and their native projections into `dense`.  The card's device must be current.
+    bool load_card_layers(strata::core::WeightTable& card_wt, strata::core::NativeDense& dense,
+                          std::map<int64_t, void*>& arenas, int64_t lb, int64_t le, std::string& e);
+    /// Frees the dense weights a card of a layer split holds for layers outside [lb, le) (load_card_layers' arguments),
+    /// when strata-q38 moves its layer cut.  Nothing may still read them.
+    void release_card_layers(strata::core::WeightTable& card_wt, strata::core::NativeDense& dense,
+                             std::map<int64_t, void*>& arenas, int64_t lb, int64_t le);
+    /// Loads layer `l`'s canonical tensors into `card_wt` in a device allocation of its own, for load_card_layers.
+    bool load_card_layer(strata::core::WeightTable& card_wt, std::map<int64_t, void*>& arenas, int64_t l,
+                         std::string& e);
 
     Options& o;                      ///< the engine's settings, owned by the caller
     int primary_device = 0;          ///< STRATA_PRIMARY_DEVICE: the visible device the engine's own session runs on
@@ -210,9 +231,6 @@ public:
     /// strata-q38: a layer split without --serve, each stage with weights, an expert cache and a session of its own
     /// on its card, CUDA0 too (--split-device 0,..: several stages on one GPU, the test of a split on one card)
     bool own_stages = false;
-    /// --trim-stage-weights took effect: the layer split's cards hold the dense weights of their own layers only
-    /// (CUDA0 too, unless the split was searched), so strata-q38 does not move its cut
-    bool stage_weights_trimmed = false;
     /// A layer split across GPUs; cleared by --split-skip-if-fits before any stage loads
     bool multi_gpu = false;
     bool remote_caches = false;      ///< --expert-cache-remote asks for a helper GPU's expert cache
@@ -223,6 +241,10 @@ public:
     int64_t K = 0;                   ///< experts per token
     uint64_t pool_bytes = 0;         ///< the size of `arena`
     void* arena = nullptr;           ///< the device memory the pack's dense weights live in
+    /// A layer split: the device memory of each of CUDA0's layers' canonical tensors (`arena` holds the model-wide ones)
+    std::map<int64_t, void*> layer_arenas;
+    /// The canonical tensors no card loads, because another form serves them (load_card_layers)
+    std::set<std::string> card_skip;
     strata::core::WeightTable wt;
     strata::core::NativeDense native_dense;
     int32_t* d_mrope = nullptr;       ///< --vision: each cell's (t, h, w) for the rope kernels, on the device

@@ -368,27 +368,36 @@ function showSpeeds(live, last, totals, {generating, reading}, rowsSetting) {
 function describeDecode(sums, slow, rowsSetting) {
   const ratio = (a, b) => sums.ratio(a, b, slow);
   const rows = ratio("rows", "steps"), conversations = ratio("conversations", "steps");
-  const experts = ratio("experts", "routed_rows");
-  const alone = ratio("routings", "routed_rows");
-  const kept = ratio("kept", "guesses"), sharing = experts != null && alone ? 1 - experts / alone : null;
+  // Older paged engines count routing only while some experts are outside VRAM; faded counts would look current.
+  const counted = ratio("routed_rows", "rows") >= 0.005;
+  const experts = counted ? ratio("experts", "routed_rows") : null;
+  const alone = counted ? ratio("routings", "routed_rows") : null;
   if (rows == null)
     return [];
+  const kept = ratio("kept", "guesses");
+  // Below 1.05 rows/step, the displayed one-decimal average is one row; use that approximation without counts.
+  const sharing = experts != null && alone ? 1 - experts / alone : rows < 1.05 ? 0 : null;
   const pct = (x) => (x == null ? "–" : `${fmt(100 * x)}%`);
-  const tenths = (x) => fmt(x, Number.isInteger(x) ? 0 : 1);
+  // Fading can leave a whole-number ratio slightly above or below its exact value.
+  const tenths = (x) => fmt(x, Math.round(10 * x) % 10 ? 1 : 0);
   const room = ratio("guess_room", "conversations");
+  // Acceptance alone cannot fade: its numerator and denominator decay at the same rate.
+  const keptNow = ratio("guesses", "steps") >= 0.005 ? kept : null;
   const together = conversations == null ? "" : `\nNumber of simultaneous conversations: ${tenths(conversations)}`;
   return [
-    [`${fmt(rows, 1)} tokens/step`, "Average rows in use. A step is one pass through the model; it computes a " +
-      "row for each token: a conversation's next token, or a guessed token being checked. " +
+    [`${fmt(rows, 1)} tokens/step`, "Average rows in use. A step runs its pipeline groups through the model; " +
+      "it computes a row for each token: a conversation's next token, or a guessed token being checked. " +
       (rowsSetting ? `Each pipeline group is set to at most ${rowsSetting} rows per step.` : "") + together],
-    [`${fmt(experts)} experts/token`, "Routed experts computed per step, divided by the step's rows (a row is one " +
-      `token here). ${alone ? `One row alone uses ${fmt(alone)}. ` : ""}The shared expert that every token uses ` +
-      "is counted with the Weights, not here. Counted only while some experts are outside VRAM."],
+    [`${fmt(experts)} experts/token`, "Experts computed per step, divided by the step's rows (a row is one token " +
+      `here). ${alone ? `One row alone uses ${fmt(alone)}. ` : ""}This includes each layer's shared expert, which ` +
+      "every token uses (it is part of the Memory panel's Weights). Each pipeline group counts its experts " +
+      "separately."],
     [`${fmt(ratio("cpu_experts", "steps"))} on CPU, ${pct(sharing)} PRES`, "On CPU: experts per step that the CPU " +
       "computed, because they were not in VRAM.\nPRES (Per Row Expert Sharing): how much expert work and memory " +
-      "traffic the step saved because its rows picked some of the same experts: 1 - experts/token ÷ experts one " +
-      "row alone uses. 0% with one row."],
-    ...kept == null ? [] : [[`${pct(kept)} MTP acceptance`,
+      "traffic the step saved because its rows used some of the same experts: 1 - experts/token ÷ experts one " +
+      "row alone uses. Rows in the same pipeline group can share experts, including the shared experts in the " +
+      "Weights. One conversation can use several rows when checking guessed tokens."],
+    ...kept == null ? [] : [[`${pct(keptNow)} MTP acceptance`,
       "The share of guessed tokens (the MTP drafter's and suffix lookup's) that the model kept." +
       (conversations == null ? "" : `\nOn average ${fmt(ratio("guesses", "conversations"), 2)} draft tokens are ` +
         "being submitted per conversation per step, and " +

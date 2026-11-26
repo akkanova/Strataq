@@ -11,11 +11,12 @@ configs would name a program that is not there.  This module is what both sides 
 """
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import subprocess
 from pathlib import Path
+
+from strata_common import cfg_paths
 
 NAME = "strata-dsv41"
 DIR = "engine-dsv41"
@@ -152,7 +153,7 @@ def repoint(config, exe) -> bool:
     """Make the run config `config` name `exe` (a strata-dsv41 in an engine-dsv41 folder) and that package's library folders, nothing else
     changed; True when the file changed."""
     config = Path(config)
-    cfg = json.loads(config.read_text(encoding="utf-8-sig"))
+    cfg = cfg_paths.read_config(config)
     if not isinstance(cfg, dict) or not isinstance(cfg.get("exe"), str):
         return False
     libs = [d for d in (cfg.get("lib_dirs") or []) if DIR not in str(d)]
@@ -161,7 +162,7 @@ def repoint(config, exe) -> bool:
         return False
     cfg.update(wanted)
     from strata_base import atomic
-    atomic.write_bytes(config, json.dumps(cfg, indent=2).encode("utf-8"))
+    atomic.write_bytes(config, cfg_paths.dumps(cfg, config, indent=2).encode("utf-8"))
     return True
 
 
@@ -180,7 +181,7 @@ def saved_configs() -> list[Path]:
 
 def _read(path) -> dict | None:
     try:
-        cfg = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+        cfg = cfg_paths.read_config(path)
     except (OSError, ValueError):
         return None
     return cfg if isinstance(cfg, dict) else None

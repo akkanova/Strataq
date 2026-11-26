@@ -66,6 +66,7 @@ from strata_server.frontend import (THINK_END, ChatTemplate, Event, OutputParser
 from strata_server.mcp import McpCancelled, hub_from_config  # noqa: E402
 from strata_server import runconfig  # noqa: E402
 from strata_server.webfiles import subtree_file as web_subtree_file  # noqa: E402
+from strata_common import cfg_paths  # noqa: E402
 from strata_common import engine_component  # noqa: E402
 from strata_base import tls  # noqa: E402
 
@@ -6258,7 +6259,7 @@ def read_config(path) -> dict:
 def parse_config_text(text: str, path) -> dict:
     """read_config on text already read (the owner-launched server hashes the bytes it parses, launch attestation)."""
     try:
-        return json.loads(text)
+        return cfg_paths.to_absolute(json.loads(text), Path(path).parent)
     except json.JSONDecodeError as e:
         raise SystemExit(f"[strata] {path} is not valid JSON: {e.msg} at line {e.lineno}, column {e.colno}. Check the commas "
                          'between the entries of "args" (each option and each value is its own quoted entry, e.g. '

@@ -11,5 +11,9 @@ namespace strata::kernels {
 /// (softmax over the 512 unbiased logits) renormalised over the 10 picked, as the native router does.
 void route_prior_top10(const float* logits, const int32_t* res_layer, float lambda, int32_t* ids, float* weights,
                        int n_tok, void* stream);
+/// The same with the bonus read from `lambda` (device-readable, e.g. mapped host memory) when the kernel runs, so that
+/// a captured graph follows its changes (strata-q38's MTP drafter).
+void route_prior_top10(const float* logits, const int32_t* res_layer, const float* lambda, int32_t* ids,
+                       float* weights, int n_tok, void* stream);
 
 }  // namespace strata::kernels

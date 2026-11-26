@@ -14,6 +14,7 @@
 #include "strata/models/qwen38/verify.hpp"
 #include "strata/models/qwen38/window_evict.hpp"
 #include "strata/common/kernels/expert_nibble.hpp"
+#include "strata/common/kernels/routing_stats.hpp"
 #include "strata/base/gpu/pin_budget.hpp"
 #if defined(STRATA_VERIFY_HGL)
 #include "strata/base/gpu/host_graph_launch.hpp"
@@ -2280,6 +2281,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
+        strata::kernels::count_routing(ids_ + tb * K, n, (int) K, (int) K, (int) l, cs);
         if (rs_on_ && G == 1 && n <= 16 && T <= 16)
             strata::kernels::route_marginal_stats(ids_ + tb * K, n, (int) K, rs_dev_ + ((size_t) T * (size_t) g.n_layers + (size_t) l) * 16, cs);
         if (ar_on()) {

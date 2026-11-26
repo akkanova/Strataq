@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -70,6 +71,22 @@ public:
     /// session_set_pool_state), not in a buffer of its own; load carves none, and use_kv_units points it at a
     /// conversation's.
     void set_kv_in_pages(bool on) { kv_in_pages_ = on; }
+    /// Where strata-q38's page pool keeps the layer's 512 routed experts (set_pool_experts).
+    struct PoolExperts {
+        const int32_t* res = nullptr;    ///< device: each expert's first page, or < 0 while it is not in VRAM
+        const uint8_t* base = nullptr;   ///< the pool's page 0
+        int64_t page_bytes = 0;
+    };
+    /// Before load (strata-q38): the 512 routed experts are the page pool's, where `*pool` says (filled by the
+    /// caller before the first draft and kept as long as this drafter), not a block of this drafter's own, so load
+    /// reads none.  A draft step's router then favors the experts in VRAM by the verify's route prior
+    /// (get_route_prior), and a routed expert that is not in VRAM is left out as the verify's tail skip would leave it
+    /// (tail_skip_rank); when it may not be, the chain ends before that step.
+    void set_pool_experts(const PoolExperts* pool) { pool_ = pool; }
+    const PoolExperts* get_pool_experts() const { return pool_; }
+    /// With set_pool_experts: gets the expert ids the last draft's steps routed to, k per step, for the steps it ran
+    /// (its drafts and the step that ended its chain).
+    std::span<const int32_t> get_routed() const;
     /// With set_kv_in_pages: makes the next drafts and prompt passes read and write the K/V of the conversation whose
     /// units table (kv_units.hpp, one entry per block of the session's max_cells and 2 more) is `units`, by copying
     /// it on the drafter's stream into the table the drafter's graphs read.
@@ -334,6 +351,11 @@ private:
     std::vector<Tensor> tensors_;
     uint8_t* dense_ = nullptr;
     uint8_t* experts_ = nullptr;
+    const PoolExperts* pool_ = nullptr;   ///< set_pool_experts: where the routed experts are (null: experts_)
+    /// With pool_, mapped: PoolGroupArgs::chain's four ints, the route prior's bonus (a float), then from
+    /// kPoolRoutedAt each step's routed ids
+    int32_t *h_pool_ = nullptr, *m_pool_ = nullptr;
+    static constexpr int kPoolRoutedAt = 8;
     // the prompt room: the experts' pinned host snapshot, its size, and whether a prompt has taken their contents
     // (the block itself stays where it is - see experts_lend)
     void* experts_host_ = nullptr;

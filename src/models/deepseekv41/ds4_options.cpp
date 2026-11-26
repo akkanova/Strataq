@@ -54,7 +54,10 @@ bool read_option(const std::string& a, const std::function<std::string(const cha
     }
     else if (a == "--dspark-block") o.dspark_block = std::max(0, std::atoi(val("--dspark-block").c_str()));
     else if (a == "--tp") o.tp = std::max(1, std::atoi(val("--tp").c_str()));
-    else if (a == "--prefill-chunk") o.prefill_chunk = std::max(0, std::atoi(val("--prefill-chunk").c_str()));
+    else if (a == "--prefill-chunk") {
+        const std::string v = val("--prefill-chunk");
+        o.prefill_chunk = v == "auto" || v.rfind("auto:", 0) == 0 ? -1 : std::max(0, std::atoi(v.c_str()));
+    }
     else if (a == "--threads") o.threads = val("--threads") != "off";
     else if (a == "--vision") o.vision = val("--vision") != "off";
     else if (a == "--mmap-experts") {

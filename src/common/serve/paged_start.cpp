@@ -231,15 +231,13 @@ void set_paged_runtime_env(const PagedSettings& s, bool hops_possible) {
             strata::platform::set_env(name, s.prompt_order == "layer" ? "1" : "0", false);
 }
 
-PagedCard& add_paged_card(PagedCards& cards, int dev, int64_t lb, int64_t le, int64_t n_layers, bool trim_weights,
-                          const std::string& program, uint64_t expert_bytes) {
+PagedCard& add_paged_card(PagedCards& cards, int dev, int64_t lb, int64_t le, const std::string& program,
+                          uint64_t expert_bytes) {
     PagedCard& card = cards.emplace_back();
     card.index = cards.size() - 1;
     card.dev = dev;
     card.lb = lb;
     card.le = le;
-    card.weights_lb = trim_weights ? lb : 0;
-    card.weights_le = trim_weights ? le : n_layers;
     const bool shared = std::any_of(cards.begin(), cards.end() - 1, [&](const PagedCard& c) { return c.dev == dev; });
     card.id = "gpu" + std::to_string(dev) + (shared ? "." + std::to_string(card.index) : "");
     const strata::core::LinkSpeed link = card.link = get_host_link(dev);
@@ -248,6 +246,13 @@ PagedCard& add_paged_card(PagedCards& cards, int dev, int64_t lb, int64_t le, in
                  program.c_str(), card.id.c_str(), link.to_gbps, link.from_gbps, link.latency_ms);
     card.layer_ms = strata::program::split_rules::get_layer_ms(strata::core::get_card_speed(dev));
     return card;
+}
+
+std::function<strata::core::MemoryLabel(strata::core::ExpertKey, uint64_t)> get_expert_labels(int64_t n_layers) {
+    return [n_layers](strata::core::ExpertKey key, uint64_t bytes) {
+        return strata::core::MemoryLabel{"experts", "", (key.layer >= n_layers ? "Drafter / " : "") +
+            strata::core::get_expert_memory_label(key.layer, bytes)};
+    };
 }
 
 CardPoolPlan plan_card_pool(const PagedCard& card, const PagedSettings& s, const strata::core::StateLayout& layout,
@@ -499,11 +504,12 @@ bool open_ram_pool(const std::string& program, const PagedSettings& s, strata::c
     }
     copy_back_gain = strata::core::get_copy_back_gain(back, ssd);
     const double gain = get_copy_back_gain_for(s.copy_back, copy_back_gain);
-    std::fprintf(stderr, "%s: the RAM's page pool: %.2f GiB%s, opened in %.1f s; it takes experts while the engine "
-                         "serves, and an expert it does not hold is read from the SSD %s.  An expert the GPU evicts "
-                         "is %s (copying it back: %.1f GB/s, reading the SSD: %.1f GB/s; --copy-back %s)\n",
+    std::fprintf(stderr, "%s: the RAM's page pool: %.2f GiB%s, opened in %.1f s, grows towards %.2f GiB when the "
+                         "engine starts serving; it takes experts while the engine serves, and an expert it does not "
+                         "hold is read from the SSD %s.  An expert the GPU evicts is %s (copying it back: %.1f GB/s, "
+                         "reading the SSD: %.1f GB/s; --copy-back %s)\n",
                  program.c_str(), (double) (ram.pages().pool().report().total.bytes) / 1073741824.0,
-                 ram.is_page_locked() ? ", page-locked" : "", open_s,
+                 ram.is_page_locked() ? ", page-locked" : "", open_s, (double) bytes / 1073741824.0,
                  files.is_direct() ? "without the file cache"
                                    : "THROUGH the file cache (the files cannot be read unbuffered here)",
                  strata::core::is_copy_back_worth(gain, false) ? "copied back to RAM"

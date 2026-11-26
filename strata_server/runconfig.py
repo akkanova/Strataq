@@ -14,7 +14,7 @@ import re
 import shutil
 from pathlib import Path
 
-from strata_common import user_args
+from strata_common import cfg_paths, user_args
 from strata_base import atomic as _atomic_mod
 
 # (key, kind, help).  kind: "bool", "int>=0", "num>=0", ("enum", values), "names", or ("sampling", check) for a key
@@ -50,6 +50,7 @@ LIVE_FLAGS = {"memory_mib.gpu0": "--gpu-mib", "memory_mib.ram": "--ram-mib", "to
               "vram_conversations": "--vram-conversations",
               "conversation_idle_seconds": "--conversation-idle-seconds",
               "decode_share_percent": "--decode-share-percent", "prompt_turn_ms": "--prompt-turn-ms",
+              "prefill_chunk": "--prefill-chunk",
               "tokens_max": "--tokens-max", "ssd_pause_mib": "--ssd-pause-mib", "rows": "--rows",
               "suffix_draft": "--suffix-draft", "lookup_chain": "--lookup-chain",
               "lookahead": "--lookahead", "concurrent": "--concurrent", "drafter": "--drafter",
@@ -75,12 +76,15 @@ _LIVE_RANGE = {"rows": (1, 16), "concurrent": (1, None), "context": (1, None), "
                "draft_confidence_pct": (0, 100), "draft_cumulative_pct": (0, 100),
                "expert_half_life": (0, 2147483647)}
 # Alternate spellings accepted by the page-pool engines, removed when their canonical flag is saved.
-_LIVE_ALIASES = {"--vram-reserve-mib": ("--reserve-mib",)}
+_LIVE_ALIASES = {"--vram-reserve-mib": ("--reserve-mib",), "--prefill-chunk": ("--chunk",)}
+# Alternate spellings that a saved default writes over in place instead: setup and its tools find Qwen's prompt chunk
+# by --prefill (setup_config.py, vram_fit.py, tune_knobs.py).
+_KEPT_ALIASES = {"--prefill-chunk": ("--prefill",)}
 
 
 def _arg(cfg: dict, flag: str):
     """Gets the last value of a live flag, including its alternate spellings, as the engine reads it."""
-    flags = (flag, *_LIVE_ALIASES.get(flag, ()))
+    flags = (flag, *_LIVE_ALIASES.get(flag, ()), *_KEPT_ALIASES.get(flag, ()))
     for group in reversed(user_args.groups(cfg.get("args"))):
         if group[0] in flags and len(group) > 1:
             v = group[1]
@@ -164,8 +168,11 @@ def apply_live(cfg: dict, values: dict, settings: dict | None = None) -> tuple[d
             _set_arg(new, "--gpu-mib", sizes)
             changed = list(cards)
     for key, v in values.items():
-        if key not in cards and key not in _ONE_CHANGE and _arg(new, LIVE_FLAGS[key]) != v:
-            _set_arg(new, LIVE_FLAGS[key], v)
+        if key in cards or key in _ONE_CHANGE:
+            continue
+        flag = LIVE_FLAGS[key]
+        if _arg(new, flag) != v:
+            _set_arg(new, flag, v)
             changed.append(key)
     return new, changed
 
@@ -259,19 +266,22 @@ def apply(cfg: dict, changes: dict) -> tuple[dict, list[str]]:
 def _set_arg(cfg: dict, flag: str, v) -> None:
     """Sets engine option `flag` to `v` (None: removes it) in cfg's "args", in place, as the person's own (user_args),
     so that it survives setup and the app writing "args" again."""
-    for alias in _LIVE_ALIASES.get(flag, ()):
-        _set_arg(cfg, alias, None)
+    mine = user_args.capture(cfg)
     a = list(cfg.get("args") or [])
-    if flag in a[:-1]:
-        i = a.index(flag)
-        if v is None:
-            del a[i:i + 2]
-        else:
-            a[i + 1] = str(v)
-    elif v is not None:
-        a += [flag, str(v)]
+    kept = _KEPT_ALIASES.get(flag, ())
+    flags = (flag, *_LIVE_ALIASES.get(flag, ()), *kept)
+    target = next((name for name in kept if name in a), flag)
+    positions = [i for i, token in enumerate(a) if token in flags]
+    for i in reversed(positions):
+        end = i + 2 if i + 1 < len(a) and not str(a[i + 1]).startswith("--") else i + 1
+        del a[i:end]
+    if v is not None:
+        i = positions[0] if positions else len(a)
+        a[i:i] = [target, str(v)]
     cfg["args"] = a
-    mine = user_args.set_flag(user_args.capture(cfg), flag, v)
+    for name in flags:
+        mine = user_args.set_flag(mine, name, None)
+    mine = user_args.set_flag(mine, target, v)
     if mine:
         cfg[user_args.USER_KEY] = mine
     else:
@@ -285,7 +295,7 @@ def save(path: str | Path, cfg: dict) -> Path:
     path = Path(path)
     bak = path.with_name(path.name + ".bak")
     shutil.copyfile(path, bak)
-    _atomic_mod.write_text(path, json.dumps(cfg, indent=1))
+    _atomic_mod.write_text(path, cfg_paths.dumps(cfg, path, indent=1))
     return bak
 
 

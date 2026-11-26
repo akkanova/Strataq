@@ -1,3 +1,4 @@
+#include "strata/common/kernels/routing_stats.hpp"
 #include "strata/common/serve/request_output.hpp"
 #include "strata/base/gpu/managed_memory.hpp"
 // src/models/qwen38/paged_model.cpp - strata-q38: Qwen3.8 on the shared paged engine (paged_model.hpp): its start
@@ -172,7 +173,7 @@ class PagedQwen final : public strata::serve::PagedModel {
 public:
     /// `drafter`: null when drafting is off; `sessions`: the conversations the engine holds (its batch slots and
     /// "main").
-    PagedQwen(Model& m, Conversation& conv, const PagedCards& cards, ModelCards& model_cards, SplitDrive& split,
+    PagedQwen(Model& m, Conversation& conv, PagedCards& cards, ModelCards& model_cards, SplitDrive& split,
               const strata::core::RamExperts& ram, const strata::core::ExpertFiles& files,
               ConversationDrafter* drafter, int sessions, int prompt_rows);
 
@@ -187,6 +188,7 @@ public:
     bool get_card_layout(const PagedCard& card, int64_t lb, int64_t le, strata::core::StateLayout& layout,
                          std::string& err) const override;
     uint64_t get_gpu_keep(const PagedCard& card) const override;
+    uint64_t get_drafter_weight_bytes(const PagedCard& card) const override;
     std::vector<strata::core::ExpertKey> get_card_ranking(int64_t lb, int64_t le, int64_t& max_experts) const override;
     std::vector<int32_t>& get_residency() override { return m_.host_res; }
     bool publish_residency(const PagedCard& card, std::string& err) override;
@@ -234,6 +236,7 @@ public:
         return alone && tokens >= 2 * chunk && conv_.sp.is_layer_major_on() ? tokens : chunk;
     }
     int64_t get_prompt_ceiling() const override { return m_.o.prefill_chunk; }
+    bool raise_prompt_ceiling(int64_t chunk, std::string& err) override;
     strata::serve::PromptBuffers get_prompt_buffers(const PagedCard& card, int64_t chunk,
                                                     int64_t tokens) const override;
     bool lay_out_prompt(const PagedCard& card, int64_t chunk, uint8_t* device, uint8_t* host,
@@ -324,12 +327,15 @@ private:
     int draft_image_session_ = -1; ///< The conversation whose cell table the drafter currently holds.
     Model& m_;
     Conversation& conv_;   ///< card 0's prompt path and verify windows, shared by every conversation
-    const PagedCards& pcards_;
+    PagedCards& pcards_;
     ModelCards& cards_;
     SplitDrive& split_;
     const strata::core::RamExperts& ram_;
     const strata::core::ExpertFiles& files_;   ///< the experts on the SSD, which the RAM's pool reads through
     ConversationDrafter* const drafter_;
+    /// Where the drafter finds its experts in the pool, given again to each load (switch_drafter)
+    const strata::core::MtpDrafter::PoolExperts* const pool_experts_;
+    const uint64_t drafter_bytes_;   ///< the drafter's own GPU memory (its dense weights, K/V table and buffers)
     const int sessions_;
     const int prompt_rows_; ///< The legacy verify width used for short prompt reads.
     uint64_t checkpoint_clock_ = 0; ///< Monotonic recency across active and restored chains.
@@ -343,10 +349,15 @@ private:
     /// Does read_prompt's work; read_prompt then keeps the prompt's missed experts out of pcie_auto_'s readings.
     bool read_prompt_core(const PagedParts& parts, const std::vector<int64_t>& ids, int64_t from, int64_t n,
                           bool drafting, const PromptControl& control, int64_t& took, std::string& err);
+    /// Each layer's dense weights on a card of the split (Model::get_layer_bytes), read once a cut is planned
+    mutable std::vector<uint64_t> layer_dense_;
+    /// Prevents a cut move when pack metadata could not establish its memory cost.
+    mutable bool layer_dense_ok_ = true;
 };
 
 std::string get_split_hop_refusal(const Options& o);
-std::vector<uint64_t> get_blob_bytes(const Model& m);
+std::vector<uint64_t> get_blob_bytes(const Model& m, bool drafter);
+bool has_drafter(const Model& m, const ModelCard& card);
 int64_t get_pool_max_experts(const Model& m);
 PagedCard& add_card(Model& m, Conversation& conv, PagedCards& cards, ModelCards& model_cards, GpuStage* stage);
 bool open_pages(Model& m, PagedCard& card, ModelCard& mc, const PagedSettings& s, int64_t max_experts,
@@ -398,7 +409,7 @@ int run_paged_engine(int argc, char** argv) {
         std::fprintf(stderr, "strata-q38: %s\n", why.c_str());
         return 2;
     }
-    const bool drafting = settings.step.lookahead > 0 && !o.mtp.empty();
+    bool drafting = settings.step.lookahead > 0 && !o.mtp.empty();
     settings.drafter = settings.drafter && drafting;
     if (settings.step.lookahead > 0 && o.mtp.empty() && settings.suffix_draft == 0 && settings.lookup_chain == 0) {
         std::fprintf(stderr, "strata-q38: --lookahead needs --mtp or --suffix-draft above 0\n");
@@ -443,6 +454,8 @@ int run_paged_engine(int argc, char** argv) {
     if (settings.ram_mib >= 0)
         m.ram_pool_bytes = settings.ram_mib << 20;
     m.mtp.set_kv_in_pages(true);
+    strata::core::MtpDrafter::PoolExperts pool_experts;   // (filled once the drafter's card has its pool)
+    m.mtp.set_pool_experts(&pool_experts);
     Conversation conv;
     PagedCards cards;
     ModelCards model_cards;
@@ -456,6 +469,8 @@ int run_paged_engine(int argc, char** argv) {
         return open_pages(m, card, model_cards[card.index], settings, get_pool_max_experts(m), err);
     };
     if (const int status = m.load(); status != 0) return status;
+    drafting = drafting && !o.mtp.empty();   // (Model::load clears --mtp when the drafter does not load)
+    settings.drafter = settings.drafter && drafting;
     if (const int status = m.build_hit_tables(false); status != 0) return status;
     const bool inline_shared = !shared_stream_override && should_inline_resident_shared(m);
     if (inline_shared)
@@ -469,6 +484,8 @@ int run_paged_engine(int argc, char** argv) {
         // Metal's wait_commit does not fence a deferred batch graph.
         mc.ver->set_batch_commit_async(drafting && !m.multi_gpu);
 #endif
+        if (has_drafter(m, mc))
+            pool_experts = {mc.d_res + m.g.n_layers * m.g.n_expert, mc.cache->device_slot(0), mc.cache->slot_bytes()};
     }
     if (const std::string why = get_unsupported_reason(m); !why.empty()) {
         std::fprintf(stderr, "strata-q38: %s\n", why.c_str());
@@ -496,34 +513,42 @@ int run_paged_engine(int argc, char** argv) {
     SplitDrive split;
     // Live grouping needs up to kVerifyMaxT groups, each starting at group * kVerifyMaxT in the hand-offs.
     const int handoff_rows = strata::kernels::kVerifyMaxT * strata::kernels::kVerifyMaxT;
-    if (!init_card_paths(m, conv, cards, model_cards, split, handoff_rows, err) ||
-        (drafting && !drafter.init(m, slots, err))) {
+    if (!init_card_paths(m, conv, cards, model_cards, split, handoff_rows, err)) {
         std::fprintf(stderr, "strata-q38: %s\n", err.c_str());
         return 1;
+    }
+    if (drafting && !drafter.init(m, slots, err)) {   // (optional: the engine serves without it, as when it is off)
+        std::fprintf(stderr, "strata-q38: WARNING: the drafter is off: %s\n", err.c_str());
+        settings.drafter = false;
     }
     // Proposals and changing group membership create many layouts; keep only recent captured graphs.
     if (drafting || model_cards.size() > 1)
         for (const ModelCard& mc : model_cards)
             mc.ver->set_batch_graph_limit(kWindowGraphs);
-    if (drafting && !settings.drafter)   // loaded for the pool's layout of the drafter's K/V, switched on later
-        m.unload_drafter();
     PagedQwen model(m, conv, cards, model_cards, split, ram, files, drafting ? &drafter : nullptr, slots,
                     window_rows.total);
+    // (loaded for the pool's layout of the drafter's K/V, and its experts ranked; may be switched on later)
+    if (drafting && !settings.drafter && !model.switch_drafter(false, err)) {
+        std::fprintf(stderr, "strata-q38: %s\n", err.c_str());
+        return 1;
+    }
     return strata::serve::serve_paged_model(model, cards, ram, copy_back_gain, settings);
 }
 
 namespace {
 
-PagedQwen::PagedQwen(Model& m, Conversation& conv, const PagedCards& cards, ModelCards& model_cards,
+PagedQwen::PagedQwen(Model& m, Conversation& conv, PagedCards& cards, ModelCards& model_cards,
                      SplitDrive& split, const strata::core::RamExperts& ram, const strata::core::ExpertFiles& files,
                      ConversationDrafter* drafter, int sessions, int prompt_rows)
     : m_(m), conv_(conv), pcards_(cards), cards_(model_cards), split_(split), ram_(ram), files_(files),
-      drafter_(drafter),
-      sessions_(sessions), prompt_rows_(prompt_rows) {
+      drafter_(drafter), pool_experts_(m.mtp.get_pool_experts()),
+      drafter_bytes_(drafter != nullptr ? m.mtp.vram_bytes() : 0), sessions_(sessions), prompt_rows_(prompt_rows) {
     const Options& o = m.o;
     facts.name = kProgram;
     facts.n_layers = m.g.n_layers;
     facts.n_expert = m.g.n_expert;
+    facts.shared_experts = 1;
+    strata::kernels::init_routing_counts((int) facts.n_layers, (int) facts.n_expert, (int) facts.shared_experts);
     facts.context = o.max_context;
     facts.extra_resident_vram = 10ull << 30;
     facts.max_rows = strata::kernels::kVerifyMaxT;
@@ -541,7 +566,9 @@ PagedQwen::PagedQwen(Model& m, Conversation& conv, const PagedCards& cards, Mode
     facts.kv_quantization = core::qsa_kv_q4() ? "Q4_0" : core::qsa_kv_int8() ? "INT8" : "FP16";
     facts.draft_limits.confidence = (float) o.spec_min_p;
     facts.drafter_start = "--mtp and a --lookahead above 0";
-    facts.expert_bytes = get_blob_bytes(m);
+    facts.expert_bytes = get_blob_bytes(m, false);
+    if (drafter != nullptr)
+        facts.drafter_expert_bytes = strata::kernels::cpu::BLOB * (uint64_t) m.g.n_expert;
     const int64_t pool_experts = get_pool_max_experts(m);
     for (size_t i = 0; i < m.profile_all.size() && (int64_t) i < pool_experts; ++i)
         facts.split_ranking.push_back({m.profile_all[i].first, m.profile_all[i].second});
@@ -640,11 +667,14 @@ PagedParts PagedQwen::make_parts(PagedCard& card, size_t first, size_t count, st
     return parts;
 }
 
-/// Gets the bytes of one expert of each of `m`'s layers.
-std::vector<uint64_t> get_blob_bytes(const Model& m) {
+/// Gets the bytes of one expert of each of `m`'s layers, then (`drafter`) of its MTP drafter's layer when it has one
+/// (--mtp): the pool of the card that runs the drafter keeps those 512 experts as layer n_layers.
+std::vector<uint64_t> get_blob_bytes(const Model& m, bool drafter) {
     std::vector<uint64_t> blobs;
     for (int64_t l = 0; l < m.g.n_layers; ++l)
         blobs.push_back(strata::kernels::cpu::expert_layout().blob_bytes(l));
+    if (drafter && !m.o.mtp.empty())
+        blobs.push_back(strata::kernels::cpu::BLOB);
     return blobs;
 }
 
@@ -664,14 +694,25 @@ int64_t get_pool_max_experts(const Model& m) {
     return std::max<int64_t>(all, m.o.expert_cache);
 }
 
+/// Tells whether `m`'s MTP drafter is loaded (switched on), so that its card's pool wants the drafter's experts.
+bool is_drafting(const Model& m) {
+    return !m.o.mtp.empty() && m.mtp.vram_bytes() > 0;
+}
+
 /// Gets the experts of the expert profile of layers [lb, le), hottest first.  With a layer split, `max_experts` (the
 /// most the GPUs hold: --expert-cache) becomes how many of them are among the profile's first `max_experts`, so that
-/// the cards hold the experts one GPU would; without one, they are CUDA0's profile and `max_experts` stays.
+/// the cards hold the experts one GPU would; without one, they are CUDA0's profile and `max_experts` stays.  The card
+/// of the last layers puts the drafter's experts first while it is on (is_drafting), each beyond `max_experts`.
 std::vector<strata::core::ExpertKey> get_card_ranking(const Model& m, int64_t lb, int64_t le, int64_t& max_experts) {
     std::vector<strata::core::ExpertKey> ranking;
+    if (le == m.g.n_layers && is_drafting(m))
+        for (int32_t e = 0; e < (int32_t) m.g.n_expert; ++e)
+            ranking.push_back({(int32_t) m.g.n_layers, e});
+    const int64_t drafter = (int64_t) ranking.size();
     if (m.profile_all.empty()) {
         for (const auto& [layer, expert] : m.profile)
             ranking.push_back({layer, expert});
+        max_experts += drafter;
         return ranking;
     }
     int64_t held = 0;
@@ -680,7 +721,7 @@ std::vector<strata::core::ExpertKey> get_card_ranking(const Model& m, int64_t lb
             ranking.push_back({layer, expert});
             held += (int64_t) i < max_experts;
         }
-    max_experts = held;
+    max_experts = held + drafter;
     return ranking;
 }
 
@@ -738,6 +779,10 @@ uint64_t PagedQwen::get_gpu_keep(const PagedCard& card) const {
     return qwen38::get_gpu_keep(m_, cards_[card.index], true);
 }
 
+uint64_t PagedQwen::get_drafter_weight_bytes(const PagedCard& card) const {
+    return has_drafter(m_, cards_[card.index]) ? drafter_bytes_ : 0;
+}
+
 std::vector<strata::core::ExpertKey> PagedQwen::get_card_ranking(int64_t lb, int64_t le, int64_t& max_experts) const {
     return qwen38::get_card_ranking(m_, lb, le, max_experts);
 }
@@ -771,6 +816,29 @@ bool PagedQwen::publish_residency(const PagedCard& card, std::string& err) {
 
 bool PagedQwen::set_card_layers(const PagedCard& card, std::string& err) {
     ModelCard& mc = cards_[card.index];
+    if (!mc.ver->drop_batch_graphs(err))
+        return false;
+    {   // the dense weights follow the layers: those of the layers gained load before the others are freed, so that a
+        // load that fails leaves the card as it was
+        const strata::core::OnDevice on(card.dev);
+        strata::core::WeightTable& wt = mc.stage != nullptr ? mc.stage->wt : m_.wt;
+        strata::core::NativeDense& dense = mc.stage != nullptr ? mc.stage->dense : m_.native_dense;
+        std::map<int64_t, void*>& arenas = mc.stage != nullptr ? mc.stage->layer_arenas : m_.layer_arenas;
+        const size_t held = arenas.size();
+        if (!m_.load_card_layers(wt, dense, arenas, card.lb, card.le, err)) {
+            m_.release_card_layers(wt, dense, arenas, mc.stage != nullptr ? mc.stage->lb : 0,
+                                   mc.stage != nullptr ? mc.stage->le
+                                                       : m_.split_at.empty() ? m_.g.n_layers : m_.split_at[0]);
+            return false;
+        }
+        const size_t gained = arenas.size() - held;
+        m_.release_card_layers(wt, dense, arenas, card.lb, card.le);
+        const size_t freed = held + gained - arenas.size();
+        if (gained != 0 || freed != 0)
+            std::fprintf(stderr, "%s: %s holds the dense weights of layers %lld-%lld (%zu loaded, %zu freed)\n",
+                         kProgram.c_str(), card.id.c_str(), (long long) card.lb, (long long) card.le - 1, gained,
+                         freed);
+    }
     if (mc.stage != nullptr) {
         mc.stage->lb = card.lb;
         mc.stage->le = card.le;
@@ -781,17 +849,25 @@ bool PagedQwen::set_card_layers(const PagedCard& card, std::string& err) {
     m_.split_at.clear();   // (complete once the last card has its layers)
     for (size_t k = 1; k < pcards_.size(); ++k)
         m_.split_at.push_back(pcards_[k].lb);
-    return mc.ver->drop_batch_graphs(err);
+    return true;
 }
 
 strata::core::LayerSizes PagedQwen::get_layer_sizes(uint64_t page) const {
     const strata::core::ModelGeometry& g = m_.g;
     const std::vector<strata::core::StateRegion>& whole = ram_.pages().pool().layout().regions;   // (every layer's)
     strata::core::LayerSizes sizes;
+    std::string err;
+    if (layer_dense_.empty() && !m_.get_layer_bytes(strata::core::WeightTable(), layer_dense_, err)) {
+        std::fprintf(stderr, "%s: the layers' dense weights could not be priced, so the layer cut stays: %s\n",
+                     kProgram.c_str(), err.c_str());
+        layer_dense_ok_ = false;
+        layer_dense_.assign((size_t) g.n_layers, 0);
+    }
+    // The common price includes routers retained by CUDA0 for mmap lookahead, so that card is priced conservatively.
+    sizes.dense = layer_dense_;
     constexpr size_t fixed = 1;
     for (int64_t l = 0, qsa = 0; l < g.n_layers; ++l) {
         const bool is_qsa = is_qsa_layer(g, l);
-        sizes.dense.push_back(0);   // (outside the pools)
         sizes.expert.push_back((strata::kernels::cpu::expert_layout().blob_bytes(l) + page - 1) / page * page);
         sizes.fixed_state.push_back(is_qsa ? 0 : whole[0].unit_bytes / (uint64_t) g.n_gdn_layers());
         sizes.token_bytes.push_back(is_qsa
@@ -803,7 +879,7 @@ strata::core::LayerSizes PagedQwen::get_layer_sizes(uint64_t page) const {
 bool PagedQwen::can_run_layers(int64_t lb, int64_t le) const {
     // a card needs a GDN layer and a QSA layer
     const int64_t interval = std::max<int64_t>(m_.g.qsa_interval, 1), qsa = le / interval - lb / interval;
-    return qsa != 0 && qsa != le - lb;
+    return layer_dense_ok_ && qsa != 0 && qsa != le - lb;
 }
 
 strata::core::RegionSpan PagedQwen::get_gpu_span(const PagedCard& card) const {
@@ -1371,6 +1447,12 @@ int PagedQwen::propose(strata::serve::PagedPart& last, int session, int32_t, int
     const int got = drafter_->propose(session, part.pages, part.ss, conv_.ver.final_R_all(), n, out, err, draft);
     if (got < 0)
         (void) wait_state(err);
+    else if (n > 0) {
+        // Only resident experts gain recency here. Missing experts still follow the fixed refill ranking, so a
+        // size-class cap can leave a demanded draft expert outside the pool until the ranking or capacity changes.
+        for (const int32_t expert : m_.mtp.get_routed())
+            pcards_.back().experts.note_use({(int32_t) m_.g.n_layers, expert});
+    }
     return got;
 }
 
@@ -1416,13 +1498,21 @@ bool PagedQwen::get_row_coordinates(const std::vector<strata::spec::StepRow>& ro
 bool PagedQwen::switch_drafter(bool on, std::string& err) {
     if (!on) {
         m_.unload_drafter();
-        return true;
+    } else {
+        m_.mtp.set_kv_in_pages(true);
+        m_.mtp.set_pool_experts(pool_experts_);
+        if (!m_.load_drafter(err) || !drafter_->init(m_, sessions_, err)) {
+            m_.unload_drafter();
+            return false;
+        }
     }
-    m_.mtp.set_kv_in_pages(true);
-    if (!m_.load_drafter(err) || !drafter_->init(m_, sessions_, err)) {
-        m_.unload_drafter();
-        return false;
-    }
+    // The drafter's experts join its card's ranking (get_card_ranking), pushing out the card's least ranked experts,
+    // or leave it.  On a layer split with hops this drops the experts the card held for other cards until the engine
+    // places them again (its next pool resize or cut move).
+    PagedCard& card = pcards_.back();
+    int64_t most = get_pool_max_experts(m_);
+    const auto ranking = get_card_ranking(card.lb, card.le, most);
+    card.experts.set_ranking(ranking, on ? std::min(most, card.experts.count_fitting(ranking)) : most);
     return true;
 }
 
@@ -1446,6 +1536,16 @@ strata::serve::PromptBuffers PagedQwen::get_prompt_buffers(const PagedCard& card
     if (tokens <= m_.o.short_read && image_row_ptrs_.empty())   // (read through the verify windows)
         return {};
     return get_prompt_bytes(m_, cards_[card.index], chunk, card.index + 1 < cards_.size());
+}
+
+bool PagedQwen::raise_prompt_ceiling(int64_t chunk, std::string& err) {
+    for (size_t k = 0; k < cards_.size(); ++k) {
+        const strata::core::OnDevice on(pcards_[k].dev);
+        if (!cards_[k].sp->raise_chunk_limit(chunk, err))
+            return false;
+    }
+    m_.o.prefill_chunk = chunk;
+    return true;
 }
 
 bool PagedQwen::lay_out_prompt(const PagedCard& card, int64_t chunk, uint8_t* device, uint8_t* host,
@@ -1484,8 +1584,8 @@ std::string get_split_hop_refusal(const Options& o) {
 PagedCard& add_card(Model& m, Conversation& conv, PagedCards& cards, ModelCards& model_cards, GpuStage* stage) {
     PagedCard& card = strata::serve::add_paged_card(
         cards, stage != nullptr ? stage->dev : m.primary_device, stage != nullptr ? stage->lb : 0,
-        stage != nullptr ? stage->le : m.split_at.empty() ? m.g.n_layers : m.split_at[0], m.g.n_layers,
-        m.stage_weights_trimmed, kProgram, strata::kernels::cpu::expert_layout().max_blob);
+        stage != nullptr ? stage->le : m.split_at.empty() ? m.g.n_layers : m.split_at[0], kProgram,
+        std::ranges::max(get_blob_bytes(m, true)));
     ModelCard& mc = model_cards.emplace_back();
     mc.stage = stage;
     mc.cache = stage != nullptr ? &stage->cache : &m.xcache;
@@ -1507,16 +1607,18 @@ bool open_pages(Model& m, PagedCard& card, ModelCard& mc, const PagedSettings& s
     const strata::core::OnDevice on(card.dev);
     const std::vector<strata::core::ExpertKey> ranking = get_card_ranking(m, card.lb, card.le, max_experts);
     const bool drafting = has_drafter(m, mc);
-    const std::vector<uint64_t> blobs = get_blob_bytes(m);
-    const uint64_t page = strata::core::choose_expert_page_bytes(blobs);
+    const std::vector<uint64_t> blobs = get_blob_bytes(m, true);
+    // (the trunk's experts choose the page; the drafter's take whole pages)
+    const uint64_t page = strata::core::choose_expert_page_bytes(get_blob_bytes(m, false));
     strata::core::StateLayout layout;
     if (!ConversationPages::get_layout(m.g, *mc.own, drafting ? &m.mtp.kv_state() : nullptr, layout, err))
         return false;
     const uint64_t keep = s.get_vram_reserve_bytes() + get_gpu_keep(m, mc, false);
-    const strata::serve::CardPoolPlan plan =
+    strata::serve::CardPoolPlan plan =
         strata::serve::plan_card_pool(card, s, layout, m.o.max_context, page, blobs, ranking, max_experts, keep);
+    plan.config.label_expert = strata::serve::get_expert_labels(m.g.n_layers);
     const uint64_t chunk = plan.config.chunk_bytes;
-    mc.cache->set_expert_bytes((int64_t) strata::kernels::cpu::expert_layout().max_blob);
+    mc.cache->set_expert_bytes((int64_t) std::ranges::max(blobs));
     strata::core::ChunkMemory memory = strata::serve::get_gpu_chunk_memory(card.dev, chunk, false);
     // with virtual memory the cache's arena is the range's first chunk, so that the pool's other chunks follow it
     uint8_t* arena = memory.contiguous ? memory.alloc(chunk) : nullptr;
@@ -1524,7 +1626,7 @@ bool open_pages(Model& m, PagedCard& card, ModelCard& mc, const PagedSettings& s
         err = "no room for the page pool's first chunk";
         return false;
     }
-    if (!mc.cache->open((int64_t) (chunk / page), m.g.n_layers, m.g.n_expert, (int64_t) page, err, arena) ||
+    if (!mc.cache->open((int64_t) (chunk / page), (int64_t) blobs.size(), m.g.n_expert, (int64_t) page, err, arena) ||
         !card.experts.open(*mc.cache, std::move(memory), plan.bytes, layout, plan.config, blobs, m.g.n_expert,
                            max_experts, ranking, {false, keep}, err))
         return false;
@@ -1532,14 +1634,22 @@ bool open_pages(Model& m, PagedCard& card, ModelCard& mc, const PagedSettings& s
     return true;
 }
 
-/// Opens `files` over the files `m`'s load read its experts from, and closes the load's source of them (m.src) with its
-/// file mappings, so that from here on every expert read goes through `files`.
+/// Opens `files` over the files `m`'s load read its experts from, then its drafter's (--mtp: experts.bin, as layer
+/// n_layers), and closes the load's source of them (m.src) with its file mappings, so that from here on every expert
+/// read goes through `files`.
 bool open_files(Model& m, strata::core::ExpertFiles& files, std::string& err) {
     std::vector<std::string> paths;
     std::vector<strata::core::ExpertFileLayout> layers;
     if (!m.src.get_file_layout(paths, layers)) {
         err = "the experts' files are not open";
         return false;
+    }
+    if (!m.o.mtp.empty()) {
+        strata::core::ExpertFileLayout& drafter = layers.emplace_back();
+        drafter.n_exp = (int) m.g.n_expert;
+        drafter.file[0] = (int) paths.size();
+        drafter.stride[0] = drafter.bytes[0] = drafter.blob = strata::kernels::cpu::BLOB;
+        paths.push_back(m.o.mtp + "/experts.bin");
     }
     const bool opened = files.open(paths, std::move(layers), err, m.src.model_inputs());
     m.src.close();
@@ -1563,7 +1673,7 @@ bool open_ram(Model& m, const PagedCards& cards, const ModelCards& model_cards, 
         prompt += get_prompt_bytes(m, model_cards[k], m.o.prefill_chunk, k + 1 < model_cards.size()).host;
     return get_card_layout(m, cards.back(), model_cards.back(), 0, m.g.n_layers, layout, err) &&
            strata::serve::open_ram_pool(kProgram, s, files, m.o.resident_headroom, ring, layout, cards[0],
-                                        get_blob_bytes(m), m.g.n_expert, profile, m.xcache.device_slot(0), prompt,
+                                        get_blob_bytes(m, false), m.g.n_expert, profile, m.xcache.device_slot(0), prompt,
                                         ram, copy_back_gain, err);
 }
 

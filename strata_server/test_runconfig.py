@@ -15,6 +15,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from strata_common import user_args
 from strata_server import runconfig
 from strata_server.frontend import ChatTemplate
 from strata_server.server import ByteTokenizer, Service, serve
@@ -44,6 +45,33 @@ class Apply(unittest.TestCase):
         self.assertEqual(changed, ["decode_share_percent", "prompt_turn_ms"])
         with self.assertRaises(ValueError):
             runconfig.check_live({"prompt_turn_ms": -1}, True)
+
+    def test_prompt_chunk_is_saved_over_the_spelling_the_config_has(self):
+        values = runconfig.check_live({"prefill_chunk": 4096}, True)
+        new, changed = runconfig.apply_live({"args": ["--prefill", "auto"]}, values)
+        self.assertEqual((new["args"], changed), (["--prefill", "4096"], ["prefill_chunk"]))
+        self.assertEqual(runconfig.apply_live(new, values)[1], [], "--prefill 4096 holds it already")
+        new, _ = runconfig.apply_live({"args": []}, runconfig.check_live({"prefill_chunk": 2048}, True),
+                                      {"prefill_chunk": 1024})
+        self.assertEqual(new["args"], ["--prefill-chunk", "2048"])
+
+    def test_prompt_chunk_save_removes_duplicate_aliases_and_keeps_user_changes(self):
+        for args in (["--prefill", "4096", "--prefill-chunk", "8192"],
+                     ["--prefill-chunk", "8192", "--prefill", "4096"],
+                     ["--prefill", "4096", "--prefill", "8192"],
+                     ["--chunk", "8192", "--prefill", "4096"]):
+            with self.subTest(args=args):
+                cfg = {"args": [*args, "--rows", "4"], "args_written": [*args, "--rows", "2"],
+                       "user_args": ["--prefill-chunk", "8192"]}
+                new, changed = runconfig.apply_live(cfg, {"prefill_chunk": 2048})
+                self.assertEqual(changed, ["prefill_chunk"])
+                self.assertEqual(new["args"], ["--prefill", "2048", "--rows", "4"])
+                self.assertEqual(new["user_args"], ["--rows", "4", "--prefill", "2048"])
+                self.assertEqual(new["args_written"], new["args"])
+                self.assertEqual(runconfig._arg(new, "--prefill-chunk"), 2048)
+                self.assertEqual(runconfig.apply_live(new, {"prefill_chunk": 2048})[1], [])
+                self.assertEqual(user_args.merge(["--prefill", "auto"], new["user_args"]),
+                                 ["--rows", "4", "--prefill", "2048"])
 
     def test_batch_groups_are_live_and_saved_with_0_for_auto(self):
         values = runconfig.check_live({"batch_groups": 0}, True)

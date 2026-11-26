@@ -40,9 +40,6 @@ struct PagedCard {
     /// its memory's id in GET_MEMORY_USE and CHANGE_SETTINGS: gpu<dev>, and gpu<dev>.<index> for a card on the GPU of
     /// an earlier card (the test of a split on one GPU)
     std::string id;
-    /// Bounds the cut to layers whose dense tensors the model can address or reload on this card.
-    /// --trim-stage-weights restricts this to the initial interval.
-    int64_t weights_lb = 0, weights_le = 0;
     strata::core::LinkSpeed link;                 ///< its link to RAM, measured at start
     double layer_ms = 0;                          ///< the predicted ms of one layer of a decode window on it
     strata::core::ExpertPages experts;            ///< the page pool: its experts and the conversations' pages
@@ -93,6 +90,8 @@ struct PagedModelFacts {
     /// temporary folder's subfolder for paused conversations
     std::string name;
     int64_t n_layers = 0, n_expert = 0;
+    /// Counts the experts every row uses in each layer besides its routed ones; stored with the dense weights.
+    int64_t shared_experts = 0;
     int64_t context = 0;                    ///< the most tokens a conversation holds (--max-context)
     int max_rows = 0;                       ///< the most rows one step may run (its verify windows' room)
     std::vector<int64_t> end_tokens;        ///< the tokens that end an answer
@@ -296,6 +295,12 @@ public:
     /// Gets the largest chunk a prompt is read in (--prefill: a ceiling), or 0 when the prompt path keeps buffers of
     /// its own.  The engine reads each prompt in the largest chunk up to it whose buffers its pools can lend then.
     virtual int64_t get_prompt_ceiling() const { return 0; }
+    /// Raises get_prompt_ceiling to `chunk`, growing the buffers of the prompt path's own that the start sized for
+    /// the old ceiling; between prompts (none lent).  False (and `err`, the ceiling kept) when they cannot grow.
+    virtual bool raise_prompt_ceiling(int64_t chunk, std::string& err) {
+        err = "this model's prompt path cannot read chunks above " + std::to_string(get_prompt_ceiling()) + " tokens";
+        return false;
+    }
     /// Gets what `card`'s prompt path borrows to read `tokens` tokens in chunks of `chunk`; nothing when such a read
     /// needs no buffers (Qwen3.8 reads a short prompt through its verify windows).
     virtual PromptBuffers get_prompt_buffers(const PagedCard&, int64_t /*chunk*/, int64_t /*tokens*/) const {
